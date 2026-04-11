@@ -1,0 +1,655 @@
+   1: from __future__ import annotations
+   2: 
+   3: import itertools
+   4: import math
+   5: from dataclasses import dataclass
+   6: from pathlib import Path
+   7: from typing import Dict, List, Tuple
+   8: 
+   9: import pandas as pd
+  10: from ortools.sat.python import cp_model
+  11: 
+  12: 
+  13: @dataclass(frozen=True)
+  14: class SolveConfig:
+  15:     max_orders: int = 140
+  16:     rounds: int = 4
+  17:     time_limit_seconds: float = 20.0
+  18:     max_virtual_chain: int = 3
+  19: 
+  20: 
+  21: V_WIDTHS = [1000.0, 1250.0, 1500.0]
+  22: V_THICKS = [round(0.5 + 0.1 * i, 1) for i in range(16)]
+  23: V_TEMPS = [700 + 10 * i for i in range(21)]
+  24: 
+  25: 
+  26: def _num(v, default: float = 0.0) -> float:
+  27:     try:
+  28:         if pd.isna(v):
+  29:             return default
+  30:         return float(v)
+  31:     except Exception:
+  32:         return default
+  33: 
+  34: 
+  35: def _txt(v, default: str = "") -> str:
+  36:     if v is None or (isinstance(v, float) and pd.isna(v)):
+  37:         return default
+  38:     return str(v).strip()
+  39: 
+  40: 
+  41: def _is_pc(group: str) -> bool:
+  42:     return "普碳" in _txt(group)
+  43: 
+  44: 
+  45: def _thick_ok(prev_t: float, cur_t: float) -> bool:
+  46:     diff = abs(cur_t - prev_t)
+  47:     if prev_t > 0.8:
+  48:         return (diff / prev_t) <= 0.30
+  49:     if prev_t >= 0.6:
+  50:         return diff <= 0.2
+  51:     return diff <= 0.1
+  52: 
+  53: 
+  54: def _allowed_step(a: dict, b: dict) -> bool:
+  55:     # Width hard constraints.
+  56:     if b["width"] > a["width"]:
+  57:         return False
+  58:     if (a["width"] - b["width"]) > 250:
+  59:         return False
+  60:     # Thickness hard constraints.
+  61:     if not _thick_ok(a["thickness"], b["thickness"]):
+  62:         return False
+  63:     # Temperature overlap hard constraint.
+  64:     lo = max(a["temp_min"], b["temp_min"])
+  65:     hi = min(a["temp_max"], b["temp_max"])
+  66:     if lo > hi:
+  67:         return False
+  68:     # Different steel groups must pass through PC.
+  69:     if a["steel_group"] != b["steel_group"] and (not _is_pc(a["steel_group"])) and (not _is_pc(b["steel_group"])):
+  70:         return False
+  71:     return True
+  72: 
+  73: 
+  74: def _col_by_name_or_index(df: pd.DataFrame, names: List[str], idx: int) -> str:
+  75:     for n in names:
+  76:         if n in df.columns:
+  77:             return n
+  78:     if idx < len(df.columns):
+  79:         return df.columns[idx]
+  80:     raise ValueError(f"Cannot resolve column {names} / {idx}")
+  81: 
+  82: 
+  83: def _build_grade_lookup(steel_info_path: Path) -> Dict[str, str]:
+  84:     grade_to_group: Dict[str, str] = {}
+  85:     xls = pd.ExcelFile(steel_info_path)
+  86:     for s in xls.sheet_names:
+  87:         df = pd.read_excel(steel_info_path, sheet_name=s)
+  88:         if df.empty:
+  89:             continue
+  90:         cols = [str(c) for c in df.columns]
+  91:         g_cols = [c for c in cols if "牌号" in c]
+  92:         sg_cols = [c for c in cols if "钢种�? in c]
+  93:         if not g_cols or not sg_cols:
+  94:             continue
+  95:         gc, sgc = g_cols[0], sg_cols[0]
+  96:         for _, r in df.iterrows():
+  97:             grade = _txt(r.get(gc, ""))
+  98:             group = _txt(r.get(sgc, ""))
+  99:             if grade and group and group not in {"(空白)", "nan", "NaN"}:
+ 100:                 grade_to_group.setdefault(grade, group)
+ 101:     return grade_to_group
+ 102: 
+ 103: 
+ 104: def _prepare_orders(orders_path: Path, steel_info_path: Path, max_orders: int) -> pd.DataFrame:
+ 105:     df = pd.read_excel(orders_path, sheet_name=0).copy()
+ 106:     grade_to_group = _build_grade_lookup(steel_info_path)
+ 107: 
+ 108:     col_id = _col_by_name_or_index(df, ["合同完全�?], 1)
+ 109:     col_grade = _col_by_name_or_index(df, ["牌号"], 5)
+ 110:     col_group = _col_by_name_or_index(df, ["Steel Grade Class"], 11)
+ 111:     col_width = _col_by_name_or_index(df, ["宽度"], 15)
+ 112:     col_thick = _col_by_name_or_index(df, ["厚度"], 16)
+ 113:     col_tmax = _col_by_name_or_index(df, ["均热段温度最大�?], 28)
+ 114:     col_tmin = _col_by_name_or_index(df, ["均热段温度最小�?], 29)
+ 115:     col_tmean = _col_by_name_or_index(df, ["均热温度"], 32)
+ 116:     col_tons = _col_by_name_or_index(df, ["吨位中�?], 33)
+ 117:     col_backlog = _col_by_name_or_index(df, ["订单欠交"], 9)
+ 118:     col_due = _col_by_name_or_index(df, ["交货日期"], 4)
+ 119:     col_roll = _col_by_name_or_index(df, ["辊型"], 30)
+ 120: 
+ 121:     out = pd.DataFrame(
+ 122:         {
+ 123:             "order_id": df[col_id].astype(str),
+ 124:             "grade": df[col_grade].astype(str),
+ 125:             "steel_group": df[col_group].astype(str),
+ 126:             "width": pd.to_numeric(df[col_width], errors="coerce"),
+ 127:             "thickness": pd.to_numeric(df[col_thick], errors="coerce"),
+ 128:             "temp_max": pd.to_numeric(df[col_tmax], errors="coerce"),
+ 129:             "temp_min": pd.to_numeric(df[col_tmin], errors="coerce"),
+ 130:             "temp_mean": pd.to_numeric(df[col_tmean], errors="coerce"),
+ 131:             "tons": pd.to_numeric(df[col_tons], errors="coerce"),
+ 132:             "backlog": pd.to_numeric(df[col_backlog], errors="coerce"),
+ 133:             "due_date": pd.to_datetime(df[col_due], errors="coerce"),
+ 134:             "roll_type": df[col_roll].astype(str),
+ 135:         }
+ 136:     )
+ 137:     out = out.dropna(subset=["width", "thickness", "tons", "backlog"]).copy()
+ 138:     out = out[out["backlog"] > 0].copy()
+ 139:     out["steel_group"] = out.apply(
+ 140:         lambda r: grade_to_group.get(_txt(r["grade"]), _txt(r["steel_group"], "UNKNOWN")) if _txt(r["steel_group"]).lower() in {"", "nan"} else _txt(r["steel_group"]),
+ 141:         axis=1,
+ 142:     )
+ 143:     out["temp_min"] = out["temp_min"].fillna(out["temp_mean"] - 15).fillna(760)
+ 144:     out["temp_max"] = out["temp_max"].fillna(out["temp_mean"] + 15).fillna(860)
+ 145:     out["line"] = out["roll_type"].apply(lambda x: "small_roll" if ("小辊" in _txt(x) and "大辊" not in _txt(x)) else "big_roll")
+ 146:     out["due_sort"] = out["due_date"].fillna(pd.Timestamp.max)
+ 147:     out = out.sort_values(["backlog", "due_sort"], ascending=[False, True]).head(max_orders).reset_index(drop=True)
+ 148:     return out
+ 149: 
+ 150: 
+ 151: def _estimated_virtual_need(a: dict, b: dict) -> int:
+ 152:     need_width = max(0, math.ceil(max(0.0, a["width"] - b["width"] - 250.0) / 250.0))
+ 153:     need_group = 1 if (a["steel_group"] != b["steel_group"] and (not _is_pc(a["steel_group"])) and (not _is_pc(b["steel_group"]))) else 0
+ 154:     need_temp = 1 if (max(a["temp_min"], b["temp_min"]) > min(a["temp_max"], b["temp_max"])) else 0
+ 155:     # conservative estimate for thickness
+ 156:     if _thick_ok(a["thickness"], b["thickness"]):
+ 157:         need_th = 0
+ 158:     else:
+ 159:         # 1..3 trial
+ 160:         need_th = 4
+ 161:         for n in [1, 2, 3]:
+ 162:             ok = True
+ 163:             prev = a["thickness"]
+ 164:             for k in range(1, n + 1):
+ 165:                 t = a["thickness"] + (b["thickness"] - a["thickness"]) * k / (n + 1)
+ 166:                 t = min(2.0, max(0.5, round(t, 1)))
+ 167:                 if not _thick_ok(prev, t):
+ 168:                     ok = False
+ 169:                     break
+ 170:                 prev = t
+ 171:             if ok and _thick_ok(prev, b["thickness"]):
+ 172:                 need_th = n
+ 173:                 break
+ 174:     return max(need_width, need_group, need_temp, need_th)
+ 175: 
+ 176: 
+ 177: def _solve_line_once(
+ 178:     data: pd.DataFrame,
+ 179:     time_limit_seconds: float,
+ 180:     seed: int,
+ 181:     bridge_w: int,
+ 182:     bridgeable: Dict[Tuple[int, int], bool],
+ 183: ) -> List[int]:
+ 184:     n = len(data)
+ 185:     model = cp_model.CpModel()
+ 186:     arcs = []
+ 187:     costs = []
+ 188:     vars_map = {}
+ 189: 
+ 190:     for i in range(n + 1):
+ 191:         for j in range(n + 1):
+ 192:             if i == j:
+ 193:                 continue
+ 194:             v = model.NewBoolVar(f"a_{i}_{j}")
+ 195:             vars_map[(i, j)] = v
+ 196:             arcs.append((i, j, v))
+ 197:             if i == 0 or j == 0:
+ 198:                 costs.append(0 * v)
+ 199:                 continue
+ 200:             a = data.iloc[i - 1]
+ 201:             b = data.iloc[j - 1]
+ 202:             if b["width"] > a["width"]:
+ 203:                 model.Add(v == 0)
+ 204:                 costs.append(0 * v)
+ 205:                 continue
+ 206:             if not bridgeable.get((i - 1, j - 1), False):
+ 207:                 model.Add(v == 0)
+ 208:                 costs.append(0 * v)
+ 209:                 continue
+ 210:             need = _estimated_virtual_need(a, b)
+ 211:             # lower cost for easier bridge and smaller switch.
+ 212:             switch = 1 if a["steel_group"] != b["steel_group"] else 0
+ 213:             costs.append((need * bridge_w + switch * 100 + int(abs(a["width"] - b["width"]))) * v)
+ 214: 
+ 215:     model.AddCircuit(arcs)
+ 216:     model.Minimize(sum(costs))
+ 217: 
+ 218:     solver = cp_model.CpSolver()
+ 219:     solver.parameters.max_time_in_seconds = time_limit_seconds
+ 220:     solver.parameters.random_seed = seed
+ 221:     solver.parameters.randomize_search = True
+ 222:     solver.parameters.num_search_workers = 8
+ 223:     status = solver.Solve(model)
+ 224:     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+ 225:         raise RuntimeError("No feasible order sequence for one line.")
+ 226: 
+ 227:     succ = {}
+ 228:     for (i, j), v in vars_map.items():
+ 229:         if solver.Value(v) == 1:
+ 230:             succ[i] = j
+ 231:     seq = []
+ 232:     cur = succ[0]
+ 233:     while cur != 0:
+ 234:         seq.append(cur)
+ 235:         cur = succ[cur]
+ 236:     return seq
+ 237: 
+ 238: 
+ 239: def _nearest(vals: List[float], x: float) -> float:
+ 240:     return min(vals, key=lambda v: abs(v - x))
+ 241: 
+ 242: 
+ 243: def _virtual_temp_bounds(target: float) -> Tuple[float, float]:
+ 244:     t = _nearest([float(v) for v in V_TEMPS], min(900.0, max(700.0, target)))
+ 245:     return max(700.0, t - 20.0), min(900.0, t + 20.0)
+ 246: 
+ 247: 
+ 248: def _make_virtual(idx: int, line: str, width: float, thickness: float, temp_target: float, segment_id: int) -> dict:
+ 249:     tmin, tmax = _virtual_temp_bounds(temp_target)
+ 250:     return {
+ 251:         "order_id": f"VIRTUAL-{idx:05d}",
+ 252:         "grade": "VIRTUAL_PC",
+ 253:         "steel_group": "普碳",
+ 254:         "width": width,
+ 255:         "thickness": thickness,
+ 256:         "temp_min": tmin,
+ 257:         "temp_max": tmax,
+ 258:         "temp_mean": (tmin + tmax) / 2.0,
+ 259:         "tons": 0.0,
+ 260:         "line": line,
+ 261:         "is_virtual": True,
+ 262:         "segment_id": segment_id,
+ 263:     }
+ 264: 
+ 265: 
+ 266: def _bridge_pair(a: dict, b: dict, max_virtual_chain: int, virtual_idx_start: int) -> Tuple[List[dict], int]:
+ 267:     if _allowed_step(a, b):
+ 268:         return [], virtual_idx_start
+ 269: 
+ 270:     for n in range(1, max_virtual_chain + 1):
+ 271:         for wseq in itertools.product(V_WIDTHS, repeat=n):
+ 272:             chain_w = [a["width"], *wseq, b["width"]]
+ 273:             if any(chain_w[i + 1] > chain_w[i] for i in range(len(chain_w) - 1)):
+ 274:                 continue
+ 275:             if any((chain_w[i] - chain_w[i + 1]) > 250 for i in range(len(chain_w) - 1)):
+ 276:                 continue
+ 277: 
+ 278:             vt = []
+ 279:             prev = a
+ 280:             ok = True
+ 281:             for k in range(n):
+ 282:                 raw_t = a["thickness"] + (b["thickness"] - a["thickness"]) * (k + 1) / (n + 1)
+ 283:                 th = _nearest([float(v) for v in V_THICKS], min(2.0, max(0.5, raw_t)))
+ 284:                 temp_target = a["temp_mean"] + (b["temp_mean"] - a["temp_mean"]) * (k + 1) / (n + 1)
+ 285:                 seg_id = int(a.get("segment_id", 1))
+ 286:                 v = _make_virtual(virtual_idx_start + k, a["line"], float(wseq[k]), float(th), float(temp_target), seg_id)
+ 287:                 if not _allowed_step(prev, v):
+ 288:                     ok = False
+ 289:                     break
+ 290:                 vt.append(v)
+ 291:                 prev = v
+ 292:             if not ok:
+ 293:                 continue
+ 294:             if _allowed_step(prev, b):
+ 295:                 return vt, virtual_idx_start + n
+ 296:     raise RuntimeError(f"Cannot bridge transition within {max_virtual_chain} virtual slabs: {a['order_id']} -> {b['order_id']}")
+ 297: 
+ 298: 
+ 299: def _can_bridge(a: dict, b: dict, max_virtual_chain: int) -> bool:
+ 300:     try:
+ 301:         _bridge_pair(a, b, max_virtual_chain, 1)
+ 302:         return True
+ 303:     except RuntimeError:
+ 304:         return False
+ 305: 
+ 306: 
+ 307: def _expand_with_virtuals(seq_df: pd.DataFrame, max_virtual_chain: int) -> pd.DataFrame:
+ 308:     rows = []
+ 309:     vidx = 1
+ 310:     records = seq_df.to_dict("records")
+ 311:     for i, cur in enumerate(records):
+ 312:         cur["is_virtual"] = False
+ 313:         rows.append(cur)
+ 314:         if i == len(records) - 1:
+ 315:             continue
+ 316:         nxt = records[i + 1]
+ 317:         v_nodes, vidx = _bridge_pair(cur, nxt, max_virtual_chain, vidx)
+ 318:         rows.extend(v_nodes)
+ 319:     return pd.DataFrame(rows)
+ 320: 
+ 321: 
+ 322: def _attach_checks(seq: pd.DataFrame) -> pd.DataFrame:
+ 323:     out = seq.copy().reset_index(drop=True)
+ 324:     if "segment_id" not in out.columns:
+ 325:         out["segment_id"] = 1
+ 326:     out["seq"] = out.index + 1
+ 327:     out["prev_width"] = out.groupby("segment_id")["width"].shift(1)
+ 328:     out["prev_thickness"] = out.groupby("segment_id")["thickness"].shift(1)
+ 329:     out["prev_group"] = out.groupby("segment_id")["steel_group"].shift(1)
+ 330:     out["width_drop"] = out["prev_width"] - out["width"]
+ 331:     out["narrow_to_wide"] = (out["width"] > out["prev_width"]).fillna(False)
+ 332:     out["width_jump_violation"] = (out["width_drop"] > 250).fillna(False)
+ 333:     out["thickness_violation"] = (
+ 334:         ((out["prev_thickness"] > 0.8) & (((out["thickness"] - out["prev_thickness"]).abs() / out["prev_thickness"]) > 0.30))
+ 335:         | ((out["prev_thickness"] >= 0.6) & (out["prev_thickness"] <= 0.8) & ((out["thickness"] - out["prev_thickness"]).abs() > 0.2))
+ 336:         | ((out["prev_thickness"] < 0.6) & ((out["thickness"] - out["prev_thickness"]).abs() > 0.1))
+ 337:     ).fillna(False)
+ 338:     lo = out[["temp_min"]].join(out.groupby("segment_id")["temp_min"].shift(1), rsuffix="_prev").max(axis=1)
+ 339:     hi = out[["temp_max"]].join(out.groupby("segment_id")["temp_max"].shift(1), rsuffix="_prev").min(axis=1)
+ 340:     out["temp_conflict"] = (lo > hi).fillna(False)
+ 341:     out["group_switch"] = (out["steel_group"] != out["prev_group"]).fillna(False)
+ 342:     first_rows = out.groupby("segment_id").head(1).index
+ 343:     out.loc[first_rows, ["narrow_to_wide", "width_jump_violation", "thickness_violation", "temp_conflict", "group_switch"]] = False
+ 344:     out["non_pc_direct_switch"] = (
+ 345:         out["group_switch"] & ~out["steel_group"].astype(str).str.contains("普碳") & ~out["prev_group"].astype(str).str.contains("普碳")
+ 346:     ).fillna(False)
+ 347:     return out
+ 348: 
+ 349: 
+ 350: def _assign_campaigns_strict(df: pd.DataFrame) -> pd.DataFrame:
+ 351:     out = df.copy().reset_index(drop=True)
+ 352:     out["campaign_id"] = 0
+ 353:     base_cid = 1
+ 354:     for _, seg in out.groupby("segment_id", sort=False):
+ 355:         seg_idx = seg.index.tolist()
+ 356:         cid = base_cid
+ 357:         cur = 0.0
+ 358:         start_idx = seg_idx[0]
+ 359:         for i in seg_idx:
+ 360:             tons = float(out.loc[i, "tons"])
+ 361:             if cur >= 700 and (cur + tons > 2000):
+ 362:                 out.loc[start_idx:i - 1, "campaign_id"] = cid
+ 363:                 cid += 1
+ 364:                 start_idx = i
+ 365:                 cur = 0.0
+ 366:             cur += tons
+ 367:         out.loc[start_idx:seg_idx[-1], "campaign_id"] = cid
+ 368:         base_cid = cid + 1
+ 369: 
+ 370:     out["campaign_tons"] = out.groupby("campaign_id")["tons"].transform("sum")
+ 371:     return out
+ 372: 
+ 373: 
+ 374: def _drop_bad_campaigns(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+ 375:     out = df.copy()
+ 376:     csum = out.groupby("campaign_id")["tons"].sum()
+ 377:     bad_ids = csum[(csum < 700) | (csum > 2000)].index.tolist()
+ 378:     if not bad_ids:
+ 379:         return out, pd.DataFrame()
+ 380:     bad = out[out["campaign_id"].isin(bad_ids) & (~out["is_virtual"])].copy()
+ 381:     bad["drop_reason"] = "CAMPAIGN_TON_OUT_OF_RANGE"
+ 382:     good = out[~out["campaign_id"].isin(bad_ids)].copy().reset_index(drop=True)
+ 383:     return good, bad
+ 384: 
+ 385: 
+ 386: def _greedy_segment_indices(bridgeable: Dict[Tuple[int, int], bool], widths: List[float]) -> List[List[int]]:
+ 387:     remaining = set(range(len(widths)))
+ 388:     segments: List[List[int]] = []
+ 389:     while remaining:
+ 390:         start = max(remaining, key=lambda i: widths[i])
+ 391:         seg = [start]
+ 392:         remaining.remove(start)
+ 393:         cur = start
+ 394:         while True:
+ 395:             cands = [j for j in remaining if bridgeable.get((cur, j), False)]
+ 396:             if not cands:
+ 397:                 break
+ 398:             nxt = min(cands, key=lambda j: abs(widths[cur] - widths[j]))
+ 399:             seg.append(nxt)
+ 400:             remaining.remove(nxt)
+ 401:             cur = nxt
+ 402:         segments.append(seg)
+ 403:     return segments
+ 404: 
+ 405: 
+ 406: def _line_schedule(data_line: pd.DataFrame, cfg: SolveConfig) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+ 407:     logs = []
+ 408:     best = None
+ 409:     bridge_w = 1200
+ 410:     dropped = []
+ 411:     work = data_line.copy().reset_index(drop=True)
+ 412:     while True:
+ 413:         recs = work.to_dict("records")
+ 414:         bridgeable: Dict[Tuple[int, int], bool] = {}
+ 415:         for i in range(len(recs)):
+ 416:             for j in range(len(recs)):
+ 417:                 if i == j:
+ 418:                     continue
+ 419:                 if recs[j]["width"] > recs[i]["width"]:
+ 420:                     bridgeable[(i, j)] = False
+ 421:                 else:
+ 422:                     bridgeable[(i, j)] = _can_bridge(recs[i], recs[j], cfg.max_virtual_chain)
+ 423:         try:
+ 424:             for r in range(1, cfg.rounds + 1):
+ 425:                 seq = _solve_line_once(work, cfg.time_limit_seconds, seed=100 + 17 * r, bridge_w=bridge_w, bridgeable=bridgeable)
+ 426:                 seq_df = work.iloc[[i - 1 for i in seq]].copy().reset_index(drop=True)
+ 427:                 seq_df["segment_id"] = 1
+ 428:                 expanded = _expand_with_virtuals(seq_df, cfg.max_virtual_chain)
+ 429:                 checked = _attach_checks(expanded)
+ 430:                 checked = _assign_campaigns_strict(checked)
+ 431:                 checked, bad_camp = _drop_bad_campaigns(checked)
+ 432:                 if not bad_camp.empty:
+ 433:                     dropped.extend(bad_camp.to_dict("records"))
+ 434:                 metric = {
+ 435:                     "round": r,
+ 436:                     "line": work.iloc[0]["line"],
+ 437:                     "rows_total": len(checked),
+ 438:                     "virtual_cnt": int(checked["is_virtual"].sum()),
+ 439:                     "narrow_to_wide_cnt": int(checked["narrow_to_wide"].sum()),
+ 440:                     "width_jump_violation_cnt": int(checked["width_jump_violation"].sum()),
+ 441:                     "thickness_violation_cnt": int(checked["thickness_violation"].sum()),
+ 442:                     "temp_conflict_cnt": int(checked["temp_conflict"].sum()),
+ 443:                     "non_pc_direct_switch_cnt": int(checked["non_pc_direct_switch"].sum()),
+ 444:                     "campaign_bad_cnt": int(((checked.groupby("campaign_id")["tons"].sum() < 700) | (checked.groupby("campaign_id")["tons"].sum() > 2000)).sum()) if len(checked) else 0,
+ 445:                     "dropped_cnt": len(dropped),
+ 446:                 }
+ 447:                 logs.append(metric)
+ 448:                 best = checked
+ 449:                 if metric["virtual_cnt"] > 0:
+ 450:                     bridge_w = int(bridge_w * 1.15)
+ 451:             break
+ 452:         except RuntimeError:
+ 453:             if len(work) <= 30:
+ 454:                 segments = _greedy_segment_indices(bridgeable, [float(x) for x in work["width"].tolist()])
+ 455:                 parts = []
+ 456:                 for sid, seg_idx in enumerate(segments, start=1):
+ 457:                     seg_df = work.iloc[seg_idx].copy().reset_index(drop=True)
+ 458:                     seg_df["segment_id"] = sid
+ 459:                     seg_expand = _expand_with_virtuals(seg_df, cfg.max_virtual_chain)
+ 460:                     parts.append(seg_expand)
+ 461:                 checked = _attach_checks(pd.concat(parts, ignore_index=True))
+ 462:                 checked = _assign_campaigns_strict(checked)
+ 463:                 checked, bad_camp = _drop_bad_campaigns(checked)
+ 464:                 if not bad_camp.empty:
+ 465:                     dropped.extend(bad_camp.to_dict("records"))
+ 466:                 logs.append(
+ 467:                     {
+ 468:                         "round": 0,
+ 469:                         "line": work.iloc[0]["line"],
+ 470:                         "rows_total": len(checked),
+ 471:                         "virtual_cnt": int(checked["is_virtual"].sum()),
+ 472:                         "narrow_to_wide_cnt": int(checked["narrow_to_wide"].sum()),
+ 473:                         "width_jump_violation_cnt": int(checked["width_jump_violation"].sum()),
+ 474:                         "thickness_violation_cnt": int(checked["thickness_violation"].sum()),
+ 475:                         "temp_conflict_cnt": int(checked["temp_conflict"].sum()),
+ 476:                         "non_pc_direct_switch_cnt": int(checked["non_pc_direct_switch"].sum()),
+ 477:                         "campaign_bad_cnt": int(((checked.groupby("campaign_id")["tons"].sum() < 700) | (checked.groupby("campaign_id")["tons"].sum() > 2000)).sum()) if len(checked) else 0,
+ 478:                         "dropped_cnt": len(dropped),
+ 479:                     }
+ 480:                 )
+ 481:                 best = checked
+ 482:                 break
+ 483:             deg = []
+ 484:             for i in range(len(recs)):
+ 485:                 out_deg = sum(1 for j in range(len(recs)) if i != j and bridgeable.get((i, j), False))
+ 486:                 in_deg = sum(1 for j in range(len(recs)) if i != j and bridgeable.get((j, i), False))
+ 487:                 deg.append((out_deg + in_deg, i))
+ 488:             _, bad_i = min(deg, key=lambda x: x[0])
+ 489:             bad_row = work.iloc[bad_i].to_dict()
+ 490:             bad_row["drop_reason"] = "NO_CHAIN_WITHIN_3_VIRTUAL"
+ 491:             dropped.append(bad_row)
+ 492:             work = work.drop(index=bad_i).reset_index(drop=True)
+ 493: 
+ 494:     dropped_df = pd.DataFrame(dropped)
+ 495:     return best if best is not None else pd.DataFrame(), pd.DataFrame(logs), dropped_df
+ 496: 
+ 497: 
+ 498: def build_schedule(orders_path: str, steel_info_path: str, output_path: str, config: SolveConfig | None = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+ 499:     cfg = config or SolveConfig()
+ 500:     data = _prepare_orders(Path(orders_path), Path(steel_info_path), cfg.max_orders)
+ 501:     out_rows = []
+ 502:     logs = []
+ 503:     dropped_rows = []
+ 504:     for line_name in ["big_roll", "small_roll"]:
+ 505:         d = data[data["line"] == line_name].copy()
+ 506:         if d.empty:
+ 507:             continue
+ 508:         seq_line, log_line, dropped_line = _line_schedule(d, cfg)
+ 509:         out_rows.append(seq_line)
+ 510:         logs.append(log_line)
+ 511:         if not dropped_line.empty:
+ 512:             dropped_rows.append(dropped_line)
+ 513:     if not out_rows:
+ 514:         raise RuntimeError("No schedulable data.")
+ 515: 
+ 516:     final_df = pd.concat(out_rows, ignore_index=True)
+ 517:     final_df["line_seq"] = final_df.groupby("line").cumcount() + 1
+ 518:     rounds_df = pd.concat(logs, ignore_index=True) if logs else pd.DataFrame()
+ 519:     dropped_df = pd.concat(dropped_rows, ignore_index=True) if dropped_rows else pd.DataFrame()
+ 520: 
+ 521:     summary = pd.DataFrame(
+ 522:         [
+ 523:             ("orders_total", int((~final_df["is_virtual"]).sum())),
+ 524:             ("virtual_total", int(final_df["is_virtual"].sum())),
+ 525:             ("max_virtual_consecutive", int(final_df.groupby((~final_df["is_virtual"]).cumsum())["is_virtual"].sum().max())),
+ 526:             ("narrow_to_wide_cnt", int(final_df["narrow_to_wide"].sum())),
+ 527:             ("width_jump_violation_cnt", int(final_df["width_jump_violation"].sum())),
+ 528:             ("thickness_violation_cnt", int(final_df["thickness_violation"].sum())),
+ 529:             ("temp_conflict_cnt", int(final_df["temp_conflict"].sum())),
+ 530:             ("non_pc_direct_switch_cnt", int(final_df["non_pc_direct_switch"].sum())),
+ 531:             ("campaign_bad_cnt", int(((final_df.groupby(["line", "campaign_id"])["tons"].sum() < 700) | (final_df.groupby(["line", "campaign_id"])["tons"].sum() > 2000)).sum())),
+ 532:             ("dropped_orders_cnt", int(len(dropped_df))),
+ 533:         ],
+ 534:         columns=["metric", "value"],
+ 535:     )
+ 536: 
+ 537:     schedule_cn = final_df.copy()
+ 538:     schedule_cn["虚拟板坯标识"] = schedule_cn["is_virtual"].map(lambda x: "�? if bool(x) else "�?)
+ 539:     schedule_cn["辊期编号"] = schedule_cn["campaign_id"]
+ 540:     schedule_cn["产线"] = schedule_cn["line"].map(lambda x: "小辊产线" if x == "small_roll" else "大辊产线")
+ 541:     col_map = {
+ 542:         "seq": "全局序号",
+ 543:         "line_seq": "产线内序�?,
+ 544:         "segment_id": "段内编号",
+ 545:         "order_id": "订单�?,
+ 546:         "grade": "牌号",
+ 547:         "steel_group": "钢种�?,
+ 548:         "width": "宽度",
+ 549:         "thickness": "厚度",
+ 550:         "temp_min": "温度下限",
+ 551:         "temp_max": "温度上限",
+ 552:         "temp_mean": "温度均�?,
+ 553:         "tons": "吨位",
+ 554:         "prev_width": "前卷宽度",
+ 555:         "prev_thickness": "前卷厚度",
+ 556:         "prev_group": "前卷钢种�?,
+ 557:         "width_drop": "宽度跳变�?,
+ 558:         "narrow_to_wide": "是否窄到�?,
+ 559:         "width_jump_violation": "宽度跳变违规",
+ 560:         "thickness_violation": "厚度跳变违规",
+ 561:         "temp_conflict": "温度冲突",
+ 562:         "group_switch": "钢种组切�?,
+ 563:         "non_pc_direct_switch": "非普碳直切违�?,
+ 564:         "campaign_tons": "辊期吨位",
+ 565:         "is_virtual": "是否虚拟(布尔)",
+ 566:         "line": "产线代码",
+ 567:     }
+ 568:     schedule_cn = schedule_cn.rename(columns=col_map)
+ 569:     keep_cols = [
+ 570:         "全局序号",
+ 571:         "产线",
+ 572:         "产线内序�?,
+ 573:         "段内编号",
+ 574:         "辊期编号",
+ 575:         "辊期吨位",
+ 576:         "虚拟板坯标识",
+ 577:         "订单�?,
+ 578:         "牌号",
+ 579:         "钢种�?,
+ 580:         "宽度",
+ 581:         "厚度",
+ 582:         "温度下限",
+ 583:         "温度上限",
+ 584:         "吨位",
+ 585:         "前卷宽度",
+ 586:         "前卷厚度",
+ 587:         "前卷钢种�?,
+ 588:         "宽度跳变�?,
+ 589:         "是否窄到�?,
+ 590:         "宽度跳变违规",
+ 591:         "厚度跳变违规",
+ 592:         "温度冲突",
+ 593:         "非普碳直切违�?,
+ 594:     ]
+ 595:     schedule_cn = schedule_cn[[c for c in keep_cols if c in schedule_cn.columns]]
+ 596: 
+ 597:     rounds_cn = rounds_df.rename(
+ 598:         columns={
+ 599:             "round": "轮次",
+ 600:             "line": "产线",
+ 601:             "rows_total": "总行�?,
+ 602:             "virtual_cnt": "虚拟板坯�?,
+ 603:             "narrow_to_wide_cnt": "窄到宽次�?,
+ 604:             "width_jump_violation_cnt": "宽度跳变违规次数",
+ 605:             "thickness_violation_cnt": "厚度跳变违规次数",
+ 606:             "temp_conflict_cnt": "温度冲突次数",
+ 607:             "non_pc_direct_switch_cnt": "非普碳直切违规次�?,
+ 608:             "campaign_bad_cnt": "辊期吨位不合规数",
+ 609:             "dropped_cnt": "剔除订单�?,
+ 610:         }
+ 611:     )
+ 612:     if "产线" in rounds_cn.columns:
+ 613:         rounds_cn["产线"] = rounds_cn["产线"].map(lambda x: "小辊产线" if x == "small_roll" else "大辊产线")
+ 614: 
+ 615:     summary_cn = summary.rename(columns={"metric": "指标", "value": "数�?})
+ 616:     metric_map = {
+ 617:         "orders_total": "已排真实订单�?,
+ 618:         "virtual_total": "虚拟板坯�?,
+ 619:         "max_virtual_consecutive": "最大连续虚拟板坯数",
+ 620:         "narrow_to_wide_cnt": "窄到宽次�?,
+ 621:         "width_jump_violation_cnt": "宽度跳变违规次数",
+ 622:         "thickness_violation_cnt": "厚度跳变违规次数",
+ 623:         "temp_conflict_cnt": "温度冲突次数",
+ 624:         "non_pc_direct_switch_cnt": "非普碳直切违规次�?,
+ 625:         "campaign_bad_cnt": "辊期吨位不合规数",
+ 626:         "dropped_orders_cnt": "剔除订单�?,
+ 627:     }
+ 628:     summary_cn["指标"] = summary_cn["指标"].map(lambda x: metric_map.get(x, x))
+ 629: 
+ 630:     dropped_cn = dropped_df.rename(
+ 631:         columns={
+ 632:             "order_id": "订单�?,
+ 633:             "line": "产线",
+ 634:             "grade": "牌号",
+ 635:             "steel_group": "钢种�?,
+ 636:             "width": "宽度",
+ 637:             "thickness": "厚度",
+ 638:             "temp_min": "温度下限",
+ 639:             "temp_max": "温度上限",
+ 640:             "tons": "吨位",
+ 641:             "drop_reason": "剔除原因",
+ 642:         }
+ 643:     )
+ 644:     if not dropped_cn.empty and "产线" in dropped_cn.columns:
+ 645:         dropped_cn["产线"] = dropped_cn["产线"].map(lambda x: "小辊产线" if x == "small_roll" else "大辊产线")
+ 646: 
+ 647:     out = Path(output_path)
+ 648:     out.parent.mkdir(parents=True, exist_ok=True)
+ 649:     with pd.ExcelWriter(out, engine="openpyxl") as w:
+ 650:         schedule_cn.to_excel(w, sheet_name="排程结果", index=False)
+ 651:         rounds_cn.to_excel(w, sheet_name="迭代统计", index=False)
+ 652:         summary_cn.to_excel(w, sheet_name="汇总统�?, index=False)
+ 653:         dropped_cn.to_excel(w, sheet_name="剔除订单", index=False)
+ 654:     final_df.to_csv(out.with_suffix(".csv"), index=False, encoding="utf-8-sig")
+ 655:     return final_df, rounds_df
