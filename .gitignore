@@ -5,3 +5,15 @@ __pycache__/
 .idea/
 *.pyc
 
+# local env
+.env
+
+# analysis webapp
+webapp/node_modules/
+webapp/dist/
+webapp/.env
+webapp/.env.*
+webapp/.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

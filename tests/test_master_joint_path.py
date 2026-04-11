@@ -237,14 +237,14 @@ def test_export_contains_engine_used(tmp_path: Path):
     assert str(v) == "joint_master"
     xls = pd.ExcelFile(out_xlsx)
     for sheet in [
-        "RUN_SUMMARY",
-        "LINE_SUMMARY",
-        "VIOLATION_SUMMARY",
-        "UNSCHEDULED_SUMMARY",
-        "BRIDGE_SUMMARY",
-        "SLOT_SUMMARY",
-        "DROP_AND_BRIDGE_DETAILS",
-        "PROGRESS_METRICS",
+        "运行汇总",
+        "产线汇总",
+        "违规汇总",
+        "未排汇总",
+        "桥接汇总",
+        "槽位汇总",
+        "剔除与桥接明细",
+        "进展指标",
     ]:
         assert sheet in xls.sheet_names
 
@@ -339,10 +339,10 @@ def test_export_contains_candidate_analysis_sheets_and_candidate_metrics(tmp_pat
     )
     xls = pd.ExcelFile(out_xlsx)
     for sheet in [
-        "BIG_ROLL_CANDIDATE",
-        "SMALL_ROLL_CANDIDATE",
-        "LINE_SUMMARY_CANDIDATE",
-        "VIOLATION_SUMMARY_CANDIDATE",
+        "大辊线候选排程",
+        "小辊线候选排程",
+        "产线汇总_候选",
+        "违规汇总_候选",
     ]:
         assert sheet in xls.sheet_names
     # Candidate backfill: main schedule sheets should not be empty when official schedule is empty.
@@ -350,16 +350,16 @@ def test_export_contains_candidate_analysis_sheets_and_candidate_metrics(tmp_pat
     small_main = pd.read_excel(out_xlsx, sheet_name="小辊线排程")
     assert len(big_main) == 1
     assert len(small_main) == 0
-    line_summary = pd.read_excel(out_xlsx, sheet_name="LINE_SUMMARY")
-    assert int(line_summary.loc[line_summary["line"] == "big_roll", "scheduled_orders"].iloc[0]) == 1
-    assert (line_summary["summary_mode"] == "CANDIDATE_ANALYSIS").any()
-    unroutable_slots = pd.read_excel(out_xlsx, sheet_name="UNROUTABLE_SLOTS")
+    line_summary = pd.read_excel(out_xlsx, sheet_name="产线汇总")
+    assert int(line_summary.loc[line_summary["产线代码"] == "big_roll", "已排订单数"].iloc[0]) == 1
+    assert (line_summary["统计口径"] == "候选口径").any()
+    unroutable_slots = pd.read_excel(out_xlsx, sheet_name="不可路由槽位")
     assert len(unroutable_slots) == 1
-    slot_summary = pd.read_excel(out_xlsx, sheet_name="SLOT_SUMMARY")
+    slot_summary = pd.read_excel(out_xlsx, sheet_name="槽位汇总")
     assert len(slot_summary) >= 1
-    progress = pd.read_excel(out_xlsx, sheet_name="PROGRESS_METRICS")
-    assert int(progress["big_roll_scheduled_orders"].iloc[0]) == 1
-    violation_summary = pd.read_excel(out_xlsx, sheet_name="VIOLATION_SUMMARY_CANDIDATE")
+    progress = pd.read_excel(out_xlsx, sheet_name="进展指标")
+    assert int(progress["大辊已排订单数"].iloc[0]) == 1
+    violation_summary = pd.read_excel(out_xlsx, sheet_name="违规汇总_候选")
     assert (violation_summary["metric"] == "candidate_unroutable_slot_count").any()
 
 def test_solve_master_model_returns_strong_infeasibility_signal():

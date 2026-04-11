@@ -41,6 +41,7 @@ def main() -> None:
     t0 = time.perf_counter()
     parser = argparse.ArgumentParser(description="Run cold rolling schedule example")
     parser.add_argument("--strict", action="store_true", help="Disable semantic fallback and fail fast")
+    parser.add_argument("--persist-mysql", action="store_true", help="Import analysis Excel into local MySQL (optional)")
     parser.add_argument(
         "--profile",
         choices=[
@@ -99,6 +100,15 @@ def main() -> None:
     print("\n前 10 行排程预览:")
     preview_cols = [c for c in ["global_seq", "order_id", "grade", "steel_group", "width", "thickness", "tons"] if c in seq_df.columns]
     print(seq_df[preview_cols].head(10).to_string(index=False))
+
+    if bool(args.persist_mysql):
+        try:
+            from aps_cp_sat.persistence.service import persist_run_analysis_from_excel
+
+            run_id = persist_run_analysis_from_excel(result.output_path)
+            print(f"[analysis][persist] ok run_id={run_id} xlsx={result.output_path}")
+        except Exception as e:
+            print(f"[analysis][persist] failed: {e}")
 
 
 if __name__ == "__main__":

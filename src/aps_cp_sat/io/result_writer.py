@@ -33,6 +33,56 @@ EXPORT_RULE_KEYS = [
 ]
 
 
+_LINE_ZH = {"big_roll": "大辊线", "small_roll": "小辊线"}
+_EDGE_TYPE_ZH = {"DIRECT_EDGE": "直接相邻", "REAL_BRIDGE_EDGE": "实物桥接", "VIRTUAL_BRIDGE_EDGE": "虚拟桥接"}
+_CANDIDATE_STATUS_ZH = {
+    "ASSIGNED_CANDIDATE": "候选已分配",
+    "DROPPED_CANDIDATE": "候选已剔除",
+    "UNROUTABLE_SLOT_MEMBER": "不可路由槽成员",
+}
+_SUMMARY_MODE_ZH = {"OFFICIAL": "正式口径", "CANDIDATE_ANALYSIS": "候选口径"}
+_RESULT_USAGE_ZH = {"OFFICIAL": "正式", "PARTIAL_OFFICIAL": "部分正式", "ANALYSIS_ONLY": "仅分析", "NOT_EXPORTED": "未导出"}
+_ACCEPTANCE_ZH = {
+    "OFFICIAL_FULL_SCHEDULE": "正式全排结果",
+    "PARTIAL_SCHEDULE_WITH_DROPS": "部分可接受(含剔除)",
+    "BEST_SEARCH_CANDIDATE_ANALYSIS": "最佳搜索候选(仅分析)",
+}
+_FAILURE_MODE_ZH = {
+    "FAILED_ROUTING_SEARCH": "路由搜索失败",
+    "FAILED_STRONG_INFEASIBILITY_SIGNAL": "强不可行信号",
+    "FAILED_TIME_BUDGET": "时间预算超限",
+    "FAILED_NO_CANDIDATE": "无候选",
+    "FAILED_IMPLEMENTATION_ERROR": "实现错误",
+}
+_VIOLATION_SRC_ZH = {
+    "slot_router_diagnostics": "槽位路由诊断",
+    "candidate_allocation_only": "候选分配推导",
+    "candidate_validate": "候选校验",
+    "UNAVAILABLE_FOR_CANDIDATE": "候选不可得",
+}
+_CONFIDENCE_ZH = {"high": "高", "medium": "中", "low": "低"}
+
+
+def _zh_enum(value: object, mapping: Dict[str, str]) -> object:
+    if value is None or value is pd.NA:
+        return value
+    s = str(value)
+    return mapping.get(s, value)
+
+
+def _zh_line(value: object) -> object:
+    return _zh_enum(value, _LINE_ZH)
+
+
+def _kv_to_zh(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if list(out.columns) == ["metric", "value"]:
+        out = out.rename(columns={"metric": "指标", "value": "值"})
+    elif list(out.columns) == ["指标", "值"]:
+        return out
+    return out
+
+
 def _campaign_ton_penalty(df: pd.DataFrame, rule: RuleConfig) -> Tuple[int, float]:
     if df.empty or "is_virtual" not in df.columns:
         return 0, 0.0
@@ -983,6 +1033,22 @@ def export_schedule_results(
     slot_summary_df, unroutable_slots_df = _build_slot_frames(raw_slots, candidate_schedule_df)
 
     validation_summary = failure_diagnostics.get("validation_summary", {}) if isinstance(failure_diagnostics, dict) else {}
+    hard_violation_total_official = 0
+    for k in [
+        "width_jump_violation_cnt",
+        "thickness_violation_cnt",
+        "temp_conflict_cnt",
+        "non_pc_direct_switch_cnt",
+        "direct_reverse_step_violation_count",
+        "virtual_attach_reverse_violation_count",
+        "period_reverse_count_violation_count",
+        "bridge_count_violation_count",
+        "invalid_virtual_spec_count",
+    ]:
+        try:
+            hard_violation_total_official += int(validation_summary.get(k, 0) or 0)
+        except Exception:
+            continue
     candidate_violation_summary_df = _build_candidate_violation_summary(
         candidate_schedule_df,
         raw_slots,
@@ -991,6 +1057,7 @@ def export_schedule_results(
     )
     violation_summary_df = pd.DataFrame(
         [
+            ("hard_constraint_violation_count", int(hard_violation_total_official)),
             ("direct_reverse_step_violation_count", int(validation_summary.get("direct_reverse_step_violation_count", 0))),
             ("virtual_attach_reverse_violation_count", int(validation_summary.get("virtual_attach_reverse_violation_count", 0))),
             ("period_reverse_count_violation_count", int(validation_summary.get("period_reverse_count_violation_count", 0))),
@@ -1058,6 +1125,7 @@ def export_schedule_results(
             int(validation_summary.get("virtual_attach_reverse_violation_count", 0)),
             int(validation_summary.get("period_reverse_count_violation_count", 0)),
             int(validation_summary.get("invalid_virtual_spec_count", 0)),
+            (pd.NA if candidate_backfill_mode else int(hard_violation_total_official)),
             template_build_seconds,
             joint_master_seconds,
             fallback_total_seconds,
@@ -1072,6 +1140,7 @@ def export_schedule_results(
             "selected_direct_edge_count", "selected_real_bridge_edge_count", "selected_virtual_bridge_edge_count",
             "direct_reverse_step_violation_count", "virtual_attach_reverse_violation_count",
             "period_reverse_count_violation_count", "invalid_virtual_spec_count",
+            "hard_constraint_violation_count",
             "template_build_seconds", "joint_master_seconds", "fallback_total_seconds", "total_run_seconds",
         ],
     )
@@ -1145,38 +1214,304 @@ def export_schedule_results(
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        big_sheet.to_excel(writer, sheet_name="大辊线排程", index=False)
-        small_sheet.to_excel(writer, sheet_name="小辊线排程", index=False)
+        # Main schedule sheets: keep official naming, but translate candidate drafts when backfilled.
+        if candidate_backfill_mode:
+            big_sheet_out = big_sheet.rename(
+                columns={
+                    "order_id": "物料号",
+                    "slot_no": "槽位号",
+                    "candidate_position": "槽位内序号",
+                    "candidate_slot_member_index": "槽位内成员序号",
+                    "tons": "吨位",
+                    "width": "宽度",
+                    "thickness": "厚度",
+                    "steel_group": "钢种组",
+                    "line_capability": "产线能力",
+                    "candidate_status": "候选状态",
+                    "slot_unroutable_flag": "槽不可路由标记",
+                    "slot_route_risk_score": "槽路由风险",
+                    "selected_edge_type": "选中边类型",
+                    "analysis_only": "仅分析",
+                    "official_usable": "可下发",
+                    "result_usage": "结果用途",
+                }
+            )
+            if "候选状态" in big_sheet_out.columns:
+                big_sheet_out["候选状态"] = big_sheet_out["候选状态"].map(lambda v: _zh_enum(v, _CANDIDATE_STATUS_ZH))
+            if "选中边类型" in big_sheet_out.columns:
+                big_sheet_out["选中边类型"] = big_sheet_out["选中边类型"].map(lambda v: _zh_enum(v, _EDGE_TYPE_ZH))
+            small_sheet_out = small_sheet.rename(
+                columns={
+                    "order_id": "物料号",
+                    "slot_no": "槽位号",
+                    "candidate_position": "槽位内序号",
+                    "candidate_slot_member_index": "槽位内成员序号",
+                    "tons": "吨位",
+                    "width": "宽度",
+                    "thickness": "厚度",
+                    "steel_group": "钢种组",
+                    "line_capability": "产线能力",
+                    "candidate_status": "候选状态",
+                    "slot_unroutable_flag": "槽不可路由标记",
+                    "slot_route_risk_score": "槽路由风险",
+                    "selected_edge_type": "选中边类型",
+                    "analysis_only": "仅分析",
+                    "official_usable": "可下发",
+                    "result_usage": "结果用途",
+                }
+            )
+            if "候选状态" in small_sheet_out.columns:
+                small_sheet_out["候选状态"] = small_sheet_out["候选状态"].map(lambda v: _zh_enum(v, _CANDIDATE_STATUS_ZH))
+            if "选中边类型" in small_sheet_out.columns:
+                small_sheet_out["选中边类型"] = small_sheet_out["选中边类型"].map(lambda v: _zh_enum(v, _EDGE_TYPE_ZH))
+        else:
+            big_sheet_out = big_sheet
+            small_sheet_out = small_sheet
+        big_sheet_out.to_excel(writer, sheet_name="大辊线排程", index=False)
+        small_sheet_out.to_excel(writer, sheet_name="小辊线排程", index=False)
         campaign_tons_df.to_excel(writer, sheet_name="轧期吨位统计", index=False)
-        rounds_out.to_excel(writer, sheet_name="轮次统计", index=False)
+        rounds_out.rename(columns={"round": "轮次", "line": "产线代码"}).to_excel(writer, sheet_name="轮次统计", index=False)
         summary_df.to_excel(writer, sheet_name="总览指标", index=False)
         flow_df.to_excel(writer, sheet_name="订单去向", index=False)
         dropped_out.to_excel(writer, sheet_name="剔除订单", index=False)
         dropped_reason_stats.to_excel(writer, sheet_name="剔除原因统计", index=False)
         runtime_report.to_excel(writer, sheet_name="标准化运行报表", index=False)
-        diagnostics_report.to_excel(writer, sheet_name="诊断摘要", index=False)
+        diagnostics_report.rename(columns={"section": "分区", "metric": "指标", "value": "值"}).to_excel(writer, sheet_name="诊断摘要", index=False)
         equivalence_report.to_excel(writer, sheet_name="等价性检查", index=False)
-        diagnostics_snapshot.to_excel(writer, sheet_name="求解路径快照", index=False)
-        rule_snapshot.to_excel(writer, sheet_name="规则快照", index=False)
-        precheck_summary_df.to_excel(writer, sheet_name="PRECHECK_SUMMARY", index=False)
-        feasibility_evidence_df.to_excel(writer, sheet_name="FEASIBILITY_EVIDENCE", index=False)
-        template_summary_df.to_excel(writer, sheet_name="TEMPLATE_SUMMARY", index=False)
-        master_allocation_summary_df.to_excel(writer, sheet_name="MASTER_ALLOCATION_SUMMARY", index=False)
-        unroutable_slots_df.to_excel(writer, sheet_name="UNROUTABLE_SLOTS", index=False)
-        drop_and_bridge_summary_df.to_excel(writer, sheet_name="DROP_AND_BRIDGE_SUMMARY", index=False)
-        run_summary_df.to_excel(writer, sheet_name="RUN_SUMMARY", index=False)
-        line_summary_df.to_excel(writer, sheet_name="LINE_SUMMARY", index=False)
-        violation_summary_df.to_excel(writer, sheet_name="VIOLATION_SUMMARY", index=False)
-        unscheduled_summary_df.to_excel(writer, sheet_name="UNSCHEDULED_SUMMARY", index=False)
-        bridge_summary_df.to_excel(writer, sheet_name="BRIDGE_SUMMARY", index=False)
-        slot_summary_df.to_excel(writer, sheet_name="SLOT_SUMMARY", index=False)
-        drop_and_bridge_details_df.to_excel(writer, sheet_name="DROP_AND_BRIDGE_DETAILS", index=False)
-        progress_metrics_df.to_excel(writer, sheet_name="PROGRESS_METRICS", index=False)
+        diagnostics_snapshot.rename(columns={"key": "字段", "value": "值"}).to_excel(writer, sheet_name="求解路径快照", index=False)
+        rule_snapshot.rename(
+            columns={
+                "rule_key": "规则键",
+                "zh_name": "中文名",
+                "en_name": "英文名",
+                "solver_active": "求解启用",
+                "validation_active": "校验启用",
+                "export_visible": "导出可见",
+            }
+        ).to_excel(writer, sheet_name="规则快照", index=False)
+        _kv_to_zh(precheck_summary_df).to_excel(writer, sheet_name="数据预检汇总", index=False)
+        _kv_to_zh(feasibility_evidence_df).to_excel(writer, sheet_name="不可行证据", index=False)
+        template_summary_df.assign(产线=template_summary_df.get("line", "").map(_zh_line)).rename(
+            columns={
+                "line": "产线代码",
+                "candidate_pairs": "候选pair数",
+                "templates_built": "模板数",
+                "template_coverage_ratio": "模板覆盖率",
+                "avg_virtual_count": "平均虚拟段数",
+                "max_virtual_count": "最大虚拟段数",
+                "rejected_by_chain_limit": "链长拒绝数",
+                "direct_edge_count": "直接边数",
+                "real_bridge_edge_count": "实物桥接边数",
+                "virtual_bridge_edge_count": "虚拟桥接边数",
+            }
+        )[[
+            "产线", "产线代码", "候选pair数", "模板数", "模板覆盖率", "平均虚拟段数", "最大虚拟段数",
+            "链长拒绝数", "直接边数", "实物桥接边数", "虚拟桥接边数",
+        ]].to_excel(writer, sheet_name="模板汇总", index=False)
+        master_allocation_summary_df.assign(产线=master_allocation_summary_df.get("line", "").map(_zh_line)).rename(
+            columns={
+                "line": "产线代码",
+                "slot_no": "槽位号",
+                "slot_order_count": "槽内订单数",
+                "slot_tons": "槽内吨位",
+                "order_count_over_cap": "超cap订单数",
+                "slot_route_risk_score": "槽路由风险",
+                "pair_gap_proxy": "pair缺口风险",
+                "span_risk": "跨度风险",
+                "degree_risk": "低度数风险",
+                "isolated_order_penalty": "孤点惩罚",
+                "selected_bridge_mix": "桥接mix",
+            }
+        )[[
+            "产线", "产线代码", "槽位号", "槽内订单数", "槽内吨位", "超cap订单数",
+            "槽路由风险", "pair缺口风险", "跨度风险", "低度数风险", "孤点惩罚", "桥接mix",
+        ]].to_excel(writer, sheet_name="主模型分配汇总", index=False)
+        unroutable_slots_df.assign(产线=unroutable_slots_df.get("line", "").map(_zh_line)).rename(
+            columns={
+                "line": "产线代码",
+                "slot_no": "槽位号",
+                "order_count": "槽内订单数",
+                "template_coverage_ratio": "模板覆盖率",
+                "missing_template_edge_count": "缺失模板边数",
+                "zero_in_orders": "零入度订单数",
+                "zero_out_orders": "零出度订单数",
+                "width_span": "宽度跨度",
+                "thickness_span": "厚度跨度",
+                "steel_group_count": "钢种组数量",
+                "slot_route_risk_score": "槽路由风险",
+                "dominant_unroutable_reason": "主不可路由原因",
+                "top_isolated_orders": "孤点订单Top",
+            }
+        )[[
+            "产线", "产线代码", "槽位号", "槽内订单数", "模板覆盖率", "缺失模板边数",
+            "零入度订单数", "零出度订单数", "宽度跨度", "厚度跨度", "钢种组数量",
+            "槽路由风险", "主不可路由原因", "孤点订单Top",
+        ]].to_excel(writer, sheet_name="不可路由槽位", index=False)
+        _kv_to_zh(drop_and_bridge_summary_df).to_excel(writer, sheet_name="剔除与桥接汇总", index=False)
+        run_summary_zh = _kv_to_zh(run_summary_df)
+        if "指标" in run_summary_zh.columns and "值" in run_summary_zh.columns:
+            run_summary_zh["指标"] = run_summary_zh["指标"].map(
+                {
+                    "profile": "Profile",
+                    "acceptance": "结果类型",
+                    "failure_mode": "失败模式",
+                    "best_candidate_available": "是否有最佳候选",
+                    "best_candidate_type": "最佳候选类型",
+                    "best_candidate_objective": "最佳候选目标值",
+                    "best_candidate_search_status": "最佳候选状态",
+                    "best_candidate_routing_feasible": "最佳候选路由可行",
+                    "best_candidate_unroutable_slot_count": "最佳候选不可路由槽位数",
+                    "export_consistency_ok": "导出口径一致",
+                    "routing_feasible": "路由可行",
+                    "evidence_level": "证据等级",
+                    "total_orders": "总订单数",
+                    "scheduled_orders": "已排订单数",
+                    "unscheduled_orders": "未排订单数",
+                    "scheduled_tons": "已排吨位",
+                    "unscheduled_tons": "未排吨位",
+                    "total_run_seconds": "总耗时(s)",
+                    "template_build_seconds": "模板耗时(s)",
+                    "joint_master_seconds": "主模型耗时(s)",
+                    "fallback_total_seconds": "fallback耗时(s)",
+                }
+            ).fillna(run_summary_zh["指标"])
+            def _zh_run_value(k: str, v: object) -> object:
+                if k in {"结果类型", "acceptance"}:
+                    return _zh_enum(v, _ACCEPTANCE_ZH)
+                if k in {"失败模式", "failure_mode"}:
+                    return _zh_enum(v, _FAILURE_MODE_ZH)
+                return v
+            run_summary_zh["值"] = [
+                _zh_run_value(str(k), v) for k, v in zip(run_summary_zh["指标"].tolist(), run_summary_zh["值"].tolist())
+            ]
+        run_summary_zh.to_excel(writer, sheet_name="运行汇总", index=False)
+        line_summary_df.assign(产线=line_summary_df.get("line", "").map(_zh_line)).rename(
+            columns={
+                "line": "产线代码",
+                "scheduled_orders": "已排订单数",
+                "scheduled_tons": "已排吨位",
+                "slot_count": "槽位数",
+                "avg_slot_order_count": "平均槽位订单数",
+                "max_slot_order_count": "最大槽位订单数",
+                "unroutable_slot_count": "不可路由槽位数",
+                "direct_edge_count": "直接边数",
+                "real_bridge_edge_count": "实物桥接边数",
+                "virtual_bridge_edge_count": "虚拟桥接边数",
+                "summary_mode": "统计口径",
+            }
+        ).assign(**{"统计口径": line_summary_df.get("summary_mode", "").map(lambda v: _zh_enum(v, _SUMMARY_MODE_ZH))})[[
+            "产线", "产线代码", "已排订单数", "已排吨位", "槽位数", "平均槽位订单数", "最大槽位订单数",
+            "不可路由槽位数", "直接边数", "实物桥接边数", "虚拟桥接边数", "统计口径",
+        ]].to_excel(writer, sheet_name="产线汇总", index=False)
+        violation_out = _kv_to_zh(violation_summary_df) if list(violation_summary_df.columns) == ["metric", "value"] else violation_summary_df.copy()
+        if list(violation_out.columns) == ["metric", "official_value", "candidate_value", "violation_count_source", "violation_count_confidence"]:
+            violation_out = violation_out.rename(
+                columns={
+                    "metric": "指标",
+                    "official_value": "正式值",
+                    "candidate_value": "候选值",
+                    "violation_count_source": "统计来源",
+                    "violation_count_confidence": "置信度",
+                }
+            )
+            violation_out["统计来源"] = violation_out["统计来源"].map(lambda v: _zh_enum(v, _VIOLATION_SRC_ZH))
+            violation_out["置信度"] = violation_out["置信度"].map(lambda v: _zh_enum(v, _CONFIDENCE_ZH))
+        else:
+            violation_out = _kv_to_zh(violation_out).rename(columns={"指标": "指标", "值": "值"})
+            if "指标" in violation_out.columns:
+                violation_out["指标"] = violation_out["指标"].map(
+                    {
+                        "hard_constraint_violation_count": "硬约束违例总数",
+                        "direct_reverse_step_violation_count": "直接逆宽违例数(>20)",
+                        "virtual_attach_reverse_violation_count": "虚拟接入逆宽违例数(>250)",
+                        "period_reverse_count_violation_count": "辊期逆宽次数违例数(>5)",
+                        "bridge_count_violation_count": "桥链长度违例数(>5)",
+                        "invalid_virtual_spec_count": "虚拟规格违例数",
+                        "unroutable_slot_count": "不可路由槽位数",
+                        "hard_cap_not_enforced": "hard cap 未生效",
+                        "isolation_risk_not_effective": "孤点风险未生效",
+                    }
+                ).fillna(violation_out["指标"])
+        violation_out.to_excel(writer, sheet_name="违规汇总", index=False)
+        _kv_to_zh(unscheduled_summary_df).to_excel(writer, sheet_name="未排汇总", index=False)
+        _kv_to_zh(bridge_summary_df).to_excel(writer, sheet_name="桥接汇总", index=False)
+        slot_summary_df.assign(产线=slot_summary_df.get("line", "").map(_zh_line)).rename(
+            columns={
+                "line": "产线代码",
+                "slot_no": "槽位号",
+                "slot_order_count": "槽内订单数",
+                "slot_tons": "槽内吨位",
+                "order_count_over_cap": "超cap订单数",
+                "slot_route_risk_score": "槽路由风险",
+                "pair_gap_proxy": "pair缺口风险",
+                "span_risk": "跨度风险",
+                "degree_risk": "低度数风险",
+                "isolated_order_penalty": "孤点惩罚",
+                "dominant_unroutable_reason": "主不可路由原因",
+            }
+        )[[
+            "产线", "产线代码", "槽位号", "槽内订单数", "槽内吨位", "超cap订单数",
+            "槽路由风险", "pair缺口风险", "跨度风险", "低度数风险", "孤点惩罚", "主不可路由原因",
+        ]].to_excel(writer, sheet_name="槽位汇总", index=False)
+        drop_and_bridge_details_df.rename(
+            columns={
+                "order_id": "物料号",
+                "dropped": "是否剔除",
+                "dominant_drop_reason": "主剔除原因",
+                "secondary_reasons": "次要原因",
+                "globally_isolated": "全局孤点",
+                "candidate_lines": "候选产线",
+                "risk_summary": "风险摘要",
+                "selected_edge_type": "选中边类型",
+                "bridge_count": "桥段数",
+                "bridge_type": "桥接类型",
+                "virtual_widths_used": "虚拟宽度使用",
+                "virtual_thicknesses_used": "虚拟厚度使用",
+            }
+        ).to_excel(writer, sheet_name="剔除与桥接明细", index=False)
+        progress_out = progress_metrics_df.copy()
+        progress_out = progress_out.rename(
+            columns={
+                "profile": "Profile",
+                "acceptance": "结果类型",
+                "failure_mode": "失败模式",
+                "best_candidate_available": "是否有最佳候选",
+                "best_candidate_type": "最佳候选类型",
+                "export_consistency_ok": "导出口径一致",
+                "routing_feasible": "路由可行",
+                "scheduled_orders": "已排订单数",
+                "unscheduled_orders": "未排订单数",
+                "dropped_order_count": "剔除订单数",
+                "dropped_tons": "剔除吨位",
+                "big_roll_scheduled_orders": "大辊已排订单数",
+                "small_roll_scheduled_orders": "小辊已排订单数",
+                "unroutable_slot_count": "不可路由槽位数",
+                "max_big_roll_slot_order_count": "大辊最大槽订单数",
+                "max_small_roll_slot_order_count": "小辊最大槽订单数",
+                "selected_direct_edge_count": "直接边数(选中)",
+                "selected_real_bridge_edge_count": "实物桥接边数(选中)",
+                "selected_virtual_bridge_edge_count": "虚拟桥接边数(选中)",
+                "direct_reverse_step_violation_count": "直接逆宽违例数(>20)",
+                "virtual_attach_reverse_violation_count": "虚拟接入逆宽违例数(>250)",
+                "period_reverse_count_violation_count": "辊期逆宽次数违例数(>5)",
+                "invalid_virtual_spec_count": "虚拟规格违例数",
+                "hard_constraint_violation_count": "硬约束违例总数",
+                "template_build_seconds": "模板耗时(s)",
+                "joint_master_seconds": "主模型耗时(s)",
+                "fallback_total_seconds": "fallback耗时(s)",
+                "total_run_seconds": "总耗时(s)",
+            }
+        )
+        if "结果类型" in progress_out.columns:
+            progress_out["结果类型"] = progress_out["结果类型"].map(lambda v: _zh_enum(v, _ACCEPTANCE_ZH))
+        if "失败模式" in progress_out.columns:
+            progress_out["失败模式"] = progress_out["失败模式"].map(lambda v: _zh_enum(v, _FAILURE_MODE_ZH))
+        progress_out.to_excel(writer, sheet_name="进展指标", index=False)
         if best_candidate_available:
-            candidate_big_roll_out.to_excel(writer, sheet_name="BIG_ROLL_CANDIDATE", index=False)
-            candidate_small_roll_out.to_excel(writer, sheet_name="SMALL_ROLL_CANDIDATE", index=False)
-            candidate_line_summary_df.to_excel(writer, sheet_name="LINE_SUMMARY_CANDIDATE", index=False)
-            candidate_violation_summary_df.to_excel(writer, sheet_name="VIOLATION_SUMMARY_CANDIDATE", index=False)
+            candidate_big_roll_out.to_excel(writer, sheet_name="大辊线候选排程", index=False)
+            candidate_small_roll_out.to_excel(writer, sheet_name="小辊线候选排程", index=False)
+            candidate_line_summary_df.to_excel(writer, sheet_name="产线汇总_候选", index=False)
+            candidate_violation_summary_df.to_excel(writer, sheet_name="违规汇总_候选", index=False)
         _autosize_excel(writer)
 
     final_df.to_csv(out_path.with_suffix(".csv"), index=False, encoding="utf-8-sig")
