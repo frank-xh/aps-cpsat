@@ -1340,6 +1340,7 @@ def _repair_bridge_candidate_audit(
     block: list[CampaignSegment],
     real_bridge_lookup: dict[tuple[str, str, str], list[dict]],
     matched_keys: list[tuple[str, str, str]],
+    frontier_contexts: dict[tuple[str, str, str], list[dict]],
     direct_edges: set[tuple[str, str]],
     real_edges: set[tuple[str, str]],
     order_tons: dict[str, float],
@@ -1361,6 +1362,12 @@ def _repair_bridge_candidate_audit(
         "rejected_score_worse": 0,
         "accepted": 0,
         "exact_invalid_pair_count": 0,
+        "frontier_mismatch": 0,
+        "pair_invalid_width": 0,
+        "pair_invalid_thickness": 0,
+        "pair_invalid_temp": 0,
+        "pair_invalid_group": 0,
+        "pair_invalid_unknown": 0,
         "reject_buckets": Counter(),
     }
     seen: set[tuple[str, str, str]] = set()
@@ -1385,28 +1392,91 @@ def _repair_bridge_candidate_audit(
             )
             print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=MATCHED")
 
-            src_pos = pos_by_oid.get(str(src), -1)
-            dst_pos = pos_by_oid.get(str(dst), -1)
-            left_tail_window = combined[max(0, src_pos - 4) : src_pos + 1] if src_pos >= 0 else []
-            right_head_window = combined[dst_pos : min(len(combined), dst_pos + 5)] if dst_pos >= 0 else []
-            if src_pos >= 0 and dst_pos >= 0:
-                lo = max(0, min(src_pos, dst_pos) - 2)
-                hi = min(len(combined), max(src_pos, dst_pos) + 3)
-                tentative_window = combined[lo:hi]
+            contexts = frontier_contexts.get(key, [])
+            if not contexts:
+                # A band hit is not necessarily a materializable repair edge. Only the
+                # adjusted frontier pair is allowed to enter the landing candidate pool.
+                actual_left_tail = ""
+                actual_right_head = ""
+                for ctx in frontier_contexts.values():
+                    if ctx:
+                        actual_left_tail = str(ctx[0].get("actual_left_tail", ""))
+                        actual_right_head = str(ctx[0].get("actual_right_head", ""))
+                        break
+                out["frontier_mismatch"] += 1
+                out["rejected_pair_invalid"] += 1
+                out["exact_invalid_pair_count"] += 1
+                out["reject_buckets"]["TEMPLATE_PAIR_INVALID"] += 1
+                print(
+                    f"[APS][REPAIR_BRIDGE_FRONTIER_MISMATCH] candidate_id={candidate_id}, "
+                    f"bridge_from={src}, bridge_to={dst}, actual_left_tail={actual_left_tail}, "
+                    f"actual_right_head={actual_right_head}"
+                )
+                print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=FRONTIER_CHECKED")
+                print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=REJECTED, reason=TEMPLATE_PAIR_INVALID")
+                continue
+
+            ctx = contexts[0]
+            adjusted_left_orders = [str(v) for v in ctx.get("adjusted_left_orders", [])]
+            adjusted_right_orders = [str(v) for v in ctx.get("adjusted_right_orders", [])]
+            if str(adjusted_left_orders[-1] if adjusted_left_orders else "") != str(src) or str(adjusted_right_orders[0] if adjusted_right_orders else "") != str(dst):
+                out["frontier_mismatch"] += 1
+                out["rejected_pair_invalid"] += 1
+                out["exact_invalid_pair_count"] += 1
+                out["reject_buckets"]["TEMPLATE_PAIR_INVALID"] += 1
+                print(
+                    f"[APS][REPAIR_BRIDGE_FRONTIER_MISMATCH] candidate_id={candidate_id}, "
+                    f"bridge_from={src}, bridge_to={dst}, "
+                    f"actual_left_tail={adjusted_left_orders[-1] if adjusted_left_orders else ''}, "
+                    f"actual_right_head={adjusted_right_orders[0] if adjusted_right_orders else ''}"
+                )
+                print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=FRONTIER_CHECKED")
+                print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=REJECTED, reason=TEMPLATE_PAIR_INVALID")
+                continue
+            print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=FRONTIER_CHECKED")
+
+            left_materialized = adjusted_left_orders[: adjusted_left_orders.index(str(src)) + 1]
+            right_materialized = adjusted_right_orders[adjusted_right_orders.index(str(dst)) :]
+            tentative_sequence = left_materialized + right_materialized
+            frontier_idx = len(left_materialized) - 1
+            if frontier_idx >= 0 and frontier_idx + 1 < len(tentative_sequence):
+                tentative_frontier_pair = (str(tentative_sequence[frontier_idx]), str(tentative_sequence[frontier_idx + 1]))
             else:
-                tentative_window = []
+                tentative_frontier_pair = ("", "")
+            left_tail_window = left_materialized[-5:]
+            right_head_window = right_materialized[:5]
+            tentative_window = tentative_sequence[max(0, frontier_idx - 2) : min(len(tentative_sequence), frontier_idx + 4)]
+            print(
+                f"[APS][REPAIR_BRIDGE_MATERIALIZE] candidate_id={candidate_id}, bridge_from={src}, "
+                f"bridge_to={dst}, left_materialized_tail={left_tail_window}, "
+                f"right_materialized_head={right_head_window}, tentative_frontier_pair={tentative_frontier_pair}"
+            )
             print(
                 f"[APS][REPAIR_BRIDGE_TENTATIVE] candidate_id={candidate_id}, "
                 f"left_tail_window={left_tail_window}, right_head_window={right_head_window}, "
                 f"bridge_from={src}, bridge_to={dst}, tentative_window={tentative_window}"
             )
-            print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TENTATIVE_BUILT")
+            print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=MATERIALIZED")
 
             pair = (str(src), str(dst))
-            new_pairs = [pair]
+            original_pairs = set(zip(adjusted_left_orders, adjusted_left_orders[1:])) | set(zip(adjusted_right_orders, adjusted_right_orders[1:]))
+            tentative_pairs = list(zip(tentative_sequence, tentative_sequence[1:]))
+            new_pairs = [p for p in tentative_pairs if p not in original_pairs]
             print(f"[APS][REPAIR_BRIDGE_NEW_PAIRS] candidate_id={candidate_id}, new_pairs={new_pairs}")
+            print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=NEW_PAIRS_COMPUTED")
+            if pair not in new_pairs or tentative_frontier_pair != pair:
+                out["rejected_pair_invalid"] += 1
+                out["exact_invalid_pair_count"] += 1
+                out["pair_invalid_unknown"] += 1
+                out["reject_buckets"]["TEMPLATE_PAIR_INVALID"] += 1
+                print(
+                    f"[APS][REPAIR_BRIDGE_MATERIALIZE_ERROR] candidate_id={candidate_id}, "
+                    f"reason=BRIDGE_PAIR_NOT_FRONTIER_IN_TENTATIVE"
+                )
+                print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=REJECTED, reason=TEMPLATE_PAIR_INVALID")
+                continue
             template_ok = pair in direct_edges or pair in real_edges
-            adjacency_ok = src_pos >= 0 and dst_pos == src_pos + 1
+            adjacency_ok = tentative_frontier_pair == pair
             if not template_ok:
                 reason = "TEMPLATE_KEY_MISSING"
             elif not adjacency_ok:
@@ -1421,6 +1491,7 @@ def _repair_bridge_candidate_audit(
             if reason:
                 out["rejected_pair_invalid"] += 1
                 out["exact_invalid_pair_count"] += 1
+                out["pair_invalid_unknown"] += 1
                 out["reject_buckets"]["TEMPLATE_PAIR_INVALID"] += 1
                 print(
                     f"[APS][REPAIR_BRIDGE_PAIR_INVALID] candidate_id={candidate_id}, "
@@ -1428,19 +1499,12 @@ def _repair_bridge_candidate_audit(
                 )
                 print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=REJECTED, reason=TEMPLATE_PAIR_INVALID")
                 continue
-            print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=NEW_PAIRS_VALIDATED")
+            print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=PAIR_VALIDATED")
 
             ton_valid = False
-            if src_pos >= 0 and dst_pos >= 0 and src_pos < dst_pos:
-                # A matched adjacent repair edge can only be used by a cut window that contains this pair.
-                for i in range(0, src_pos + 1):
-                    for j in range(dst_pos + 1, len(combined) + 1):
-                        tons = prefix[j] - prefix[i]
-                        if float(campaign_ton_min) - 1e-6 <= tons <= float(campaign_ton_max) + 1e-6:
-                            ton_valid = True
-                            break
-                    if ton_valid:
-                        break
+            materialized_tons = sum(float(order_tons.get(str(oid), 0.0) or 0.0) for oid in tentative_sequence)
+            if float(campaign_ton_min) - 1e-6 <= materialized_tons <= float(campaign_ton_max) + 1e-6:
+                ton_valid = True
             if not ton_valid:
                 out["rejected_ton_invalid"] += 1
                 out["reject_buckets"]["TON_WINDOW_INVALID"] += 1
@@ -1808,6 +1872,12 @@ def _reconstruct_underfilled_segments(
         "repair_bridge_candidates_rejected_score_worse": 0,
         "repair_bridge_candidates_accepted": 0,
         "repair_bridge_exact_invalid_pair_count": 0,
+        "repair_bridge_frontier_mismatch_count": 0,
+        "repair_bridge_pair_invalid_width": 0,
+        "repair_bridge_pair_invalid_thickness": 0,
+        "repair_bridge_pair_invalid_temp": 0,
+        "repair_bridge_pair_invalid_group": 0,
+        "repair_bridge_pair_invalid_unknown": 0,
         "repair_only_real_bridge_used_segments": 0,
         "repair_only_real_bridge_used_orders": 0,
         "repair_only_real_bridge_not_entered_reason": "",
@@ -1941,6 +2011,8 @@ def _reconstruct_underfilled_segments(
                 )
                 adjustment_boundary_keys: list[tuple[str, str, str]] = []
                 adjustment_band_logs: list[dict] = []
+                frontier_boundary_keys: list[tuple[str, str, str]] = []
+                frontier_contexts: dict[tuple[str, str, str], list[dict]] = {}
                 adjustment_generated_total = 0
                 adjustment_pairs_tested_total = 0
                 adjustment_hits_total = 0
@@ -2020,6 +2092,26 @@ def _reconstruct_underfilled_segments(
                         adjustment_pairs_tested_total += int(len(band_pairs))
                         split_adjustment_pairs += int(len(band_pairs))
                         adjustment_boundary_keys.extend(band_pairs)
+                        frontier_key: tuple[str, str, str] | None = None
+                        if adjusted_left_orders and adjusted_right_orders:
+                            frontier_key = (
+                                str(line),
+                                str(adjusted_left_orders[-1]),
+                                str(adjusted_right_orders[0]),
+                            )
+                            frontier_boundary_keys.append(frontier_key)
+                            frontier_contexts.setdefault(frontier_key, []).append(
+                                {
+                                    "split_id": split_id,
+                                    "adjustment_id": adjustment_id,
+                                    "left_trim": left_trim,
+                                    "right_trim": right_trim,
+                                    "adjusted_left_orders": list(adjusted_left_orders),
+                                    "adjusted_right_orders": list(adjusted_right_orders),
+                                    "actual_left_tail": str(adjusted_left_orders[-1]),
+                                    "actual_right_head": str(adjusted_right_orders[0]),
+                                }
+                            )
                         adjustment_band_logs.append(
                             {
                                 "split_id": split_id,
@@ -2067,19 +2159,23 @@ def _reconstruct_underfilled_segments(
                         f"best_adjustment_cost={-1 if split_best_adjust_cost is None else int(split_best_adjust_cost)}"
                     )
                 boundary_keys = list(dict.fromkeys(base_boundary_keys + adjustment_boundary_keys))
+                frontier_keys = list(dict.fromkeys(frontier_boundary_keys))
                 band_logs = base_band_logs + adjustment_band_logs
                 real_edge_distance = _boundary_band_distance_map(band_logs)
                 real_edge_adjustment_cost = _endpoint_adjustment_cost_map(band_logs)
                 bridge_match_diag = _count_real_bridge_matches(real_bridge_lookup, set(boundary_keys))
+                frontier_match_diag = _count_real_bridge_matches(real_bridge_lookup, set(frontier_keys))
                 adjustment_match_diag = _count_real_bridge_matches(real_bridge_lookup, set(adjustment_boundary_keys))
                 band_only_hit = int(base_match_diag.get("matched_rows", 0) or 0) > 0 and int(single_match_diag.get("matched_rows", 0) or 0) <= 0
                 matched_bridge_keys = [key for key in boundary_keys if key in real_bridge_lookup]
+                frontier_matched_keys = [key for key in frontier_keys if key in real_bridge_lookup]
                 bridge_candidate_audit = _repair_bridge_candidate_audit(
                     line=str(line),
                     block_id=int(block_id),
                     block=block,
                     real_bridge_lookup=real_bridge_lookup,
                     matched_keys=matched_bridge_keys,
+                    frontier_contexts=frontier_contexts,
                     direct_edges=direct_edges,
                     real_edges=real_edges,
                     order_tons=tons_by_order,
@@ -2092,6 +2188,12 @@ def _reconstruct_underfilled_segments(
                     "rejected_score_worse": 0,
                     "accepted": 0,
                     "exact_invalid_pair_count": 0,
+                    "frontier_mismatch": 0,
+                    "pair_invalid_width": 0,
+                    "pair_invalid_thickness": 0,
+                    "pair_invalid_temp": 0,
+                    "pair_invalid_group": 0,
+                    "pair_invalid_unknown": 0,
                     "reject_buckets": Counter(),
                 }
                 print(
@@ -2109,7 +2211,8 @@ def _reconstruct_underfilled_segments(
                 )
                 print(
                     f"[APS][REPAIR_BRIDGE_MATCH] line={line}, block_id={block_id}, "
-                    f"matched_rows={int(bridge_match_diag.get('matched_rows', 0))}"
+                    f"matched_rows={int(bridge_match_diag.get('matched_rows', 0))}, "
+                    f"frontier_matched_rows={int(frontier_match_diag.get('matched_rows', 0))}"
                 )
                 diag["repair_bridge_raw_rows_total"] += int(line_raw_real_rows)
                 diag["repair_bridge_matched_rows_total"] += int(bridge_match_diag.get("matched_rows", 0))
@@ -2126,6 +2229,12 @@ def _reconstruct_underfilled_segments(
                 diag["repair_bridge_candidates_rejected_score_worse"] += int(bridge_candidate_audit.get("rejected_score_worse", 0) or 0)
                 diag["repair_bridge_candidates_accepted"] += int(bridge_candidate_audit.get("accepted", 0) or 0)
                 diag["repair_bridge_exact_invalid_pair_count"] += int(bridge_candidate_audit.get("exact_invalid_pair_count", 0) or 0)
+                diag["repair_bridge_frontier_mismatch_count"] += int(bridge_candidate_audit.get("frontier_mismatch", 0) or 0)
+                diag["repair_bridge_pair_invalid_width"] += int(bridge_candidate_audit.get("pair_invalid_width", 0) or 0)
+                diag["repair_bridge_pair_invalid_thickness"] += int(bridge_candidate_audit.get("pair_invalid_thickness", 0) or 0)
+                diag["repair_bridge_pair_invalid_temp"] += int(bridge_candidate_audit.get("pair_invalid_temp", 0) or 0)
+                diag["repair_bridge_pair_invalid_group"] += int(bridge_candidate_audit.get("pair_invalid_group", 0) or 0)
+                diag["repair_bridge_pair_invalid_unknown"] += int(bridge_candidate_audit.get("pair_invalid_unknown", 0) or 0)
                 if adjustment_best_cost is not None:
                     old_adjust_cost = int(diag.get("repair_bridge_best_adjustment_cost", -1) or -1)
                     diag["repair_bridge_best_adjustment_cost"] = int(adjustment_best_cost) if old_adjust_cost < 0 else min(old_adjust_cost, int(adjustment_best_cost))
@@ -2216,7 +2325,7 @@ def _reconstruct_underfilled_segments(
                     real_valid, real_under, real_diag = _solve_underfilled_reconstruction_block(
                         block,
                         direct_edges=direct_edges,
-                        real_edges={(str(k[1]), str(k[2])) for k in boundary_keys if k in real_bridge_lookup},
+                        real_edges={(str(k[1]), str(k[2])) for k in frontier_matched_keys},
                         order_tons=tons_by_order,
                         campaign_ton_min=campaign_ton_min,
                         campaign_ton_max=campaign_ton_max,
@@ -2248,7 +2357,7 @@ def _reconstruct_underfilled_segments(
                     print(
                         f"[APS][REPAIR_BRIDGE_POOL] line={line}, block_id={block_id}, "
                         f"total_candidates={int(bridge_match_diag.get('matched_rows', 0) or 0)}, "
-                        f"real_candidates={int(bridge_match_diag.get('matched_rows', 0) or 0)}, "
+                        f"real_candidates={int(frontier_match_diag.get('matched_rows', 0) or 0)}, "
                         f"virtual_candidates=0, "
                         f"kept_after_basic_filter={int(real_diag_report.get('repair_only_real_bridge_candidates_kept', 0) or 0)}"
                     )
@@ -2259,6 +2368,7 @@ def _reconstruct_underfilled_segments(
                         f"[APS][REPAIR_BRIDGE_FILTER_SUMMARY] line={line}, block_id={block_id}, "
                         f"attempts=1, raw={line_raw_real_rows}, "
                         f"matched={int(bridge_match_diag.get('matched_rows', 0) or 0)}, "
+                        f"frontier_matched={int(frontier_match_diag.get('matched_rows', 0) or 0)}, "
                         f"kept={int(real_diag_report.get('repair_only_real_bridge_candidates_kept', 0) or 0)}, "
                         f"filtered_direct_feasible={int(real_diag_report.get('repair_only_real_bridge_filtered_direct_feasible', 0) or 0)}, "
                         f"filtered_pair_invalid={int(real_diag_report.get('repair_only_real_bridge_filtered_pair_invalid', 0) or 0)}, "
