@@ -395,6 +395,7 @@ def build_profile_config(
                 "repair_bridge_adjustment_enable_left_trim": True,
                 "repair_bridge_adjustment_enable_right_trim": True,
                 "repair_bridge_adjustment_enable_swap": False,
+                "repair_bridge_ton_rescue_max_neighbor_blocks": 2,
                 # Strict template enforcement (no illegal edge penalty)
                 "strict_template_edges": True,
                 # Disable fallbacks that conflict with LNS path
@@ -509,6 +510,7 @@ def build_profile_config(
                 "repair_bridge_adjustment_enable_left_trim": True,
                 "repair_bridge_adjustment_enable_right_trim": True,
                 "repair_bridge_adjustment_enable_swap": False,
+                "repair_bridge_ton_rescue_max_neighbor_blocks": 2,
                 "strict_template_edges": True,
                 "allow_fallback": False,
                 "allow_legacy_fallback": False,

@@ -110,6 +110,7 @@ class ModelConfig:
     repair_bridge_adjustment_enable_left_trim: bool = True
     repair_bridge_adjustment_enable_right_trim: bool = True
     repair_bridge_adjustment_enable_swap: bool = False
+    repair_bridge_ton_rescue_max_neighbor_blocks: int = 2
     # ---- Tail rebalancing: rescue underfilled tail segments by pullback ----
     tail_rebalance_enabled: bool = True
     tail_rebalance_max_pullback_orders: int = 8
