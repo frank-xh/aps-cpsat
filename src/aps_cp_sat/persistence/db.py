@@ -5,10 +5,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
+
+try:
+    from dotenv import load_dotenv as _load_dotenv
+except Exception:
+    _load_dotenv = None
 
 
 def _repo_root() -> Path:
@@ -18,7 +22,8 @@ def _repo_root() -> Path:
 
 def load_env() -> None:
     """Load `.env` from repo root if present (no override)."""
-    load_dotenv(dotenv_path=_repo_root() / ".env", override=False)
+    if _load_dotenv is not None:
+        _load_dotenv(dotenv_path=_repo_root() / ".env", override=False)
 
 
 @dataclass(frozen=True)
@@ -80,4 +85,3 @@ def session_scope() -> Iterator[Session]:
         raise
     finally:
         session.close()
-

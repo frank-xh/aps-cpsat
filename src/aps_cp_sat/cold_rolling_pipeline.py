@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import os
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
@@ -15,6 +16,11 @@ from aps_cp_sat.rules import RULE_REGISTRY
 from aps_cp_sat.transition import build_transition_templates
 from aps_cp_sat.config.parameters import build_profile_config, normalize_enforced_profile_name
 from aps_cp_sat.validate import validate_model_equivalence, validate_solution_summary
+
+try:
+    from aps_cp_sat.persistence.service import persist_run_analysis_from_excel
+except Exception:
+    persist_run_analysis_from_excel = None
 
 
 class ColdRollingPipeline:
@@ -595,6 +601,12 @@ class ColdRollingPipeline:
             "repair_bridge_candidates_rejected_score_worse": int(em.get("repair_bridge_candidates_rejected_score_worse", 0) or 0),
             "repair_bridge_candidates_accepted": int(em.get("repair_bridge_candidates_accepted", 0) or 0),
             "repair_bridge_exact_invalid_pair_count": int(em.get("repair_bridge_exact_invalid_pair_count", 0) or 0),
+            "repair_bridge_frontier_mismatch_count": int(em.get("repair_bridge_frontier_mismatch_count", 0) or 0),
+            "repair_bridge_pair_invalid_width": int(em.get("repair_bridge_pair_invalid_width", 0) or 0),
+            "repair_bridge_pair_invalid_thickness": int(em.get("repair_bridge_pair_invalid_thickness", 0) or 0),
+            "repair_bridge_pair_invalid_temp": int(em.get("repair_bridge_pair_invalid_temp", 0) or 0),
+            "repair_bridge_pair_invalid_group": int(em.get("repair_bridge_pair_invalid_group", 0) or 0),
+            "repair_bridge_pair_invalid_unknown": int(em.get("repair_bridge_pair_invalid_unknown", 0) or 0),
             "repair_only_real_bridge_used_segments": int(em.get("repair_only_real_bridge_used_segments", 0) or 0),
             "repair_only_real_bridge_used_orders": int(em.get("repair_only_real_bridge_used_orders", 0) or 0),
             "repair_only_real_bridge_not_entered_reason": str(em.get("repair_only_real_bridge_not_entered_reason", "")),
@@ -1401,6 +1413,12 @@ class ColdRollingPipeline:
                 "repair_bridge_candidates_rejected_score_worse",
                 "repair_bridge_candidates_accepted",
                 "repair_bridge_exact_invalid_pair_count",
+                "repair_bridge_frontier_mismatch_count",
+                "repair_bridge_pair_invalid_width",
+                "repair_bridge_pair_invalid_thickness",
+                "repair_bridge_pair_invalid_temp",
+                "repair_bridge_pair_invalid_group",
+                "repair_bridge_pair_invalid_unknown",
                 "repair_bridge_pack_type",
                 "repair_bridge_pack_keys",
                 "repair_bridge_pack_line_keys",
@@ -1529,8 +1547,33 @@ class ColdRollingPipeline:
                     failure_diagnostics=diagnostics if diagnostics else (em.get("failure_diagnostics") if isinstance(em.get("failure_diagnostics"), dict) else summary),
                     engine_meta=em,
                 )
+                persist_enabled = str(os.getenv("APS_PERSIST_AFTER_EXPORT", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
+                updated_engine_meta["persistence_enabled"] = bool(persist_enabled)
+                if persist_enabled:
+                    export_path_for_persist = Path(result.output_path)
+                    run_code = str(em.get("run_code") or export_path_for_persist.stem)
+                    updated_engine_meta["persisted_run_code"] = run_code
+                    updated_engine_meta["persisted_result_file_path"] = str(export_path_for_persist)
+                    print(f"[APS][PERSIST] enabled=True, run_code={run_code}, xlsx={export_path_for_persist}")
+                    try:
+                        if persist_run_analysis_from_excel is None:
+                            raise RuntimeError("persist_run_analysis_from_excel unavailable; install analysis platform dependencies")
+                        if not export_path_for_persist.exists():
+                            raise FileNotFoundError(str(export_path_for_persist))
+                        persisted_run_id = persist_run_analysis_from_excel(
+                            xlsx_path=str(export_path_for_persist),
+                            run_code=run_code,
+                        )
+                        updated_engine_meta["persistence_success"] = True
+                        updated_engine_meta["persisted_run_id"] = int(persisted_run_id)
+                        print(f"[APS][PERSIST] success=True, run_id={persisted_run_id}")
+                    except Exception as ex:
+                        updated_engine_meta["persistence_success"] = False
+                        updated_engine_meta["persistence_error"] = str(ex)
+                        print(f"[APS][PERSIST] success=False, error={ex}")
             result_writer_seconds = perf_counter() - t_export_start
             updated_engine_meta["result_writer_seconds"] = float(result_writer_seconds)
             print(f"[APS][PHASE_TIMING] result_writer={result_writer_seconds:.3f}s")
+            result = replace(result, engine_meta=updated_engine_meta)
             return result
 

@@ -18,6 +18,26 @@ def _get_db() -> Session:
     return get_sessionmaker()()
 
 
+def _run_brief(r: ScheduleRun) -> dict[str, Any]:
+    return {
+        "id": r.id,
+        "run_code": r.run_code,
+        "profile_name": r.profile_name,
+        "result_file_path": r.result_file_path,
+        "acceptance": r.acceptance,
+        "failure_mode": r.failure_mode,
+        "routing_feasible": r.routing_feasible,
+        "analysis_only": r.analysis_only,
+        "official_exported": r.official_exported,
+        "analysis_exported": r.analysis_exported,
+        "scheduled_orders": r.scheduled_orders,
+        "dropped_orders": r.dropped_orders,
+        "scheduled_tons": r.scheduled_tons,
+        "total_run_seconds": r.total_run_seconds,
+        "created_at": r.created_at,
+    }
+
+
 @router.get("")
 def list_runs(
     page: int = Query(1, ge=1),
@@ -88,6 +108,20 @@ def list_runs(
                 }
             )
         return {"items": items, "total": int(total or 0), "page": page, "page_size": page_size}
+    finally:
+        db.close()
+
+
+@router.get("/latest")
+def get_latest_run() -> dict[str, Any]:
+    db = _get_db()
+    try:
+        run = db.scalar(select(ScheduleRun).order_by(ScheduleRun.created_at.desc(), ScheduleRun.id.desc()).limit(1))
+        if run is None:
+            return {"available": False}
+        out = {"available": True}
+        out.update(_run_brief(run))
+        return out
     finally:
         db.close()
 
@@ -249,4 +283,3 @@ def list_orders(
         return {"items": items, "total": int(total or 0), "page": page, "page_size": page_size}
     finally:
         db.close()
-
