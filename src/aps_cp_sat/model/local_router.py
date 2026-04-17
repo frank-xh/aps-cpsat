@@ -141,7 +141,10 @@ def _solve_slot_route_with_templates(
             cost = _template_total_cost(row, cfg.score)
             prev = tpl_best.get(key)
             if prev is None or cost < int(prev["cost"]):
-                tpl_best[key] = {"cost": cost}
+                tpl_best[key] = {
+                    "cost": cost,
+                    "logical_reverse_flag": int(row.get("logical_reverse_flag", 0) or 0),
+                }
 
     missing_template_edge_count = 0
     diagnostics = _build_unroutable_slot_diagnostics(slot_df, tpl_df)
@@ -149,6 +152,7 @@ def _solve_slot_route_with_templates(
     arcs = []
     var_map: Dict[Tuple[int, int], cp_model.IntVar] = {}
     obj_terms = []
+    reverse_terms = []
     for oid in ids:
         i = idx_of[oid]
         s = model.NewBoolVar(f"start_{i}")
@@ -168,15 +172,24 @@ def _solve_slot_route_with_templates(
             tpl = tpl_best.get((oi, oj))
             if tpl is None:
                 missing_template_edge_count += 1
-                if strict_template_edges:
-                    continue
+                # Task 3: HARD CONSTRAINT - Prohibit this arc entirely if no valid template edge exists
+                # No soft fallback: model cannot connect orders without a valid template transition
+                v = model.NewBoolVar(f"x_{i}_{j}")
+                var_map[(i, j)] = v
+                arcs.append((i, j, v))
+                # Hard prohibition: this arc MUST NOT be selected in any solution
+                model.Add(v == 0)
+                continue
             v = model.NewBoolVar(f"x_{i}_{j}")
             var_map[(i, j)] = v
             arcs.append((i, j, v))
+            obj_terms.append(int(tpl["cost"]) * v)
             if tpl is not None:
-                obj_terms.append(int(tpl["cost"]) * v)
+                is_logical_reverse = bool(int(tpl.get("logical_reverse_flag", 0) or 0) > 0)
             else:
-                obj_terms.append(_edge_cost_fallback(rec_by[oi], rec_by[oj], cfg.score, float(cfg.model.dual_width_anchor)) * v)
+                is_logical_reverse = float(rec_by[oj].get("width", 0.0)) > float(rec_by[oi].get("width", 0.0))
+            if is_logical_reverse:
+                reverse_terms.append(v)
     diagnostics["missing_template_edge_count"] = int(missing_template_edge_count)
     if strict_template_edges:
         node_out = {idx_of[oid]: 0 for oid in ids}
@@ -194,6 +207,7 @@ def _solve_slot_route_with_templates(
                 "missing_template_edge_count": int(missing_template_edge_count),
                 "diagnostics": diagnostics,
             }
+    model.Add(sum(reverse_terms) <= int(cfg.rule.max_logical_reverse_per_campaign))
     model.AddCircuit(arcs)
     model.Minimize(sum(obj_terms))
 
@@ -242,32 +256,17 @@ def _solve_slot_route_with_templates(
                 }
             seq.append(oid)
     logical_reverse_count = 0
-    best_tpl_by_pair = {}
-    if isinstance(tpl_df, pd.DataFrame) and not tpl_df.empty:
-        for row in tpl_df.to_dict("records"):
-            oi = str(row.get("from_order_id", ""))
-            oj = str(row.get("to_order_id", ""))
-            if oi not in idx_of or oj not in idx_of or oi == oj:
-                continue
-            key = (oi, oj)
-            cost = _template_total_cost(row, cfg.score)
-            prev = best_tpl_by_pair.get(key)
-            if prev is None or cost < int(prev["cost"]):
-                best_tpl_by_pair[key] = {"cost": cost, "logical_reverse_flag": int(row.get("logical_reverse_flag", 0) or 0)}
     for pos in range(len(seq) - 1):
-        tpl = best_tpl_by_pair.get((seq[pos], seq[pos + 1]))
-        logical_reverse_count += int((tpl or {}).get("logical_reverse_flag", 0))
+        left = rec_by[seq[pos]]
+        right = rec_by[seq[pos + 1]]
+        tpl = tpl_best.get((seq[pos], seq[pos + 1]))
+        if tpl is not None:
+            logical_reverse_count += int(tpl.get("logical_reverse_flag", 0) or 0)
+        elif float(right.get("width", 0.0)) < float(left.get("width", 0.0)):
+            logical_reverse_count += 1
     diagnostics["period_reverse_count"] = int(logical_reverse_count)
     diagnostics["period_reverse_count_violation_count"] = max(0, logical_reverse_count - int(cfg.rule.max_logical_reverse_per_campaign))
     diagnostics["reverse_count_definition"] = "logical_reverse_per_campaign"
-    if logical_reverse_count > int(cfg.rule.max_logical_reverse_per_campaign):
-        return {
-            "status": "UNROUTABLE_SLOT",
-            "sequence": [],
-            "strict_template_edges_enabled": bool(strict_template_edges),
-            "missing_template_edge_count": int(missing_template_edge_count),
-            "diagnostics": diagnostics,
-        }
     return {
         "status": "ROUTED",
         "sequence": seq,

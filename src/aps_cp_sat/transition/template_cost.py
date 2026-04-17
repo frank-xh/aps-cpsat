@@ -4,15 +4,20 @@ from aps_cp_sat.config import PlannerConfig
 from aps_cp_sat.transition.bridge_rules import _temp_overlap_len, _txt
 
 
-def _template_cost(a: dict, b: dict, cfg: PlannerConfig, need: int) -> float:
+def _template_cost(a: dict, b: dict, cfg: PlannerConfig, need: int, edge_type: str | None = None) -> float:
     width_d = abs(float(a["width"]) - float(b["width"]))
     thick_d = abs(float(a["thickness"]) - float(b["thickness"]))
     temp_overlap = _temp_overlap_len(float(a["temp_min"]), float(a["temp_max"]), float(b["temp_min"]), float(b["temp_max"]))
     group_switch = 1 if _txt(a.get("steel_group")) != _txt(b.get("steel_group")) else 0
     due_inv = max(0, int(a.get("due_rank", 3)) - int(b.get("due_rank", 3)))
     temp_gap = max(0.0, float(cfg.rule.min_temp_overlap_real_real) - temp_overlap)
-    edge_type = "VIRTUAL_BRIDGE_EDGE" if int(need) > 0 else "DIRECT_EDGE"
-    edge_penalty = float(cfg.score.virtual_bridge_penalty) if edge_type == "VIRTUAL_BRIDGE_EDGE" else float(cfg.score.direct_edge_penalty)
+    resolved_edge_type = str(edge_type or ("VIRTUAL_BRIDGE_EDGE" if int(need) > 0 else "DIRECT_EDGE"))
+    if resolved_edge_type == "REAL_BRIDGE_EDGE":
+        edge_penalty = float(cfg.score.real_bridge_penalty)
+    elif resolved_edge_type == "VIRTUAL_BRIDGE_EDGE":
+        edge_penalty = float(cfg.score.virtual_bridge_penalty)
+    else:
+        edge_penalty = float(cfg.score.direct_edge_penalty)
     return float(
         float(cfg.score.width_smooth) * width_d
         + float(max(1, cfg.score.thick_smooth // 10)) * thick_d

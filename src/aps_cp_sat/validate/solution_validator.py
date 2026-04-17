@@ -106,15 +106,42 @@ def validate_solution_summary(result: ColdRollingResult, rule: RuleConfig | None
         "virtual_orders": int(df["is_virtual"].sum()),
     }
 
+    # HARD VIOLATION TRACKING: campaign_ton_min and campaign_ton_max are now HARD constraints
+    campaign_ton_min_violation_count = 0
+    campaign_ton_max_violation_count = 0
+    campaign_ton_hard_violation_count_total = 0
+    hard_violation_count_total = 0
+
     if {"line", "campaign_id", "tons"}.issubset(set(df.columns)):
         real = df[~df["is_virtual"]].copy()
         if not real.empty:
             csum = real.groupby(["line", "campaign_id"], as_index=False)["tons"].sum()
-            low = csum["tons"] < float(rule.campaign_ton_min)
-            out["campaign_cnt"] = int(len(csum))
-            out["low_ton_campaign_cnt"] = int(low.sum())
+            min_ton = float(rule.campaign_ton_min)
+            max_ton = float(rule.campaign_ton_max)
 
-            csum["gap"] = (float(rule.campaign_ton_min) - csum["tons"]).clip(lower=0.0)
+            # HARD: campaign_ton_min violation (slot tons < 700)
+            low = csum["tons"] < min_ton
+            campaign_ton_min_violation_count = int(low.sum())
+
+            # HARD: campaign_ton_max violation (slot tons > 2000)
+            over = csum["tons"] > max_ton
+            campaign_ton_max_violation_count = int(over.sum())
+
+            # Total campaign ton hard violations
+            campaign_ton_hard_violation_count_total = campaign_ton_min_violation_count + campaign_ton_max_violation_count
+
+            out["campaign_cnt"] = int(len(csum))
+            out["campaign_ton_min_hard_enforced"] = True
+            out["campaign_ton_window"] = [min_ton, max_ton]
+            out["campaign_ton_min_violation_count"] = campaign_ton_min_violation_count
+            out["campaign_ton_max_violation_count"] = campaign_ton_max_violation_count
+            out["campaign_ton_hard_violation_count_total"] = campaign_ton_hard_violation_count_total
+
+            # Legacy support: still track low_ton_campaign_cnt as diagnostic
+            low_ton_cnt = int(low.sum())
+            out["low_ton_campaign_cnt"] = low_ton_cnt
+
+            csum["gap"] = (min_ton - csum["tons"]).clip(lower=0.0)
             low_top = csum[csum["gap"] > 0.0].sort_values("gap", ascending=False).head(5)
             if not low_top.empty:
                 explain = []
@@ -122,10 +149,20 @@ def validate_solution_summary(result: ColdRollingResult, rule: RuleConfig | None
                     explain.append(f"{row['line']}#{int(row['campaign_id'])}:缺口{float(row['gap']):.1f}t")
                 out["low_ton_top5"] = " | ".join(explain)
 
+    # Count hard violations from validation checks
+    direct_reverse_step_violation_count = 0
+    virtual_attach_reverse_violation_count = 0
+    period_reverse_count_violation_count = 0
+    invalid_virtual_spec_count = 0
+    bridge_count_violation_count = 0
+
     for key in ["width_jump_violation", "thickness_violation", "non_pc_direct_switch", "temp_conflict"]:
         if key in df.columns:
-            out[f"{key}_cnt"] = int(df[key].fillna(False).sum())
+            cnt = int(df[key].fillna(False).sum())
+            out[f"{key}_cnt"] = cnt
+            hard_violation_count_total += cnt
 
+    # Add virtual and reverse violations to hard count
     vkeys = ["width_jump_violation_cnt", "thickness_violation_cnt", "non_pc_direct_switch_cnt", "temp_conflict_cnt"]
     parts = []
     for key in vkeys:
@@ -139,7 +176,237 @@ def validate_solution_summary(result: ColdRollingResult, rule: RuleConfig | None
         for rule_key in VALIDATION_RULE_KEYS.values()
         if RULE_REGISTRY.get(rule_key).validation_active
     ]
-    out.update(_audit_virtual_and_reverse(df, rule))
+
+    # Update with virtual and reverse audit data
+    virtual_audit = _audit_virtual_and_reverse(df, rule)
+    out.update(virtual_audit)
+
+    # Model vs Validation ton comparison (Priority 1C)
+    # Separate real tons and virtual tons per campaign for alignment check
+    if {"line", "campaign_id", "tons", "is_virtual"}.issubset(set(df.columns)):
+        real_campaign_tons = df[~df["is_virtual"]].groupby(["line", "campaign_id"])["tons"].sum()
+        virtual_campaign_tons = df[df["is_virtual"]].groupby(["line", "campaign_id"])["tons"].sum()
+        total_campaign_tons = df.groupby(["line", "campaign_id"])["tons"].sum()
+        
+        # Calculate real, virtual, total tons per campaign
+        campaign_real_tons_list = []
+        campaign_virtual_tons_list = []
+        campaign_total_tons_list = []
+        for idx in total_campaign_tons.index:
+            real_t = float(real_campaign_tons.get(idx, 0.0))
+            virtual_t = float(virtual_campaign_tons.get(idx, 0.0))
+            total_t = float(total_campaign_tons.get(idx, 0.0))
+            campaign_real_tons_list.append(real_t)
+            campaign_virtual_tons_list.append(virtual_t)
+            campaign_total_tons_list.append(total_t)
+        
+        out["campaign_real_tons"] = campaign_real_tons_list
+        out["campaign_virtual_tons"] = campaign_virtual_tons_list
+        out["campaign_total_tons"] = campaign_total_tons_list
+        out["campaign_total_tons_min"] = float(min(campaign_total_tons_list)) if campaign_total_tons_list else 0.0
+        out["campaign_total_tons_max"] = float(max(campaign_total_tons_list)) if campaign_total_tons_list else 0.0
+        out["campaign_total_tons_avg"] = float(sum(campaign_total_tons_list) / len(campaign_total_tons_list)) if campaign_total_tons_list else 0.0
+        
+        # Model ton vs validation ton gap (if model tons available in result)
+        # Note: hasattr returns True even when engine_meta is None, so we must check for None explicitly
+        _engine_meta = getattr(result, "engine_meta", None) or {}
+        model_load_includes_virtual = bool(_engine_meta.get("model_load_includes_virtual_tons", False))
+        out["model_load_includes_virtual_tons"] = model_load_includes_virtual
+        
+        # Calculate gap between validation total and expected model limit (2000)
+        # If model includes virtual: gap = validation_total - (2000 - virtual_budget)
+        # If model excludes virtual: gap = validation_total - 2000
+        virtual_budget = float(_engine_meta.get("virtual_budget_per_slot_ton10", 0) or 0) / 10.0
+        max_ton = float(rule.campaign_ton_max)
+        
+        gaps = []
+        for i, total_t in enumerate(campaign_total_tons_list):
+            if model_load_includes_virtual:
+                # Model already accounts for virtual budget, so gap is against max_ton directly
+                effective_limit = max_ton
+            else:
+                # Model only checks real tons, so validation might exceed due to virtual tons
+                effective_limit = max_ton  # Validation compares against max_ton
+            gap = max(0.0, total_t - effective_limit)
+            gaps.append(gap)
+        
+        max_gap = float(max(gaps)) if gaps else 0.0
+        gap_slot_count = int(sum(1 for g in gaps if g > 0))
+        gap_total = float(sum(gaps))
+        
+        out["campaign_model_validation_ton_gap"] = gaps
+        out["max_campaign_ton_gap"] = max_gap
+        out["campaign_ton_gap_slot_count"] = gap_slot_count
+        out["campaign_ton_gap_total"] = gap_total
+
+    # Add virtual/reverse violations to hard count
+    direct_reverse_step_violation_count = int(virtual_audit.get("direct_reverse_step_violation_count", 0))
+    virtual_attach_reverse_violation_count = int(virtual_audit.get("virtual_attach_reverse_violation_count", 0))
+    period_reverse_count_violation_count = int(virtual_audit.get("period_reverse_count_violation_count", 0))
+    invalid_virtual_spec_count = int(virtual_audit.get("invalid_virtual_spec_count", 0))
+    bridge_count_violation_count = int(virtual_audit.get("bridge_count_violation_count", 0))
+
+    hard_violation_count_total += (
+        direct_reverse_step_violation_count
+        + virtual_attach_reverse_violation_count
+        + period_reverse_count_violation_count
+        + invalid_virtual_spec_count
+        + bridge_count_violation_count
+    )
+
+    # TOTAL HARD VIOLATION COUNT (including campaign ton violations)
+    hard_violation_count_total += campaign_ton_hard_violation_count_total
+    out["hard_violation_count_total"] = int(hard_violation_count_total)
+    
+    # Hard violation breakdown completeness check (Priority 2)
+    # Ensure total = sum of all breakdown items
+    breakdown_items = [
+        ("campaign_ton_min_violation_count", campaign_ton_min_violation_count),
+        ("campaign_ton_max_violation_count", campaign_ton_max_violation_count),
+        ("width_jump_violation_cnt", int(out.get("width_jump_violation_cnt", 0))),
+        ("thickness_violation_cnt", int(out.get("thickness_violation_cnt", 0))),
+        ("non_pc_direct_switch_cnt", int(out.get("non_pc_direct_switch_cnt", 0))),
+        ("temp_conflict_cnt", int(out.get("temp_conflict_cnt", 0))),
+        ("direct_reverse_step_violation_count", direct_reverse_step_violation_count),
+        ("virtual_attach_reverse_violation_count", virtual_attach_reverse_violation_count),
+        ("period_reverse_count_violation_count", period_reverse_count_violation_count),
+        ("invalid_virtual_spec_count", invalid_virtual_spec_count),
+        ("bridge_count_violation_count", bridge_count_violation_count),
+        ("virtual_bridge_edge_leaked_into_disabled_mode", int(out.get("virtual_bridge_edge_leaked_into_disabled_mode", 0))),
+    ]
+    breakdown_sum = sum(v for _, v in breakdown_items)
+    breakdown_gap = abs(int(hard_violation_count_total) - breakdown_sum)
+    out["hard_violation_breakdown_complete"] = bool(breakdown_gap == 0)
+    out["hard_violation_breakdown_gap"] = breakdown_gap
+    out["hard_violation_breakdown_items"] = {k: v for k, v in breakdown_items if v > 0}
+    
+    # Add alias fields for clearer naming (Priority 2C)
+    out["temperature_overlap_violation_count"] = int(out.get("temp_conflict_cnt", 0))
+    out["width_transition_violation_count"] = int(out.get("width_jump_violation_cnt", 0))
+    out["thickness_transition_violation_count"] = int(out.get("thickness_violation_cnt", 0))
+    out["cross_group_bridge_violation_count"] = int(out.get("non_pc_direct_switch_cnt", 0))
+    
+    # Priority 1: Add bridge_expand_violation_cnt - matches validate_model_equivalence output
+    # Bridge expand violations = adjacency violations after bridge expansion
+    bridge_expand_violation_count = int(virtual_audit.get("bridge_expand_violation_count", 0))
+    if "bridge_expand_violation_cnt" not in out:
+        out["bridge_expand_violation_cnt"] = bridge_expand_violation_count
+    out["bridge_expand_violation_count"] = bridge_expand_violation_count
+    
+    # chain_break_cnt: campaign 内序号链断裂次数（来自 validate_model_equivalence）
+    # Note: this is tracked separately as it indicates structural issues, not rule violations
+    if "chain_break_cnt" not in out:
+        out["chain_break_cnt"] = 0
+    out["chain_break_warning"] = bool(out["chain_break_cnt"] > 0)
+
+    # Priority 4: Per-line violation breakdown for failure source identification
+    # Group violations by line to identify which line causes routing failures
+    if {"line", "width_jump_violation", "thickness_violation", "temp_conflict", "non_pc_direct_switch"}.issubset(df.columns):
+        for line in sorted(df["line"].dropna().unique().tolist()):
+            line_df = df[df["line"] == line]
+            out[f"{line}_width_jump_violation_cnt"] = int(line_df["width_jump_violation"].fillna(False).sum())
+            out[f"{line}_thickness_violation_cnt"] = int(line_df["thickness_violation"].fillna(False).sum())
+            out[f"{line}_temp_conflict_cnt"] = int(line_df["temp_conflict"].fillna(False).sum())
+            out[f"{line}_non_pc_direct_switch_cnt"] = int(line_df["non_pc_direct_switch"].fillna(False).sum())
+            line_adj = int(line_df["width_jump_violation"].fillna(False).sum()) + \
+                       int(line_df["thickness_violation"].fillna(False).sum()) + \
+                       int(line_df["temp_conflict"].fillna(False).sum()) + \
+                       int(line_df["non_pc_direct_switch"].fillna(False).sum())
+            out[f"{line}_adjacency_violation_cnt"] = line_adj
+            out[f"{line}_real_orders"] = int((~line_df["is_virtual"]).sum()) if "is_virtual" in line_df.columns else int(len(line_df))
+            out[f"{line}_campaign_count"] = int(line_df["campaign_id"].nunique()) if "campaign_id" in line_df.columns else 0
+        # Failure source summary: which line has the most violations
+        line_adj_viols = {k.replace("_adjacency_violation_cnt", ""): v for k, v in out.items() if k.endswith("_adjacency_violation_cnt")}
+        if line_adj_viols:
+            max_line = max(line_adj_viols, key=line_adj_viols.get)
+            max_viols = line_adj_viols[max_line]
+            out["failure_source_line"] = str(max_line) if max_viols > 0 else ""
+            out["failure_source_max_violations"] = int(max_viols) if max_viols > 0 else 0
+            out["failure_source_summary"] = (
+                f"line={max_line}, violations={max_viols}"
+                if max_viols > 0
+                else "no_adjacency_violations"
+            )
+
+    # -------------------------------------------------------------------------
+    # Constructive LNS path diagnostics
+    # Extract metrics from engine_meta / lns_diagnostics when using constructive_lns path.
+    # -------------------------------------------------------------------------
+    _engine_meta = getattr(result, "engine_meta", None) or {}
+    if str(_engine_meta.get("engine_used", "")) == "constructive_lns" or str(_engine_meta.get("main_path", "")) == "constructive_lns":
+        lns_diag = _engine_meta.get("lns_diagnostics", {}) or {}
+        rounds_summary = lns_diag.get("rounds_summary", {}) or {}
+
+        out["constructive_initial_chain_count"] = int(
+            lns_diag.get("constructive_build_diags", {}).get("total_chains", 0)
+            if isinstance(lns_diag.get("constructive_build_diags"), dict)
+            else 0
+        )
+        out["constructive_initial_segment_count"] = int(
+            lns_diag.get("initial_planned_count", 0)
+        )
+        out["constructive_final_segment_count"] = int(
+            lns_diag.get("final_planned_count", 0)
+        )
+        out["lns_accepted_rounds"] = int(
+            rounds_summary.get("accepted_count", 0)
+        )
+        out["lns_total_rounds"] = int(
+            _engine_meta.get("lns_engine_meta", {}).get("n_rounds_ran", 0)
+            if isinstance(_engine_meta.get("lns_engine_meta"), dict)
+            else 0
+        )
+        out["lns_status"] = str(_engine_meta.get("lns_status", "UNKNOWN"))
+        out["lns_improvement_delta_orders"] = int(
+            lns_diag.get("improvement_delta_orders", 0)
+        )
+        out["lns_initial_dropped_count"] = int(
+            lns_diag.get("initial_dropped_count", 0)
+        )
+        out["lns_final_dropped_count"] = int(
+            lns_diag.get("final_dropped_count", 0)
+        )
+        out["lns_drop_delta"] = int(
+            lns_diag.get("final_dropped_count", 0) - lns_diag.get("initial_dropped_count", 0)
+        )
+        out["solver_path"] = "constructive_lns"
+
+        # ---- Bridge expansion mode guard ----
+        # Get bridge_expansion_mode from multiple possible locations
+        bridge_expand_mode = str(
+            _engine_meta.get("bridge_expansion_mode", "disabled")
+            or lns_diag.get("bridge_expansion_mode", "disabled")
+            or "disabled"
+        )
+        out["bridge_expansion_mode"] = bridge_expand_mode
+
+        # Check for VIRTUAL_BRIDGE_EDGE leak in disabled mode
+        virtual_bridge_edge_leaked = 0
+        if bridge_expand_mode == "disabled":
+            if "selected_edge_type" in df.columns:
+                virtual_bridge_edge_leaked = int(
+                    (df["selected_edge_type"].astype(str) == "VIRTUAL_BRIDGE_EDGE").sum()
+                )
+            elif "selected_bridge_path" in df.columns:
+                # Fallback: count non-empty bridge paths as potential leaks
+                bridge_paths = df["selected_bridge_path"].astype(str)
+                virtual_bridge_edge_leaked = int((bridge_paths.str.len() > 0).sum())
+
+        out["virtual_bridge_edge_leaked_into_disabled_mode"] = virtual_bridge_edge_leaked
+
+        # If VIRTUAL_BRIDGE_EDGE leaked, mark bridge_expand_ok = False
+        if virtual_bridge_edge_leaked > 0:
+            out["bridge_expand_ok"] = False
+            hard_violation_count_total += virtual_bridge_edge_leaked
+
+            # Also update breakdown items
+            breakdown_items.append(
+                ("virtual_bridge_edge_leaked_into_disabled_mode", virtual_bridge_edge_leaked)
+            )
+    else:
+        out["solver_path"] = "joint_master"
+        out["bridge_expansion_mode"] = "unknown"
+        out["virtual_bridge_edge_leaked_into_disabled_mode"] = 0
 
     print(f"[APS][校验摘要] {out}")
     return out
@@ -227,6 +494,7 @@ def validate_model_equivalence(schedule_df: pd.DataFrame, templates_df: pd.DataF
             )
         )
         miss = 0
+        template_miss_examples: list[dict] = []
         for (_, _), d in df.groupby(["line", "campaign_id"], dropna=False):
             rows = d.sort_values("campaign_seq").to_dict("records")
             for i in range(len(rows) - 1):
@@ -237,8 +505,30 @@ def validate_model_equivalence(schedule_df: pd.DataFrame, templates_df: pd.DataF
                 key = (str(a.get("line", "")), str(a.get("order_id", "")), str(b.get("order_id", "")))
                 if key not in keyset:
                     miss += 1
+                    if len(template_miss_examples) < 20:
+                        sample = {
+                            "line": str(a.get("line", "")),
+                            "campaign_id": str(a.get("campaign_id", "")),
+                            "campaign_seq_a": int(a.get("campaign_seq", 0) or 0),
+                            "campaign_seq_b": int(b.get("campaign_seq", 0) or 0),
+                            "order_id_a": str(a.get("order_id", "")),
+                            "order_id_b": str(b.get("order_id", "")),
+                        }
+                        if "selected_edge_type" in a:
+                            sample["selected_edge_type_a"] = str(a.get("selected_edge_type", ""))
+                        if "selected_edge_type" in b:
+                            sample["selected_edge_type_b"] = str(b.get("selected_edge_type", ""))
+                        template_miss_examples.append(sample)
         out["template_miss_cnt"] = int(miss)
         out["template_pair_ok"] = miss == 0
+        out["template_miss_examples"] = template_miss_examples
+        if miss > 0:
+            preview = template_miss_examples[:5]
+            print(f"[APS][template_miss_examples] 共 {miss} 个 miss，前 {len(preview)} 条示例:")
+            for ex in preview:
+                print(f"  line={ex['line']}, campaign={ex['campaign_id']}, "
+                      f"seq=({ex['campaign_seq_a']}->{ex['campaign_seq_b']}), "
+                      f"order=({ex['order_id_a']}->{ex['order_id_b']})")
 
     print(f"[APS][等价校验] {out}")
     return out
