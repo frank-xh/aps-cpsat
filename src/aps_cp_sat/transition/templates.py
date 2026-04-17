@@ -23,7 +23,12 @@ class TransitionTemplateSummary:
     max_bridge_used: int
 
 
-def build_transition_templates(orders_df: pd.DataFrame, cfg: PlannerConfig) -> dict[str, object]:
+def build_transition_templates(
+    orders_df: pd.DataFrame,
+    cfg: PlannerConfig,
+    *,
+    unassigned_real_orders: pd.DataFrame | None = None,
+) -> dict[str, object]:
     """
     Transition template facade.
 
@@ -53,7 +58,12 @@ def build_transition_templates(orders_df: pd.DataFrame, cfg: PlannerConfig) -> d
         d = _line_feasible(orders_df, line)
         line_partition_seconds += perf_counter() - partition_t0
         build_t0 = perf_counter()
-        tpl, stats = _build_line_templates(d, line, cfg)
+        tpl, stats = _build_line_templates(
+            d,
+            line,
+            cfg,
+            unassigned_real_orders=unassigned_real_orders if isinstance(unassigned_real_orders, pd.DataFrame) else orders_df,
+        )
         line_build_seconds = perf_counter() - build_t0
         all_tpl.append(tpl)
         pair_scan_total += float(stats.get("template_pair_scan_seconds", 0.0))

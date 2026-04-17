@@ -125,3 +125,77 @@ def test_virtual_attach_reverse_rule_applies_only_when_right_side_is_virtual():
     right_real = {"width": 1240.0, "is_virtual": False}
     assert reverse_step_within_applicable_limit(left, right_virtual, rule) is True
     assert reverse_step_within_applicable_limit(left, right_real, rule) is False
+
+
+def test_real_bridge_edge_is_built_before_virtual_bridge():
+    cfg = PlannerConfig()
+    main_df = pd.DataFrame(
+        [
+            {
+                "order_id": "A",
+                "grade": "DP600",
+                "line_capability": "dual",
+                "width": 1200.0,
+                "thickness": 1.0,
+                "temp_min": 700.0,
+                "temp_max": 760.0,
+                "tons": 20.0,
+                "steel_group": "双相钢",
+                "due_rank": 2,
+                "priority": 1,
+            },
+            {
+                "order_id": "B",
+                "grade": "HC420LA",
+                "line_capability": "dual",
+                "width": 1190.0,
+                "thickness": 1.0,
+                "temp_min": 700.0,
+                "temp_max": 760.0,
+                "tons": 21.0,
+                "steel_group": "低合金高强",
+                "due_rank": 2,
+                "priority": 1,
+            },
+        ]
+    )
+    bridge_pool = pd.DataFrame(
+        [
+            {
+                "order_id": "C_LOW",
+                "grade": "DC01",
+                "line_capability": "dual",
+                "width": 1195.0,
+                "thickness": 1.0,
+                "temp_min": 700.0,
+                "temp_max": 760.0,
+                "tons": 10.0,
+                "steel_group": "普碳",
+                "due_rank": 3,
+                "priority": 1,
+            },
+            {
+                "order_id": "C_HIGH",
+                "grade": "DC01",
+                "line_capability": "dual",
+                "width": 1196.0,
+                "thickness": 1.0,
+                "temp_min": 700.0,
+                "temp_max": 760.0,
+                "tons": 11.0,
+                "steel_group": "普碳",
+                "due_rank": 1,
+                "priority": 2,
+            },
+        ]
+    )
+    pack = build_transition_templates(main_df, cfg, unassigned_real_orders=bridge_pool)
+    tpl = pack["templates"]
+    ab = tpl[(tpl["from_order_id"] == "A") & (tpl["to_order_id"] == "B")]
+    assert not ab.empty
+    row = ab.iloc[0]
+    assert row["edge_type"] == "REAL_BRIDGE_EDGE"
+    assert row["real_bridge_order_id"] == "C_HIGH"
+    assert int(row["bridge_count"]) == 1
+    assert float(row["virtual_tons"]) == 0.0
+    assert str(row["bridge_path"]) == ""

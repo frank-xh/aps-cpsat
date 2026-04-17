@@ -344,6 +344,236 @@ def build_profile_config(
             )
         return PlannerConfig(rule=base_rule, model=model, score=score)
 
+    # -------------------------------------------------------------------------
+    # Constructive LNS search profile
+    # Uses the new ALNS-driven constructive path (constructive_lns_master)
+    # instead of the joint_master model.
+    # -------------------------------------------------------------------------
+    if profile == "constructive_lns_search":
+        score = ScoreConfig(
+            **{
+                **base_score.__dict__,
+                "slot_order_count_penalty": 0,
+                "unassigned_real": 0,
+                "virtual_bridge_penalty": 200,
+                "real_bridge_penalty": 40,
+            }
+        )
+        model = ModelConfig(
+            **{
+                **base_model.__dict__,
+                "profile_name": "constructive_lns_search",
+                # Switch to new ALNS master path
+                "main_solver_strategy": "constructive_lns",
+                # LNS parameters
+                "rounds": 10,
+                "constructive_lns_rounds": 10,
+                "lns_early_stop_no_improve_rounds": 3,
+                "lns_max_total_rounds": 10,
+                "lns_min_rounds_before_early_stop": 4,
+                "constructive_destroy_ratio_min": 0.20,
+                "constructive_destroy_ratio_max": 0.35,
+                "constructive_subproblem_max_orders": 40,
+                "constructive_enable_cp_sat_repair": True,
+                # Route B/C: disable ALL bridge edges = direct_only mode (Route C)
+                # This is the strictest mode: only DIRECT_EDGE is allowed.
+                # Purpose: quickly verify whether the only blocker for official_exported=True
+                # is the bridge edge expansion itself.
+                "allow_virtual_bridge_edge_in_constructive": False,
+                "allow_real_bridge_edge_in_constructive": False,
+                "bridge_expansion_mode": "disabled",
+                "repair_only_real_bridge_enabled": True,
+                "repair_only_virtual_bridge_enabled": False,
+                "repair_only_bridge_max_per_segment": 1,
+                "repair_only_bridge_cost_penalty": 100000.0,
+                "repair_bridge_left_band_k": 3,
+                "repair_bridge_right_band_k": 3,
+                "repair_bridge_band_max_pairs_per_split": 9,
+                "repair_bridge_left_trim_max": 2,
+                "repair_bridge_right_trim_max": 2,
+                "repair_bridge_endpoint_adjustment_limit_per_split": 9,
+                "repair_bridge_adjustment_enable_left_trim": True,
+                "repair_bridge_adjustment_enable_right_trim": True,
+                "repair_bridge_adjustment_enable_swap": False,
+                # Strict template enforcement (no illegal edge penalty)
+                "strict_template_edges": True,
+                # Disable fallbacks that conflict with LNS path
+                "allow_fallback": False,
+                "allow_legacy_fallback": False,
+                "enableSemanticFallback": False,
+                "enableScaleDownFallback": False,
+                "enableStructureFallback": False,
+                "enableLegacyFallback": False,
+                # Production flags
+                "validation_mode": bool(validation_mode),
+                "time_limit_seconds": 60.0,
+                "min_real_schedule_ratio": 0.90,
+                "master_profile_count": 1,
+                "master_seed_count": 1,
+                "max_campaign_slots": 14,
+                "min_campaign_slots": 6,
+                "big_roll_slot_soft_order_cap": 20,
+                "small_roll_slot_soft_order_cap": 24,
+                "export_failed_result_for_debug": True,
+                # ---- Tail rebalancing: rescue underfilled tail by pullback ----
+                "tail_rebalance_enabled": True,
+                "tail_rebalance_max_pullback_orders": 8,
+                "tail_rebalance_max_pullback_tons10": 2500,
+                "tail_rebalance_accept_if_prev_stays_above_min": True,
+                # ---- Tail Repair Budget: limit search scope ----
+                "max_tail_repair_windows_per_line": 12,
+                "max_tail_repair_windows_total": 24,
+                "max_recut_cutpoints_per_window": 12,
+                "max_fill_candidates_per_tail": 20,
+                "tail_repair_gap_to_min_limit": 220.0,
+                # ---- Tail Fill From Dropped: make fill branch actually trigger ----
+                "tail_fill_from_dropped_enabled": True,
+                "tail_fill_gap_to_min_limit": 220.0,
+                "tail_fill_accept_partial_progress": True,
+                "tail_fill_max_inserts_per_tail": 2,
+                "tail_fill_second_pass_gap_limit": 30.0,
+                # ---- Small roll dual-order reserve: prevent big_roll monopoly ----
+                "small_roll_dual_reserve_enabled": True,
+                "small_roll_dual_reserve_penalty": 15,
+                # ---- Small roll dual-order reserve bucket: hard-prevent big_roll from taking top dual candidates ----
+                "small_roll_dual_reserve_bucket_enabled": True,
+                "small_roll_dual_reserve_bucket_ratio": 0.45,
+                "small_roll_dual_reserve_bucket_max_orders": 120,
+                # ---- Small roll seed-first: prioritize small_roll chain building before big_roll consumes reserve ----
+                "small_roll_seed_first_enabled": True,
+                "small_roll_seed_min_orders": 20,
+                "small_roll_seed_min_tons10": 5000,
+                # ---- Small roll dual-order reserve QUOTA: balanced allocation instead of "lock all" ----
+                # Min = guarantee, Max = ceiling; once max reached, remaining quota released to big_roll.
+                "small_roll_dual_reserve_quota_enabled": True,
+                "small_roll_dual_reserve_quota_min_orders": 25,
+                "small_roll_dual_reserve_quota_min_tons10": 6000,
+                "small_roll_dual_reserve_quota_max_orders": 60,
+                "small_roll_dual_reserve_quota_max_tons10": 14000,
+                # Release remaining quota to big_roll after small_roll seed phase completes
+                "big_roll_dual_release_after_small_seed": True,
+            }
+        )
+        return PlannerConfig(rule=base_rule, model=model, score=score)
+
+    # -------------------------------------------------------------------------
+    # Constructive LNS debug acceptance profile (validation-only)
+    # Same as constructive_lns_search but with RELAXED partial acceptance
+    # thresholds to confirm whether official_exported=True is blocked ONLY by
+    # soft threshold (partial acceptance), not by routing/hard constraints.
+    # This profile is NOT for production use.
+    # -------------------------------------------------------------------------
+    if profile == "constructive_lns_debug_acceptance":
+        print(
+            "[APS][debug_acceptance] using relaxed partial acceptance thresholds for validation only"
+        )
+        score = ScoreConfig(
+            **{
+                **base_score.__dict__,
+                "slot_order_count_penalty": 0,
+                "unassigned_real": 0,
+                "virtual_bridge_penalty": 200,
+                "real_bridge_penalty": 40,
+            }
+        )
+        model = ModelConfig(
+            **{
+                **base_model.__dict__,
+                "profile_name": "constructive_lns_debug_acceptance",
+                # Same ALNS master path as constructive_lns_search
+                "main_solver_strategy": "constructive_lns",
+                # LNS parameters
+                "rounds": 10,
+                "constructive_lns_rounds": 10,
+                "lns_early_stop_no_improve_rounds": 3,
+                "lns_max_total_rounds": 10,
+                "lns_min_rounds_before_early_stop": 4,
+                "constructive_destroy_ratio_min": 0.20,
+                "constructive_destroy_ratio_max": 0.35,
+                "constructive_subproblem_max_orders": 40,
+                "constructive_enable_cp_sat_repair": True,
+                # Same direct_only mode as constructive_lns_search
+                "allow_virtual_bridge_edge_in_constructive": False,
+                "allow_real_bridge_edge_in_constructive": False,
+                "bridge_expansion_mode": "disabled",
+                "repair_only_real_bridge_enabled": True,
+                "repair_only_virtual_bridge_enabled": False,
+                "repair_only_bridge_max_per_segment": 1,
+                "repair_only_bridge_cost_penalty": 100000.0,
+                "repair_bridge_left_band_k": 3,
+                "repair_bridge_right_band_k": 3,
+                "repair_bridge_band_max_pairs_per_split": 9,
+                "repair_bridge_left_trim_max": 2,
+                "repair_bridge_right_trim_max": 2,
+                "repair_bridge_endpoint_adjustment_limit_per_split": 9,
+                "repair_bridge_adjustment_enable_left_trim": True,
+                "repair_bridge_adjustment_enable_right_trim": True,
+                "repair_bridge_adjustment_enable_swap": False,
+                "strict_template_edges": True,
+                "allow_fallback": False,
+                "allow_legacy_fallback": False,
+                "enableSemanticFallback": False,
+                "enableScaleDownFallback": False,
+                "enableStructureFallback": False,
+                "enableLegacyFallback": False,
+                # Production flags
+                "validation_mode": bool(validation_mode),
+                "time_limit_seconds": 60.0,
+                "min_real_schedule_ratio": 0.90,
+                "master_profile_count": 1,
+                "master_seed_count": 1,
+                "max_campaign_slots": 14,
+                "min_campaign_slots": 6,
+                "big_roll_slot_soft_order_cap": 20,
+                "small_roll_slot_soft_order_cap": 24,
+                "export_failed_result_for_debug": True,
+                # Tail rebalancing (same as constructive_lns_search)
+                "tail_rebalance_enabled": True,
+                "tail_rebalance_max_pullback_orders": 8,
+                "tail_rebalance_max_pullback_tons10": 2500,
+                "tail_rebalance_accept_if_prev_stays_above_min": True,
+                # ---- Tail Repair Budget: limit search scope ----
+                "max_tail_repair_windows_per_line": 12,
+                "max_tail_repair_windows_total": 24,
+                "max_recut_cutpoints_per_window": 12,
+                "max_fill_candidates_per_tail": 20,
+                "tail_repair_gap_to_min_limit": 220.0,
+                # ---- Tail Fill From Dropped: make fill branch actually trigger ----
+                "tail_fill_from_dropped_enabled": True,
+                "tail_fill_gap_to_min_limit": 220.0,
+                "tail_fill_accept_partial_progress": True,
+                "tail_fill_max_inserts_per_tail": 2,
+                "tail_fill_second_pass_gap_limit": 30.0,
+                # Small roll dual-order reserve (same as constructive_lns_search)
+                "small_roll_dual_reserve_enabled": True,
+                "small_roll_dual_reserve_penalty": 15,
+                "small_roll_dual_reserve_bucket_enabled": True,
+                "small_roll_dual_reserve_bucket_ratio": 0.45,
+                "small_roll_dual_reserve_bucket_max_orders": 120,
+                # ---- Small roll seed-first: prioritize small_roll chain building before big_roll consumes reserve ----
+                "small_roll_seed_first_enabled": True,
+                "small_roll_seed_min_orders": 20,
+                "small_roll_seed_min_tons10": 5000,
+                # ---- Small roll dual-order reserve QUOTA: balanced allocation (same as constructive_lns_search) ----
+                "small_roll_dual_reserve_quota_enabled": True,
+                "small_roll_dual_reserve_quota_min_orders": 25,
+                "small_roll_dual_reserve_quota_min_tons10": 6000,
+                "small_roll_dual_reserve_quota_max_orders": 60,
+                "small_roll_dual_reserve_quota_max_tons10": 14000,
+                "big_roll_dual_release_after_small_seed": True,
+                # ---- RELAXED partial acceptance thresholds (validation only) ----
+                # These thresholds are intentionally very loose to allow official_exported=True
+                # when routing_feasible=True and hard violations=0.
+                # The goal is to confirm the ONLY remaining blocker is the soft threshold itself.
+                "max_drop_ratio_for_partial": 0.90,        # original: 0.05 (now: 90% drop allowed)
+                "max_drop_tons_ratio_for_partial": 0.90,  # original: 0.08
+                "max_drop_count_for_partial": 1000,       # original: 20
+                "min_scheduled_orders_for_partial": 50,   # original: 100 (relaxed to 50)
+                "min_scheduled_tons_for_partial": 500.0,  # original: 1000.0 (relaxed to 500)
+            }
+        )
+        return PlannerConfig(rule=base_rule, model=model, score=score)
+
     model = base_model
     if bool(validation_mode):
         model = ModelConfig(
@@ -357,15 +587,33 @@ def build_profile_config(
     return PlannerConfig(rule=base_rule, model=model, score=base_score)
 
 
+def normalize_enforced_profile_name(profile_name: str | None) -> str:
+    """
+    Normalize profile name to the current enforced default.
+
+    Rules:
+        - None / "" / "default" -> "constructive_lns_search"
+        - "constructive_lns_search" -> "constructive_lns_search"
+        - Other values are returned as-is (to allow explicit runtime errors)
+    """
+    if profile_name is None:
+        return "constructive_lns_search"
+    name = str(profile_name).strip().lower()
+    if name in ("", "default"):
+        return "constructive_lns_search"
+    return str(profile_name)
+
+
 def build_default_solve_config(
     validation_mode: bool = True,
     production_compatibility_mode: bool = False,
 ) -> PlannerConfig:
     """
-    统一参数入口：新架构默认从这里构造 default profile。
+    统一参数入口：当前工程默认且唯一允许的主试验 profile 为 constructive_lns_search。
+    其他 profile 值会在运行时被 master.py / cold_rolling_pipeline.py 的守卫拒绝。
     """
     return build_profile_config(
-        "default",
+        "constructive_lns_search",
         validation_mode=validation_mode,
         production_compatibility_mode=production_compatibility_mode,
     )

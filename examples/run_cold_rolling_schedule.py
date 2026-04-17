@@ -17,7 +17,7 @@ from aps_cp_sat.config import PlannerConfig, build_profile_config
 from aps_cp_sat.domain.models import ColdRollingRequest
 
 
-def build_example_config(profile: str = "production_search", strict: bool = False) -> PlannerConfig:
+def build_example_config(profile: str = "constructive_lns_search", strict: bool = False) -> PlannerConfig:
     base = build_profile_config(
         profile,
         validation_mode=bool(strict),
@@ -45,16 +45,9 @@ def main() -> None:
     parser.add_argument(
         "--profile",
         choices=[
-            "default",
-            "feasibility",
-            "feasibility_fast_slot_safe",
-            "feasibility_slot_diagnostic",
-            "feasibility_search_relaxed_slots",
-            "production_search",
-            "feasibility_slot_safe",
-            "quality",
+            "constructive_lns_search",
         ],
-        default="production_search",
+        default="constructive_lns_search",
         help="Solver tuning profile",
     )
     args = parser.parse_args()
@@ -68,7 +61,9 @@ def main() -> None:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     output = os.path.join(output_dir, f"SAT排程结果_{ts}.xlsx")
 
-    cfg = build_example_config(profile=str(args.profile), strict=bool(args.strict))
+    # 强制使用 constructive_lns_search，忽略命令行参数中的旧值
+    enforced_profile = "constructive_lns_search"
+    cfg = build_example_config(profile=enforced_profile, strict=bool(args.strict))
 
     print("[APS] 冷轧排程任务开始")
     print(f"[APS] 订单文件: {orders}")
