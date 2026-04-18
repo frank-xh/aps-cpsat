@@ -3519,6 +3519,7 @@ def run_constructive_lns_master(
         "repair_bridge_filtered_ton_above_max_after_expansion",
         "repair_bridge_filtered_ton_split_not_found",
         "repair_bridge_filtered_ton_rescue_no_gain",
+        "repair_bridge_filtered_ton_rescue_impossible",
         "repair_bridge_pack_type",
         "repair_bridge_pack_keys",
         "repair_bridge_pack_line_keys",
