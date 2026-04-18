@@ -1368,6 +1368,12 @@ def _repair_bridge_candidate_audit(
         "pair_invalid_temp": 0,
         "pair_invalid_group": 0,
         "pair_invalid_unknown": 0,
+        "ton_rescue_candidates": [],
+        "filtered_ton_below_min_current_block": 0,
+        "filtered_ton_below_min_even_after_neighbor_expansion": 0,
+        "filtered_ton_above_max_after_expansion": 0,
+        "filtered_ton_split_not_found": 0,
+        "filtered_ton_rescue_no_gain": 0,
         "reject_buckets": Counter(),
     }
     seen: set[tuple[str, str, str]] = set()
@@ -1506,9 +1512,24 @@ def _repair_bridge_candidate_audit(
             if float(campaign_ton_min) - 1e-6 <= materialized_tons <= float(campaign_ton_max) + 1e-6:
                 ton_valid = True
             if not ton_valid:
-                out["rejected_ton_invalid"] += 1
-                out["reject_buckets"]["TON_WINDOW_INVALID"] += 1
-                print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=REJECTED, reason=TON_WINDOW_INVALID")
+                if materialized_tons < float(campaign_ton_min) - 1e-6:
+                    out["filtered_ton_below_min_current_block"] += 1
+                    out["ton_rescue_candidates"].append(
+                        {
+                            "candidate_id": candidate_id,
+                            "key": key,
+                            "bridge_from": str(src),
+                            "bridge_to": str(dst),
+                            "context": dict(ctx),
+                            "materialized_tons": float(materialized_tons),
+                            "tentative_sequence": list(tentative_sequence),
+                        }
+                    )
+                    print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_RESCUE_ATTEMPT")
+                else:
+                    out["rejected_ton_invalid"] += 1
+                    out["reject_buckets"]["TON_WINDOW_INVALID"] += 1
+                    print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=REJECTED, reason=TON_WINDOW_INVALID")
                 continue
             print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_WINDOW_VALIDATED")
             print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=SCORE_COMPARED")
@@ -1795,6 +1816,327 @@ def _solve_underfilled_reconstruction_block(
     return valid, residual_under, obs
 
 
+def _campaign_segment_from_orders(
+    *,
+    line: str,
+    campaign_local_id: int,
+    order_ids: list[str],
+    order_tons: dict[str, float],
+    is_valid: bool,
+) -> CampaignSegment | None:
+    oids = [str(v) for v in order_ids if str(v)]
+    if not oids:
+        return None
+    total_tons = sum(float(order_tons.get(str(oid), 0.0) or 0.0) for oid in oids)
+    return CampaignSegment(
+        line=str(line),
+        campaign_local_id=int(campaign_local_id),
+        order_ids=oids,
+        total_tons=float(total_tons),
+        cut_reason=CutReason.TARGET_REACHED if is_valid else CutReason.TAIL_UNDERFILLED,
+        start_order_id=oids[0],
+        end_order_id=oids[-1],
+        edge_count=max(0, len(oids) - 1),
+        is_valid=bool(is_valid),
+    )
+
+
+def _generate_ton_rescue_windows(
+    *,
+    line_under: list[CampaignSegment],
+    current_block_idx: int,
+    current_block_size: int,
+    order_tons: dict[str, float],
+    campaign_ton_min: float,
+    max_neighbor_blocks: int,
+    max_orders_per_window: int,
+    enable_backward: bool,
+    enable_forward: bool,
+    enable_bidirectional: bool,
+) -> list[dict]:
+    n = len(line_under)
+    start0 = int(current_block_idx)
+    end0 = min(n, int(current_block_idx) + int(current_block_size))
+    if start0 < 0 or start0 >= n or end0 <= start0:
+        return []
+
+    windows: list[dict] = []
+    seen: set[tuple[int, int]] = set()
+
+    def add_window(direction: str, back: int, fwd: int) -> None:
+        start = max(0, start0 - int(back))
+        end = min(n, end0 + int(fwd))
+        key = (start, end)
+        if key in seen:
+            return
+        seen.add(key)
+        block = line_under[start:end]
+        orders = [str(oid) for seg in block for oid in seg.order_ids]
+        if len(orders) > int(max_orders_per_window):
+            return
+        tons = sum(float(order_tons.get(str(oid), 0.0) or 0.0) for oid in orders)
+        windows.append(
+            {
+                "direction": direction,
+                "start": start,
+                "end": end,
+                "back": int(back),
+                "fwd": int(fwd),
+                "block": block,
+                "order_count": len(orders),
+                "tons": float(tons),
+                "reaches_min": bool(tons >= float(campaign_ton_min) - 1e-6),
+            }
+        )
+
+    max_neighbor_blocks = max(0, int(max_neighbor_blocks))
+    if enable_forward:
+        for fwd in range(0, max_neighbor_blocks + 1):
+            add_window("forward", 0, fwd)
+            if windows and windows[-1].get("direction") == "forward" and windows[-1].get("reaches_min"):
+                break
+
+    if enable_backward:
+        for back in range(1, max_neighbor_blocks + 1):
+            add_window("backward", back, 0)
+            if windows and windows[-1].get("direction") == "backward" and windows[-1].get("reaches_min"):
+                break
+
+    if enable_bidirectional:
+        for total in range(2, max_neighbor_blocks + 1):
+            for back in range(1, total):
+                fwd = total - back
+                add_window("bidirectional", back, fwd)
+                if windows and windows[-1].get("direction") == "bidirectional" and windows[-1].get("reaches_min"):
+                    break
+            if any(w.get("direction") == "bidirectional" and w.get("reaches_min") for w in windows):
+                break
+
+    windows.sort(
+        key=lambda w: (
+            0 if w.get("reaches_min") else 1,
+            abs(float(w.get("tons", 0.0)) - float(campaign_ton_min)),
+            int(w.get("back", 0)) + int(w.get("fwd", 0)),
+            {"forward": 0, "backward": 1, "bidirectional": 2}.get(str(w.get("direction")), 9),
+        )
+    )
+    return windows
+
+
+def _try_bridge_ton_rescue_recut(
+    *,
+    candidate: dict,
+    line: str,
+    block_id: int,
+    window_id: int,
+    direction: str,
+    expansion_block: list[CampaignSegment],
+    direct_edges: set[tuple[str, str]],
+    real_edge: tuple[str, str],
+    order_tons: dict[str, float],
+    campaign_ton_min: float,
+    campaign_ton_max: float,
+    campaign_ton_target: float,
+    max_real_bridge_per_segment: int,
+    bridge_cost_penalty: float,
+    next_local_id: int,
+    real_edge_distance: dict[tuple[str, str], int] | None = None,
+    real_edge_adjustment_cost: dict[tuple[str, str], int] | None = None,
+) -> dict:
+    candidate_id = str(candidate.get("candidate_id", "BRIDGE_CAND"))
+    bridge_from = str(candidate.get("bridge_from", real_edge[0]))
+    bridge_to = str(candidate.get("bridge_to", real_edge[1]))
+    ctx = candidate.get("context", {}) if isinstance(candidate.get("context", {}), dict) else {}
+    adjusted_left_orders = [str(v) for v in ctx.get("adjusted_left_orders", [])]
+    adjusted_right_orders = [str(v) for v in ctx.get("adjusted_right_orders", [])]
+    combined_orders = [str(oid) for seg in expansion_block for oid in seg.order_ids]
+    combined_tons = sum(float(order_tons.get(str(oid), 0.0) or 0.0) for oid in combined_orders)
+    neighbor_ids = [int(seg.campaign_local_id) for seg in expansion_block[int(current_block_segment_count):]]
+    print(
+        f"[APS][REPAIR_BRIDGE_TON_RESCUE_WINDOW] candidate_id={candidate_id}, "
+        f"window_id={window_id}, direction={direction}, neighbor_blocks={neighbor_ids}, "
+        f"combined_orders={len(combined_orders)}, combined_tons={combined_tons:.1f}"
+    )
+    print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_RESCUE_RECUT")
+
+    if bridge_from not in adjusted_left_orders or bridge_to not in adjusted_right_orders:
+        print(
+            f"[APS][REPAIR_BRIDGE_TON_RESCUE_FAIL] candidate_id={candidate_id}, "
+            f"window_id={window_id}, reason=TEMPLATE_PAIR_INVALID"
+        )
+        print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_RESCUE_REJECTED")
+        return {"success": False, "reject_reason": "TEMPLATE_PAIR_INVALID"}
+
+    left_materialized = adjusted_left_orders[: adjusted_left_orders.index(bridge_from) + 1]
+    right_materialized = adjusted_right_orders[adjusted_right_orders.index(bridge_to) :]
+    anchor_orders = left_materialized + right_materialized
+    used = Counter(anchor_orders)
+    append_orders: list[str] = []
+    for oid in combined_orders:
+        if used[str(oid)] > 0:
+            used[str(oid)] -= 1
+        else:
+            append_orders.append(str(oid))
+    rescue_orders = anchor_orders + append_orders
+    print(
+        f"[APS][REPAIR_BRIDGE_TON_RESCUE_MATERIALIZE] candidate_id={candidate_id}, "
+        f"window_id={window_id}, anchor_pair=({bridge_from},{bridge_to}), "
+        f"left_anchor_tail={left_materialized[-5:]}, right_anchor_head={right_materialized[:5]}"
+    )
+
+    if not rescue_orders:
+        print(
+            f"[APS][REPAIR_BRIDGE_TON_RESCUE_FAIL] candidate_id={candidate_id}, "
+            f"window_id={window_id}, reason=TON_SPLIT_NOT_FOUND"
+        )
+        print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_RESCUE_REJECTED")
+        return {"success": False, "reject_reason": "TON_SPLIT_NOT_FOUND"}
+    rescue_tons = sum(float(order_tons.get(str(oid), 0.0) or 0.0) for oid in rescue_orders)
+    if rescue_tons < float(campaign_ton_min) - 1e-6:
+        print(
+            f"[APS][REPAIR_BRIDGE_TON_RESCUE_RECUT] candidate_id={candidate_id}, "
+            f"window_id={window_id}, success=False, rescued_valid=0, residual_underfilled=1"
+        )
+        print(
+            f"[APS][REPAIR_BRIDGE_TON_RESCUE_FAIL] candidate_id={candidate_id}, "
+            f"window_id={window_id}, reason=TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION"
+        )
+        print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_RESCUE_REJECTED")
+        return {"success": False, "reject_reason": "TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION"}
+
+    synthetic = _campaign_segment_from_orders(
+        line=line,
+        campaign_local_id=next_local_id + 1,
+        order_ids=rescue_orders,
+        order_tons=order_tons,
+        is_valid=False,
+    )
+    if synthetic is None:
+        return {"success": False, "reject_reason": "TON_SPLIT_NOT_FOUND"}
+    valid, residual, recut_diag = _solve_underfilled_reconstruction_block(
+        [synthetic],
+        direct_edges=direct_edges,
+        real_edges={real_edge},
+        order_tons=order_tons,
+        campaign_ton_min=campaign_ton_min,
+        campaign_ton_max=campaign_ton_max,
+        campaign_ton_target=campaign_ton_target,
+        allow_real_bridge=True,
+        allow_virtual_bridge=False,
+        max_real_bridge_per_segment=max_real_bridge_per_segment,
+        bridge_cost_penalty=bridge_cost_penalty,
+        next_local_id=next_local_id,
+        real_edge_distance=real_edge_distance,
+        real_edge_adjustment_cost=real_edge_adjustment_cost,
+    )
+
+    if not valid:
+        reason = "TON_SPLIT_NOT_FOUND"
+        if rescue_tons > float(campaign_ton_max) + 1e-6:
+            reason = "TON_SPLIT_NOT_FOUND"
+        print(
+            f"[APS][REPAIR_BRIDGE_TON_RESCUE_RECUT] candidate_id={candidate_id}, "
+            f"window_id={window_id}, success=False, rescued_valid=0, residual_underfilled={len(residual)}"
+        )
+        print(f"[APS][REPAIR_BRIDGE_TON_RESCUE_FAIL] candidate_id={candidate_id}, window_id={window_id}, reason={reason}")
+        print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_RESCUE_REJECTED")
+        return {"success": False, "reject_reason": reason}
+
+    after_counter = Counter()
+    for seg in valid + residual:
+        after_counter.update([str(v) for v in seg.order_ids])
+    rescue_counter = Counter(rescue_orders)
+    omitted_counter = Counter(combined_orders) - rescue_counter
+    residual_all = list(residual)
+    local_id = next_local_id + len(valid) + len(residual)
+    if omitted_counter:
+        omitted_orders: list[str] = []
+        for oid in combined_orders:
+            if omitted_counter[str(oid)] > 0:
+                omitted_orders.append(str(oid))
+                omitted_counter[str(oid)] -= 1
+        omitted_seg = _campaign_segment_from_orders(
+            line=line,
+            campaign_local_id=local_id + 1,
+            order_ids=omitted_orders,
+            order_tons=order_tons,
+            is_valid=False,
+        )
+        if omitted_seg is not None:
+            residual_all.append(omitted_seg)
+
+    before_counter = Counter(combined_orders)
+    final_counter = Counter()
+    for seg in valid + residual_all:
+        final_counter.update([str(v) for v in seg.order_ids])
+    if before_counter != final_counter:
+        print(
+            f"[APS][REPAIR_BRIDGE_TON_RESCUE_FAIL] candidate_id={candidate_id}, "
+            f"window_id={window_id}, reason=MULTIPLICITY_INVALID"
+        )
+        print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_RESCUE_REJECTED")
+        return {"success": False, "reject_reason": "MULTIPLICITY_INVALID"}
+
+    bridge_pair_used = any(
+        any((str(seg.order_ids[i]), str(seg.order_ids[i + 1])) == real_edge for i in range(len(seg.order_ids) - 1))
+        for seg in valid
+    )
+    if not bridge_pair_used:
+        print(
+            f"[APS][REPAIR_BRIDGE_TON_RESCUE_RECUT] candidate_id={candidate_id}, "
+            f"window_id={window_id}, success=False, rescued_valid={len(valid)}, residual_underfilled={len(residual_all)}"
+        )
+        print(
+            f"[APS][REPAIR_BRIDGE_TON_RESCUE_FAIL] candidate_id={candidate_id}, "
+            f"window_id={window_id}, reason=TON_RESCUE_NO_GAIN"
+        )
+        print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_RESCUE_REJECTED")
+        return {"success": False, "reject_reason": "TON_RESCUE_NO_GAIN"}
+
+    valid_delta = len(valid)
+    underfilled_delta = len(residual_all) - len(expansion_block)
+    scheduled_orders_delta = sum(len(seg.order_ids) for seg in valid)
+    improved = valid_delta > 0 or underfilled_delta < 0 or scheduled_orders_delta > 0
+    print(
+        f"[APS][REPAIR_BRIDGE_TON_RESCUE_RECUT] candidate_id={candidate_id}, "
+        f"window_id={window_id}, success={bool(improved)}, rescued_valid={len(valid)}, "
+        f"residual_underfilled={len(residual_all)}"
+    )
+    if not improved:
+        print(
+            f"[APS][REPAIR_BRIDGE_TON_RESCUE_FAIL] candidate_id={candidate_id}, "
+            f"window_id={window_id}, reason=TON_RESCUE_NO_GAIN"
+        )
+        print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_RESCUE_REJECTED")
+        return {"success": False, "reject_reason": "TON_RESCUE_NO_GAIN"}
+
+    print(
+        f"[APS][REPAIR_BRIDGE_TON_RESCUE_ACCEPT] candidate_id={candidate_id}, "
+        f"window_id={window_id}, valid_delta={valid_delta}, underfilled_delta={underfilled_delta}, "
+        f"scheduled_orders_delta={scheduled_orders_delta}"
+    )
+    print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_RESCUE_ACCEPTED")
+    recut_diag.update(
+        {
+            "success": True,
+            "valid_delta": int(valid_delta),
+            "underfilled_delta": int(underfilled_delta),
+            "scheduled_orders_delta": int(scheduled_orders_delta),
+            "salvaged_orders": int(scheduled_orders_delta),
+            "real_bridge_used": max(1, int(recut_diag.get("real_bridge_used", 0) or 0)),
+        }
+    )
+    return {
+        "success": True,
+        "valid": valid,
+        "underfilled": residual_all,
+        "diag": recut_diag,
+        "valid_delta": int(valid_delta),
+        "underfilled_delta": int(underfilled_delta),
+        "scheduled_orders_delta": int(scheduled_orders_delta),
+    }
+
+
 def _reconstruct_underfilled_segments(
     valid_segments: List[CampaignSegment],
     underfilled_segments: List[CampaignSegment],
@@ -1878,6 +2220,18 @@ def _reconstruct_underfilled_segments(
         "repair_bridge_pair_invalid_temp": 0,
         "repair_bridge_pair_invalid_group": 0,
         "repair_bridge_pair_invalid_unknown": 0,
+        "repair_bridge_ton_rescue_attempts": 0,
+        "repair_bridge_ton_rescue_success": 0,
+        "repair_bridge_ton_rescue_windows_tested": 0,
+        "repair_bridge_ton_rescue_valid_delta": 0,
+        "repair_bridge_ton_rescue_underfilled_delta": 0,
+        "repair_bridge_ton_rescue_scheduled_orders_delta": 0,
+        "repair_bridge_filtered_ton_below_min_current_block": 0,
+        "repair_bridge_filtered_ton_below_min_even_after_neighbor_expansion": 0,
+        "repair_bridge_filtered_ton_above_max_after_expansion": 0,
+        "repair_bridge_filtered_ton_split_not_found": 0,
+        "repair_bridge_filtered_ton_rescue_no_gain": 0,
+        "repair_bridge_filtered_ton_rescue_impossible": 0,
         "repair_only_real_bridge_used_segments": 0,
         "repair_only_real_bridge_used_orders": 0,
         "repair_only_real_bridge_not_entered_reason": "",
@@ -1950,6 +2304,12 @@ def _reconstruct_underfilled_segments(
     adjustment_limit = int(getattr(cfg.model, "repair_bridge_endpoint_adjustment_limit_per_split", 9) if cfg and cfg.model else 9)
     enable_left_trim = bool(getattr(cfg.model, "repair_bridge_adjustment_enable_left_trim", True) if cfg and cfg.model else True)
     enable_right_trim = bool(getattr(cfg.model, "repair_bridge_adjustment_enable_right_trim", True) if cfg and cfg.model else True)
+    ton_rescue_max_neighbor_blocks = int(getattr(cfg.model, "repair_bridge_ton_rescue_max_neighbor_blocks", 2) if cfg and cfg.model else 2)
+    ton_rescue_enable_backward = bool(getattr(cfg.model, "repair_bridge_ton_rescue_enable_backward", True) if cfg and cfg.model else True)
+    ton_rescue_enable_forward = bool(getattr(cfg.model, "repair_bridge_ton_rescue_enable_forward", True) if cfg and cfg.model else True)
+    ton_rescue_enable_bidirectional = bool(getattr(cfg.model, "repair_bridge_ton_rescue_enable_bidirectional", True) if cfg and cfg.model else True)
+    ton_rescue_max_orders_per_window = int(getattr(cfg.model, "repair_bridge_ton_rescue_max_orders_per_window", 50) if cfg and cfg.model else 50)
+    ton_rescue_max_failed_after_min = int(getattr(cfg.model, "repair_bridge_ton_rescue_max_failed_windows_after_min", 2) if cfg and cfg.model else 2)
 
     frozen_oids = Counter()
     for seg in valid_segments:
@@ -2235,6 +2595,7 @@ def _reconstruct_underfilled_segments(
                 diag["repair_bridge_pair_invalid_temp"] += int(bridge_candidate_audit.get("pair_invalid_temp", 0) or 0)
                 diag["repair_bridge_pair_invalid_group"] += int(bridge_candidate_audit.get("pair_invalid_group", 0) or 0)
                 diag["repair_bridge_pair_invalid_unknown"] += int(bridge_candidate_audit.get("pair_invalid_unknown", 0) or 0)
+                diag["repair_bridge_filtered_ton_below_min_current_block"] += int(bridge_candidate_audit.get("filtered_ton_below_min_current_block", 0) or 0)
                 if adjustment_best_cost is not None:
                     old_adjust_cost = int(diag.get("repair_bridge_best_adjustment_cost", -1) or -1)
                     diag["repair_bridge_best_adjustment_cost"] = int(adjustment_best_cost) if old_adjust_cost < 0 else min(old_adjust_cost, int(adjustment_best_cost))
@@ -2384,8 +2745,120 @@ def _reconstruct_underfilled_segments(
                         best = (real_valid, real_under, real_diag, "REAL", block)
                         best_size = block_size
                         break
+                    ton_rescue_candidates = list(bridge_candidate_audit.get("ton_rescue_candidates", []) or [])
+                    rescue_result = None
+                    rescue_reason_counts: Counter = Counter()
+                    if ton_rescue_candidates and int(frontier_match_diag.get("matched_rows", 0) or 0) > 0:
+                        for rescue_candidate in ton_rescue_candidates:
+                            candidate_key = rescue_candidate.get("key")
+                            if not candidate_key:
+                                continue
+                            rescue_edge = (str(candidate_key[1]), str(candidate_key[2]))
+                            diag["repair_bridge_ton_rescue_attempts"] += 1
+                            max_back = min(int(ton_rescue_max_neighbor_blocks), i)
+                            max_fwd = min(int(ton_rescue_max_neighbor_blocks), max(0, len(line_under) - (i + block_size)))
+                            theoretical_start = max(0, i - max_back)
+                            theoretical_end = min(len(line_under), i + block_size + max_fwd)
+                            theoretical_orders = [
+                                str(oid)
+                                for seg in line_under[theoretical_start:theoretical_end]
+                                for oid in seg.order_ids
+                            ]
+                            theoretical_max_tons = sum(float(tons_by_order.get(str(oid), 0.0) or 0.0) for oid in theoretical_orders)
+                            if theoretical_max_tons < float(campaign_ton_min) - 1e-6:
+                                diag["repair_bridge_filtered_ton_rescue_impossible"] += 1
+                                rescue_reason_counts["TON_RESCUE_IMPOSSIBLE"] += 1
+                                print(
+                                    f"[APS][REPAIR_BRIDGE_TON_RESCUE_IMPOSSIBLE] "
+                                    f"candidate_id={rescue_candidate.get('candidate_id')}, "
+                                    f"theoretical_max_tons={theoretical_max_tons:.1f}, "
+                                    f"campaign_ton_min={float(campaign_ton_min):.1f}"
+                                )
+                                continue
+                            rescue_windows = _generate_ton_rescue_windows(
+                                line_under=line_under,
+                                current_block_idx=i,
+                                current_block_size=block_size,
+                                order_tons=tons_by_order,
+                                campaign_ton_min=campaign_ton_min,
+                                max_neighbor_blocks=ton_rescue_max_neighbor_blocks,
+                                max_orders_per_window=ton_rescue_max_orders_per_window,
+                                enable_backward=ton_rescue_enable_backward,
+                                enable_forward=ton_rescue_enable_forward,
+                                enable_bidirectional=ton_rescue_enable_bidirectional,
+                            )
+                            failed_after_min = 0
+                            last_tons: float | None = None
+                            for window_id, window in enumerate(rescue_windows, start=1):
+                                combined_tons = float(window.get("tons", 0.0) or 0.0)
+                                if last_tons is not None and abs(combined_tons - last_tons) <= 1e-6:
+                                    continue
+                                last_tons = combined_tons
+                                expansion_block = list(window.get("block", []))
+                                diag["repair_bridge_ton_rescue_windows_tested"] += 1
+                                result = _try_bridge_ton_rescue_recut(
+                                    candidate=rescue_candidate,
+                                    line=str(line),
+                                    block_id=int(block_id),
+                                    window_id=int(window_id),
+                                    direction=str(window.get("direction", "")),
+                                    expansion_block=expansion_block,
+                                    direct_edges=direct_edges,
+                                    real_edge=rescue_edge,
+                                    order_tons=tons_by_order,
+                                    campaign_ton_min=campaign_ton_min,
+                                    campaign_ton_max=campaign_ton_max,
+                                    campaign_ton_target=ton_target,
+                                    max_real_bridge_per_segment=max_real,
+                                    bridge_cost_penalty=bridge_penalty,
+                                    next_local_id=max_local_id,
+                                    real_edge_distance=real_edge_distance,
+                                    real_edge_adjustment_cost=real_edge_adjustment_cost,
+                                )
+                                if result.get("success"):
+                                    rescue_result = result
+                                    best = (
+                                        list(result.get("valid", [])),
+                                        list(result.get("underfilled", [])),
+                                        dict(result.get("diag", {})),
+                                        "REAL",
+                                        expansion_block,
+                                    )
+                                    best_size = int(window.get("end", i + block_size)) - i
+                                    diag["repair_bridge_ton_rescue_success"] += 1
+                                    diag["repair_bridge_ton_rescue_valid_delta"] += int(result.get("valid_delta", 0) or 0)
+                                    diag["repair_bridge_ton_rescue_underfilled_delta"] += int(result.get("underfilled_delta", 0) or 0)
+                                    diag["repair_bridge_ton_rescue_scheduled_orders_delta"] += int(result.get("scheduled_orders_delta", 0) or 0)
+                                    diag["repair_bridge_candidates_accepted"] += 1
+                                    break
+                                reject_reason = str(result.get("reject_reason", "") or "")
+                                if reject_reason:
+                                    rescue_reason_counts[reject_reason] += 1
+                                if reject_reason == "TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION":
+                                    diag["repair_bridge_filtered_ton_below_min_even_after_neighbor_expansion"] += 1
+                                elif reject_reason == "TON_SPLIT_NOT_FOUND":
+                                    diag["repair_bridge_filtered_ton_split_not_found"] += 1
+                                    if bool(window.get("reaches_min", False)):
+                                        failed_after_min += 1
+                                elif reject_reason == "TON_RESCUE_NO_GAIN":
+                                    diag["repair_bridge_filtered_ton_rescue_no_gain"] += 1
+                                    if bool(window.get("reaches_min", False)):
+                                        failed_after_min += 1
+                                elif reject_reason == "TON_ABOVE_MAX_AFTER_EXPANSION":
+                                    diag["repair_bridge_filtered_ton_above_max_after_expansion"] += 1
+                                if failed_after_min >= int(ton_rescue_max_failed_after_min):
+                                    break
+                            if rescue_result is not None:
+                                break
+                        if rescue_result is not None:
+                            break
                     reason_buckets = {
                         "TEMPLATE_PAIR_INVALID": int(real_diag_report.get("repair_only_real_bridge_filtered_pair_invalid", 0) or 0),
+                        "TON_BELOW_MIN_CURRENT_BLOCK": int(bridge_candidate_audit.get("filtered_ton_below_min_current_block", 0) or 0),
+                        "TON_RESCUE_IMPOSSIBLE": int(rescue_reason_counts.get("TON_RESCUE_IMPOSSIBLE", 0) or 0),
+                        "TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION": int(rescue_reason_counts.get("TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION", 0) or 0),
+                        "TON_SPLIT_NOT_FOUND": int(rescue_reason_counts.get("TON_SPLIT_NOT_FOUND", 0) or 0),
+                        "TON_RESCUE_NO_GAIN": int(rescue_reason_counts.get("TON_RESCUE_NO_GAIN", 0) or 0),
                         "TON_WINDOW_INVALID": int(real_diag_report.get("repair_only_real_bridge_filtered_ton_invalid", 0) or 0),
                         "SCORE_WORSE_THAN_DIRECT_ONLY": int(real_diag_report.get("repair_only_real_bridge_filtered_score_worse", 0) or 0),
                         "BRIDGE_LIMIT_EXCEEDED": int(real_diag_report.get("repair_only_real_bridge_filtered_bridge_limit_exceeded", 0) or 0),
@@ -2404,6 +2877,11 @@ def _reconstruct_underfilled_segments(
                         f"[APS][REPAIR_BRIDGE_REASON_AUDIT] line={line}, block_id={block_id}, "
                         f"filtered_pair_invalid={int(real_diag_report.get('repair_only_real_bridge_filtered_pair_invalid', 0) or 0)}, "
                         f"filtered_ton_invalid={int(real_diag_report.get('repair_only_real_bridge_filtered_ton_invalid', 0) or 0)}, "
+                        f"filtered_ton_below_min_current_block={int(bridge_candidate_audit.get('filtered_ton_below_min_current_block', 0) or 0)}, "
+                        f"filtered_ton_rescue_impossible={int(rescue_reason_counts.get('TON_RESCUE_IMPOSSIBLE', 0) or 0)}, "
+                        f"filtered_ton_below_min_even_after_neighbor_expansion={int(rescue_reason_counts.get('TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION', 0) or 0)}, "
+                        f"filtered_ton_split_not_found={int(diag.get('repair_bridge_filtered_ton_split_not_found', 0) or 0)}, "
+                        f"filtered_ton_rescue_no_gain={int(diag.get('repair_bridge_filtered_ton_rescue_no_gain', 0) or 0)}, "
                         f"filtered_score_worse={int(real_diag_report.get('repair_only_real_bridge_filtered_score_worse', 0) or 0)}, "
                         f"final_reason={reason}"
                     )
@@ -2441,6 +2919,9 @@ def _reconstruct_underfilled_segments(
                 i += best_size
                 continue
 
+            consumed_prev_ids = {int(seg.campaign_local_id) for seg in block if int(seg.campaign_local_id) < int(line_under[i].campaign_local_id)}
+            if consumed_prev_ids:
+                remaining_under = [seg for seg in remaining_under if int(seg.campaign_local_id) not in consumed_prev_ids]
             max_local_id += len(valid_out) + len(under_out)
             new_valid.extend(valid_out)
             remaining_under.extend(under_out)
