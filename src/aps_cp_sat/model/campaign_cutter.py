@@ -31,6 +31,7 @@ import pandas as pd
 
 from aps_cp_sat.config import PlannerConfig
 from aps_cp_sat.model.constructive_sequence_builder import ConstructiveChain
+from aps_cp_sat.transition.bridge_rules import _is_pc, _temp_overlap_len, _thick_ok, _txt
 
 
 class CutReason(Enum):
@@ -87,6 +88,135 @@ class CampaignSegment:
             "edge_count": self.edge_count,
             "is_valid": self.is_valid,
             "order_count": len(self.order_ids),
+        }
+
+
+@dataclass
+class PairEvalResult:
+    template_ok: bool
+    adjacency_ok: bool
+    context_ok: bool
+    reason: str
+    sub_reasons: list[str] = field(default_factory=list)
+    template_key: tuple[str, str, str] | tuple[str, str] | str = ""
+    context_snapshot: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "template_ok": bool(self.template_ok),
+            "adjacency_ok": bool(self.adjacency_ok),
+            "context_ok": bool(self.context_ok),
+            "reason": str(self.reason),
+            "sub_reasons": list(self.sub_reasons),
+            "template_key": self.template_key,
+            "context_snapshot": dict(self.context_snapshot),
+        }
+
+
+@dataclass
+class BridgeabilityCensus:
+    items: list[dict] = field(default_factory=list)
+    has_endpoint_edge_count: int = 0
+    template_graph_no_edge_count: int = 0
+    rule_prefilter_all_fail_count: int = 0
+    band_too_narrow_count: int = 0
+    prefilter_rejected_block_count: int = 0
+    candidate_pool_empty_count: int = 0
+    candidate_pool_nonempty_count: int = 0
+    ton_rescue_entered_count: int = 0
+    ton_rescue_success_count: int = 0
+    improvement_recorded_count: int = 0
+    improvement_applied_count: int = 0
+    thickness_fail_dominant_count: int = 0
+    width_fail_dominant_count: int = 0
+    temp_fail_dominant_count: int = 0
+    group_fail_dominant_count: int = 0
+    multi_fail_dominant_count: int = 0
+
+    def add_item(self, item: dict) -> None:
+        endpoint_class = str(item.get("endpoint_class", "") or "")
+        dominant = str(item.get("dominant_fail_reason", "") or "")
+        candidate_count = int(item.get("candidate_count", 0) or 0)
+        self.items.append(dict(item))
+        if endpoint_class == "HAS_ENDPOINT_EDGE":
+            self.has_endpoint_edge_count += 1
+        elif endpoint_class == "TEMPLATE_GRAPH_NO_EDGE":
+            self.template_graph_no_edge_count += 1
+        elif endpoint_class == "RULE_PREFILTER_ALL_FAIL":
+            self.rule_prefilter_all_fail_count += 1
+        elif endpoint_class == "BAND_TOO_NARROW":
+            self.band_too_narrow_count += 1
+        if bool(item.get("prefilter_rejected", False)):
+            self.prefilter_rejected_block_count += 1
+        if candidate_count > 0:
+            self.candidate_pool_nonempty_count += 1
+        else:
+            self.candidate_pool_empty_count += 1
+        if bool(item.get("ton_rescue_entered", False)):
+            self.ton_rescue_entered_count += 1
+        if bool(item.get("ton_rescue_success", False)):
+            self.ton_rescue_success_count += 1
+        if str(item.get("final_decision", "")) == "IMPROVEMENT_RECORDED_BUT_NOT_APPLIED":
+            self.improvement_recorded_count += 1
+        if str(item.get("final_decision", "")) == "IMPROVEMENT_APPLIED":
+            self.improvement_applied_count += 1
+        if dominant == "THICKNESS_RULE_FAIL":
+            self.thickness_fail_dominant_count += 1
+        elif dominant == "WIDTH_RULE_FAIL":
+            self.width_fail_dominant_count += 1
+        elif dominant == "TEMP_OVERLAP_FAIL":
+            self.temp_fail_dominant_count += 1
+        elif dominant == "GROUP_SWITCH_FAIL":
+            self.group_fail_dominant_count += 1
+        elif dominant == "MULTI_RULE_FAIL":
+            self.multi_fail_dominant_count += 1
+
+    def to_dict(self) -> dict:
+        return {
+            "total_blocks": int(len(self.items)),
+            "has_endpoint_edge_count": int(self.has_endpoint_edge_count),
+            "template_graph_no_edge_count": int(self.template_graph_no_edge_count),
+            "rule_prefilter_all_fail_count": int(self.rule_prefilter_all_fail_count),
+            "band_too_narrow_count": int(self.band_too_narrow_count),
+            "prefilter_rejected_block_count": int(self.prefilter_rejected_block_count),
+            "candidate_pool_empty_count": int(self.candidate_pool_empty_count),
+            "candidate_pool_nonempty_count": int(self.candidate_pool_nonempty_count),
+            "ton_rescue_entered_count": int(self.ton_rescue_entered_count),
+            "ton_rescue_success_count": int(self.ton_rescue_success_count),
+            "improvement_recorded_count": int(self.improvement_recorded_count),
+            "improvement_applied_count": int(self.improvement_applied_count),
+            "thickness_fail_dominant_count": int(self.thickness_fail_dominant_count),
+            "width_fail_dominant_count": int(self.width_fail_dominant_count),
+            "temp_fail_dominant_count": int(self.temp_fail_dominant_count),
+            "group_fail_dominant_count": int(self.group_fail_dominant_count),
+            "multi_fail_dominant_count": int(self.multi_fail_dominant_count),
+            "items": list(self.items),
+        }
+
+
+@dataclass
+class VirtualPilotEligibilityResult:
+    structural_eligible: bool
+    runtime_enabled: bool
+    final_eligible: bool
+    endpoint_class: str
+    candidate_count: int
+    frontier_candidate_count: int
+    pilot_target_candidates: int
+    reject_reason: str
+    reject_details: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "structural_eligible": bool(self.structural_eligible),
+            "runtime_enabled": bool(self.runtime_enabled),
+            "final_eligible": bool(self.final_eligible),
+            "endpoint_class": str(self.endpoint_class),
+            "candidate_count": int(self.candidate_count),
+            "frontier_candidate_count": int(self.frontier_candidate_count),
+            "pilot_target_candidates": int(self.pilot_target_candidates),
+            "reject_reason": str(self.reject_reason),
+            "reject_details": dict(self.reject_details),
         }
 
 
@@ -1018,6 +1148,569 @@ def _transition_templates_df(transition_pack) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _as_float_or_none(value) -> float | None:
+    try:
+        if value is None:
+            return None
+        if pd.isna(value):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _build_order_spec_map_from_transition_context(
+    transition_pack,
+    tpl_df: pd.DataFrame,
+    orders_df: pd.DataFrame | None = None,
+) -> dict[str, dict]:
+    specs: dict[str, dict] = {}
+    seen_objects: set[int] = set()
+
+    width_keys = ("width", "order_width", "strip_width", "from_width", "to_width", "left_width", "right_width")
+    thickness_keys = ("thickness", "thick", "order_thickness", "strip_thickness", "from_thickness", "to_thickness", "left_thickness", "right_thickness")
+    temp_min_keys = ("temp_min", "temp_low", "anneal_temp_min", "temperature_min", "from_temp_min", "to_temp_min", "left_temp_min", "right_temp_min")
+    temp_max_keys = ("temp_max", "temp_high", "anneal_temp_max", "temperature_max", "from_temp_max", "to_temp_max", "left_temp_max", "right_temp_max")
+    steel_group_keys = ("steel_group", "grade_group", "steel_grade_group", "from_steel_group", "to_steel_group", "left_steel_group", "right_steel_group")
+    line_capability_keys = ("line_capability", "roll_capability", "capability")
+
+    def first_present(row: dict, keys: tuple[str, ...]):
+        for key in keys:
+            if key in row:
+                val = row.get(key)
+                if val is not None and not (isinstance(val, str) and not val.strip()):
+                    return val
+        return None
+
+    def add_spec(row: dict, oid_key: str = "order_id", prefix: str = "") -> None:
+        oid = _txt(row.get(oid_key, ""))
+        if not oid:
+            return
+        prefixed = {str(key)[len(prefix):]: val for key, val in row.items() if prefix and str(key).startswith(prefix)}
+        merged = {**row, **prefixed}
+        width = _as_float_or_none(first_present(merged, width_keys))
+        thickness = _as_float_or_none(first_present(merged, thickness_keys))
+        temp_min = _as_float_or_none(first_present(merged, temp_min_keys))
+        temp_max = _as_float_or_none(first_present(merged, temp_max_keys))
+        steel_group = _txt(first_present(merged, steel_group_keys) or "")
+        line_capability = _txt(first_present(merged, line_capability_keys) or "")
+        if width is None and thickness is None and temp_min is None and temp_max is None and not steel_group and not line_capability:
+            return
+        cur = specs.setdefault(oid, {"order_id": oid})
+        if width is not None:
+            cur["width"] = width
+        if thickness is not None:
+            cur["thickness"] = thickness
+        if temp_min is not None:
+            cur["temp_min"] = temp_min
+        if temp_max is not None:
+            cur["temp_max"] = temp_max
+        if steel_group:
+            cur["steel_group"] = steel_group
+        if line_capability:
+            cur["line_capability"] = line_capability
+
+    def scan_df(df: pd.DataFrame) -> None:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return
+        obj_id = id(df)
+        if obj_id in seen_objects:
+            return
+        seen_objects.add(obj_id)
+        cols = {str(c) for c in df.columns}
+        if {"order_id", "width", "thickness", "temp_min", "temp_max", "temp_low", "temp_high", "steel_group", "line_capability"}.intersection(cols):
+            for row in df.to_dict("records"):
+                add_spec(row)
+        endpoint_specs = [
+            ("from_order_id", "from_"),
+            ("to_order_id", "to_"),
+            ("source_order_id", "source_"),
+            ("target_order_id", "target_"),
+            ("left_order_id", "left_"),
+            ("right_order_id", "right_"),
+        ]
+        for oid_key, prefix in endpoint_specs:
+            if oid_key in cols:
+                for row in df.to_dict("records"):
+                    add_spec(row, oid_key=oid_key, prefix=prefix)
+
+    def scan_value(value, depth: int = 0) -> None:
+        if depth > 5 or value is None:
+            return
+        obj_id = id(value)
+        if obj_id in seen_objects and not isinstance(value, pd.DataFrame):
+            return
+        if isinstance(value, pd.DataFrame):
+            scan_df(value)
+            return
+        if isinstance(value, dict):
+            seen_objects.add(obj_id)
+            if any(key in value for key in ("order_id", "from_order_id", "to_order_id", "left_order_id", "right_order_id")):
+                add_spec(value)
+                for oid_key, prefix in (
+                    ("from_order_id", "from_"),
+                    ("to_order_id", "to_"),
+                    ("left_order_id", "left_"),
+                    ("right_order_id", "right_"),
+                    ("source_order_id", "source_"),
+                    ("target_order_id", "target_"),
+                ):
+                    if oid_key in value:
+                        add_spec(value, oid_key=oid_key, prefix=prefix)
+            for nested in value.values():
+                scan_value(nested, depth + 1)
+            return
+        if isinstance(value, (list, tuple)):
+            seen_objects.add(obj_id)
+            for item in value:
+                scan_value(item, depth + 1)
+
+    scan_df(orders_df) if isinstance(orders_df, pd.DataFrame) else None
+    scan_df(tpl_df)
+    scan_value(transition_pack)
+    return specs
+
+
+def _build_template_pair_rows_by_key(tpl_df: pd.DataFrame, line: str) -> dict[tuple[str, str], list[dict]]:
+    out: dict[tuple[str, str], list[dict]] = {}
+    if not isinstance(tpl_df, pd.DataFrame) or tpl_df.empty:
+        return out
+    for row in tpl_df.to_dict("records"):
+        if "line" in row and str(row.get("line", "")) != str(line):
+            continue
+        src, src_field = _extract_bridge_endpoint(row, "from")
+        dst, dst_field = _extract_bridge_endpoint(row, "to")
+        if not src_field or not dst_field:
+            continue
+        out.setdefault((str(src), str(dst)), []).append(row)
+    return out
+
+
+def _order_pair_meta(order_specs_by_id: dict[str, dict], oid: str) -> dict:
+    spec = dict(order_specs_by_id.get(str(oid), {}) or {})
+    width = _as_float_or_none(spec.get("width"))
+    thickness = _as_float_or_none(spec.get("thickness"))
+    temp_low = _as_float_or_none(spec.get("temp_min", spec.get("temp_low")))
+    temp_high = _as_float_or_none(spec.get("temp_max", spec.get("temp_high")))
+    steel_group = _txt(spec.get("steel_group", ""))
+    context_present = bool(
+        spec
+        and width is not None
+        and thickness is not None
+        and temp_low is not None
+        and temp_high is not None
+        and bool(steel_group)
+    )
+    return {
+        "order_id": str(oid),
+        "width": width,
+        "thickness": thickness,
+        "temp_low": temp_low,
+        "temp_high": temp_high,
+        "steel_group": steel_group,
+        "line_capability": _txt(spec.get("line_capability", "")),
+        "context_present": bool(context_present),
+    }
+
+
+def _quick_thickness_feasible(left_ctx: dict, right_ctx: dict) -> tuple[bool, str, dict]:
+    left_t = _as_float_or_none((left_ctx or {}).get("thickness"))
+    right_t = _as_float_or_none((right_ctx or {}).get("thickness"))
+    if left_t is None or right_t is None:
+        return True, "ORDER_CONTEXT_MISSING", {
+            "left_thickness": left_t,
+            "right_thickness": right_t,
+            "delta_mm": None,
+            "delta_ratio": None,
+        }
+    delta_mm = abs(float(right_t) - float(left_t))
+    delta_ratio = delta_mm / max(abs(float(left_t)), 1e-9)
+    ok = bool(_thick_ok(float(left_t), float(right_t)))
+    return ok, "OK" if ok else "THICKNESS_RULE_FAIL", {
+        "left_thickness": float(left_t),
+        "right_thickness": float(right_t),
+        "delta_mm": float(delta_mm),
+        "delta_ratio": float(delta_ratio),
+    }
+
+
+def _quick_pair_rank_metrics(order_context_by_id: dict[str, dict], left_oid: str, right_oid: str, rule=None) -> dict:
+    left_meta = _order_pair_meta(order_context_by_id, str(left_oid))
+    right_meta = _order_pair_meta(order_context_by_id, str(right_oid))
+    prefilter = _quick_bridge_rule_prefilter(left_meta, right_meta, rule=rule)
+    thick_detail = dict(prefilter.get("thickness_detail", {}) or {})
+    lw = _as_float_or_none(left_meta.get("width"))
+    rw = _as_float_or_none(right_meta.get("width"))
+    width_distance = abs(float(lw) - float(rw)) if lw is not None and rw is not None else 999999.0
+    thickness_distance = float(prefilter.get("thickness_gap") or 0.0) if prefilter.get("thickness_gap") is not None else 999999.0
+    return {
+        **prefilter,
+        "thickness_prefilter_pass": bool(prefilter.get("thickness_pass", False)),
+        "thickness_reason": "OK" if bool(prefilter.get("thickness_pass", False)) else "THICKNESS_RULE_FAIL",
+        "thickness_distance_mm": float(thickness_distance),
+        "thickness_delta_ratio": thick_detail.get("delta_ratio"),
+        "width_distance": float(width_distance),
+        "left_thickness": thick_detail.get("left_thickness"),
+        "right_thickness": thick_detail.get("right_thickness"),
+    }
+
+
+def _quick_bridge_rule_prefilter(left_ctx: dict, right_ctx: dict, rule) -> dict:
+    left = dict(left_ctx or {})
+    right = dict(right_ctx or {})
+    fail_reasons: list[str] = []
+
+    thick_ok, thick_reason, thick_detail = _quick_thickness_feasible(left, right)
+    thickness_pass = bool(thick_ok)
+    if not thickness_pass and thick_reason != "ORDER_CONTEXT_MISSING":
+        fail_reasons.append("THICKNESS_RULE_FAIL")
+
+    lw = _as_float_or_none(left.get("width"))
+    rw = _as_float_or_none(right.get("width"))
+    width_delta = None
+    width_pass = True
+    if lw is None or rw is None:
+        width_pass = False
+        fail_reasons.append("ORDER_CONTEXT_MISSING")
+    else:
+        width_delta = float(rw) - float(lw)
+        reverse_limit = float(getattr(rule, "real_reverse_step_max_mm", 0.0) or 0.0) if rule is not None else 0.0
+        drop_limit = float(getattr(rule, "max_width_drop", 999999.0) or 999999.0) if rule is not None else 999999.0
+        if width_delta > reverse_limit or -width_delta > drop_limit:
+            width_pass = False
+            fail_reasons.append("WIDTH_RULE_FAIL")
+
+    lmin = _as_float_or_none(left.get("temp_min", left.get("temp_low")))
+    lmax = _as_float_or_none(left.get("temp_max", left.get("temp_high")))
+    rmin = _as_float_or_none(right.get("temp_min", right.get("temp_low")))
+    rmax = _as_float_or_none(right.get("temp_max", right.get("temp_high")))
+    temp_overlap = None
+    temp_pass = True
+    if None in (lmin, lmax, rmin, rmax):
+        temp_pass = False
+        fail_reasons.append("ORDER_CONTEXT_MISSING")
+    else:
+        temp_overlap = _temp_overlap_len(float(lmin), float(lmax), float(rmin), float(rmax))
+        min_overlap = float(getattr(rule, "min_temp_overlap_real_real", 0.0) or 0.0) if rule is not None else 0.0
+        if float(temp_overlap) < min_overlap:
+            temp_pass = False
+            fail_reasons.append("TEMP_OVERLAP_FAIL")
+
+    lg = _txt(left.get("steel_group", "")).upper()
+    rg = _txt(right.get("steel_group", "")).upper()
+    group_transition_required = bool(lg and rg and lg != rg)
+    group_pass = True
+    if not lg or not rg:
+        group_pass = False
+        fail_reasons.append("ORDER_CONTEXT_MISSING")
+    elif group_transition_required and (not _is_pc(lg)) and (not _is_pc(rg)):
+        group_pass = False
+        fail_reasons.append("GROUP_SWITCH_FAIL")
+
+    fail_reasons = list(dict.fromkeys(fail_reasons))
+    non_context_failures = [r for r in fail_reasons if r != "ORDER_CONTEXT_MISSING"]
+    dominant_fail_reason = non_context_failures[0] if non_context_failures else (fail_reasons[0] if fail_reasons else "OK")
+    thickness_gap = thick_detail.get("delta_mm")
+    width_abs = abs(float(width_delta)) if width_delta is not None else None
+    temp_penalty = 0.0
+    if temp_overlap is None:
+        temp_penalty = 5000.0
+    elif not temp_pass:
+        temp_penalty = 3000.0 + abs(float(temp_overlap)) * 10.0
+    else:
+        temp_penalty = max(0.0, 100.0 - float(temp_overlap))
+    thickness_penalty = (10000.0 + float(thickness_gap or 0.0) * 1000.0) if not thickness_pass else float(thickness_gap or 0.0) * 100.0
+    width_penalty = (5000.0 + float(width_abs or 0.0)) if not width_pass else float(width_abs or 0.0)
+    group_penalty = 4000.0 if not group_pass else (50.0 if group_transition_required else 0.0)
+    hard_prefilter_fail_penalty = 100000.0 * len(non_context_failures)
+    return {
+        "pass": bool(not fail_reasons),
+        "thickness_pass": bool(thickness_pass),
+        "width_pass": bool(width_pass),
+        "temp_pass": bool(temp_pass),
+        "group_pass": bool(group_pass),
+        "dominant_fail_reason": str(dominant_fail_reason),
+        "fail_reasons": fail_reasons,
+        "thickness_gap": thickness_gap,
+        "width_delta": width_delta,
+        "temp_overlap": temp_overlap,
+        "group_transition_required": bool(group_transition_required),
+        "thickness_detail": thick_detail,
+        "hard_prefilter_fail_penalty": float(hard_prefilter_fail_penalty),
+        "thickness_penalty": float(thickness_penalty),
+        "width_penalty": float(width_penalty),
+        "temp_penalty": float(temp_penalty),
+        "group_penalty": float(group_penalty),
+    }
+
+
+def _rank_pair_keys_by_rules(
+    keys: list[tuple[str, str, str]],
+    order_context_by_id: dict[str, dict],
+    adjustment_cost_by_pair: dict[tuple[str, str], int] | None = None,
+    rule=None,
+) -> list[tuple[str, str, str]]:
+    def sort_key(item: tuple[str, str, str]):
+        _, left_oid, right_oid = item
+        metrics = _quick_pair_rank_metrics(order_context_by_id, str(left_oid), str(right_oid), rule=rule)
+        adjust_cost = int((adjustment_cost_by_pair or {}).get((str(left_oid), str(right_oid)), 0) or 0)
+        rank_score = (
+            float(metrics.get("hard_prefilter_fail_penalty", 0.0))
+            + float(metrics.get("thickness_penalty", 0.0))
+            + float(metrics.get("width_penalty", 0.0))
+            + float(metrics.get("temp_penalty", 0.0))
+            + float(metrics.get("group_penalty", 0.0))
+            + int(adjust_cost)
+        )
+        return (
+            0 if bool(metrics.get("pass", False)) else 1,
+            len(list(metrics.get("fail_reasons", []) or [])),
+            0 if bool(metrics.get("group_pass", False)) else 1,
+            0 if bool(metrics.get("temp_pass", False)) else 1,
+            0 if bool(metrics.get("width_pass", False)) else 1,
+            0 if bool(metrics.get("thickness_pass", False)) else 1,
+            float(rank_score),
+        )
+
+    return sorted(list(dict.fromkeys(keys)), key=sort_key)
+
+
+def _rank_band_orders_for_thickness(
+    *,
+    order_context_by_id: dict[str, dict],
+    left_band: list[str],
+    right_band: list[str],
+    line: str,
+    block_id: int | None,
+    split_id: int | None,
+    rule=None,
+) -> tuple[list[str], list[str]]:
+    left_generation = list(reversed([str(v) for v in left_band]))
+    right_generation = [str(v) for v in right_band]
+    if not left_generation or not right_generation:
+        return left_generation, right_generation
+
+    left_tail = left_generation[0]
+    right_generation = sorted(
+        right_generation,
+        key=lambda oid: (
+            0 if _quick_pair_rank_metrics(order_context_by_id, left_tail, oid, rule=rule).get("pass") else 1,
+            len(list(_quick_pair_rank_metrics(order_context_by_id, left_tail, oid, rule=rule).get("fail_reasons", []) or [])),
+            -float(_quick_pair_rank_metrics(order_context_by_id, left_tail, oid, rule=rule).get("temp_overlap") or -999999.0),
+            0 if _quick_pair_rank_metrics(order_context_by_id, left_tail, oid, rule=rule).get("group_pass") else 1,
+            float(_quick_pair_rank_metrics(order_context_by_id, left_tail, oid, rule=rule).get("width_distance", 999999.0)),
+            float(_quick_pair_rank_metrics(order_context_by_id, left_tail, oid, rule=rule).get("thickness_distance_mm", 999999.0)),
+        ),
+    )
+    left_generation = sorted(
+        left_generation,
+        key=lambda oid: min(
+            (
+                0 if _quick_pair_rank_metrics(order_context_by_id, oid, right_oid, rule=rule).get("pass") else 1,
+                len(list(_quick_pair_rank_metrics(order_context_by_id, oid, right_oid, rule=rule).get("fail_reasons", []) or [])),
+                -float(_quick_pair_rank_metrics(order_context_by_id, oid, right_oid, rule=rule).get("temp_overlap") or -999999.0),
+                0 if _quick_pair_rank_metrics(order_context_by_id, oid, right_oid, rule=rule).get("group_pass") else 1,
+                float(_quick_pair_rank_metrics(order_context_by_id, oid, right_oid, rule=rule).get("width_distance", 999999.0)),
+                float(_quick_pair_rank_metrics(order_context_by_id, oid, right_oid, rule=rule).get("thickness_distance_mm", 999999.0)),
+            )
+            for right_oid in right_generation
+        ),
+    )
+    ranked_preview = []
+    for right_oid in right_generation[:8]:
+        meta = _order_pair_meta(order_context_by_id, right_oid)
+        metrics = _quick_pair_rank_metrics(order_context_by_id, left_tail, right_oid, rule=rule)
+        ranked_preview.append((
+            right_oid,
+            bool(metrics.get("pass", False)),
+            list(metrics.get("fail_reasons", []) or []),
+            metrics.get("thickness_gap"),
+            metrics.get("width_delta"),
+            metrics.get("temp_overlap"),
+            bool(metrics.get("group_pass", False)),
+        ))
+    print(
+        f"[APS][REPAIR_BRIDGE_BAND_ORDERING] line={line}, block_id={block_id}, split_id={split_id}, "
+        f"left_tail={left_tail}, right_band_ranked={ranked_preview}"
+    )
+    return left_generation, right_generation
+
+
+def _pair_context_changed_fields(pre_context: dict, extract_context: dict) -> list[str]:
+    changed: list[str] = []
+    keys = sorted(set(pre_context.keys()) | set(extract_context.keys()))
+    for key in keys:
+        if pre_context.get(key) != extract_context.get(key):
+            changed.append(str(key))
+    return changed
+
+
+def _evaluate_pair_violation(
+    *,
+    left_order: str,
+    right_order: str,
+    line: str,
+    template_lookup: dict[tuple[str, str], list[dict]],
+    direct_edges: set[tuple[str, str]],
+    real_edges: set[tuple[str, str]],
+    adjacency_ok: bool,
+    order_context_by_id: dict[str, dict],
+    rule,
+    lookup_key_mode: str = "(line,from_order_id,to_order_id)",
+) -> PairEvalResult:
+    left_oid = str(left_order)
+    right_oid = str(right_order)
+    pair = (left_oid, right_oid)
+    line_key = (str(line), left_oid, right_oid)
+    rows = list(template_lookup.get(pair, []) or [])
+    template_found = bool(rows or pair in direct_edges or pair in real_edges)
+    payload_present = any(not _bridge_payload_empty(row) for row in rows) if rows else bool(pair in direct_edges or pair in real_edges)
+    template_ok = bool(template_found)
+    left_meta = _order_pair_meta(order_context_by_id, left_oid)
+    right_meta = _order_pair_meta(order_context_by_id, right_oid)
+    context_ok = bool(left_meta.get("context_present") and right_meta.get("context_present"))
+    effective_adjacency_ok = bool(adjacency_ok and context_ok)
+    context_snapshot = {
+        "line": str(line),
+        "from_order_id": left_oid,
+        "to_order_id": right_oid,
+        "lookup_key_mode": str(lookup_key_mode),
+        "template_key": line_key,
+        "line_row_found": bool(rows),
+        "template_found": bool(template_found),
+        "payload_present": bool(payload_present),
+        "context_ok": bool(context_ok),
+        "left_meta": left_meta,
+        "right_meta": right_meta,
+    }
+
+    sub_reasons: list[str] = []
+    reason = "OK"
+    if not context_ok:
+        sub_reasons.append("ORDER_CONTEXT_MISSING")
+    if not context_ok:
+        reason = "ORDER_CONTEXT_MISSING"
+    elif not template_found:
+        reason = "TEMPLATE_KEY_MISSING"
+    elif not rows and (pair in direct_edges or pair in real_edges):
+        reason = "LINE_CONTEXT_MISMATCH"
+    elif rows and not payload_present:
+        reason = "TEMPLATE_PAYLOAD_EMPTY"
+    elif not adjacency_ok:
+        reason = "ANCHOR_PAIR_NOT_ADJACENT"
+        sub_reasons.append("ANCHOR_NOT_ADJACENT")
+    else:
+        rule_reason, rule_sub_reasons = _classify_pair_rule_failure(
+            left_oid,
+            right_oid,
+            template_known=template_found,
+            order_specs_by_id=order_context_by_id,
+            rule=rule,
+        )
+        if rule_reason != "UNKNOWN_PAIR_INVALID":
+            reason = rule_reason
+            sub_reasons.extend(rule_sub_reasons)
+        elif rule_sub_reasons:
+            reason = "MULTI_RULE_FAIL" if len(rule_sub_reasons) > 1 else rule_sub_reasons[0]
+            sub_reasons.extend(rule_sub_reasons)
+
+    sub_reasons = list(dict.fromkeys([str(v) for v in sub_reasons if str(v)]))
+    if reason == "OK" and sub_reasons:
+        reason = "MULTI_RULE_FAIL" if len(sub_reasons) > 1 else sub_reasons[0]
+    if reason == "UNKNOWN_PAIR_INVALID" and sub_reasons:
+        reason = "MULTI_RULE_FAIL" if len(sub_reasons) > 1 else sub_reasons[0]
+    business_ok = reason == "OK"
+    return PairEvalResult(
+        template_ok=bool(template_ok),
+        adjacency_ok=bool(effective_adjacency_ok and business_ok),
+        context_ok=bool(context_ok),
+        reason=str(reason),
+        sub_reasons=sub_reasons,
+        template_key=line_key,
+        context_snapshot=context_snapshot,
+    )
+
+
+def _print_pair_audit(
+    tag: str,
+    *,
+    candidate_id: str,
+    pair: tuple[str, str],
+    line: str,
+    eval_result: PairEvalResult,
+) -> None:
+    print(
+        f"[APS][{tag}] candidate_id={candidate_id}, pair=({pair[0]},{pair[1]}), "
+        f"line={line}, template_ok={bool(eval_result.template_ok)}, "
+        f"adjacency_ok={bool(eval_result.adjacency_ok)}, "
+        f"context_ok={bool(eval_result.context_ok)}, "
+        f"reason={eval_result.reason}, template_key={eval_result.template_key}, "
+        f"context={eval_result.context_snapshot}"
+    )
+
+
+def _print_anchor_context(
+    *,
+    candidate_id: str,
+    pair: tuple[str, str],
+    line: str,
+    eval_result: PairEvalResult,
+) -> None:
+    ctx = dict(eval_result.context_snapshot)
+    print(
+        f"[APS][REPAIR_BRIDGE_ANCHOR_CONTEXT] candidate_id={candidate_id}, "
+        f"pair=({pair[0]},{pair[1]}), line={line}, "
+        f"from_order_id={pair[0]}, to_order_id={pair[1]}, "
+        f"lookup_key_mode={ctx.get('lookup_key_mode', '')}, "
+        f"left_meta={ctx.get('left_meta', {})}, right_meta={ctx.get('right_meta', {})}, "
+        f"template_key={ctx.get('template_key', '')}, "
+        f"template_found={bool(ctx.get('template_found', False))}, "
+        f"payload_present={bool(ctx.get('payload_present', False))}"
+    )
+
+
+def _print_order_context_miss(
+    *,
+    candidate_id: str,
+    pair: tuple[str, str],
+    eval_result: PairEvalResult,
+) -> None:
+    ctx = dict(eval_result.context_snapshot)
+    left_ok = bool(dict(ctx.get("left_meta", {}) or {}).get("context_present", False))
+    right_ok = bool(dict(ctx.get("right_meta", {}) or {}).get("context_present", False))
+    if left_ok and right_ok:
+        return
+    missing_side = "both"
+    if left_ok and not right_ok:
+        missing_side = "right"
+    elif right_ok and not left_ok:
+        missing_side = "left"
+    print(
+        f"[APS][REPAIR_BRIDGE_ORDER_CONTEXT_MISS] candidate_id={candidate_id}, "
+        f"pair=({pair[0]},{pair[1]}), missing_side={missing_side}"
+    )
+
+
+def _print_order_context_lookup_sample(order_context_by_id: dict[str, dict], order_ids: list[str], limit: int = 8) -> None:
+    seen: set[str] = set()
+    printed = 0
+    for oid in order_ids:
+        oid = str(oid)
+        if oid in seen:
+            continue
+        seen.add(oid)
+        meta = _order_pair_meta(order_context_by_id, oid)
+        print(
+            f"[APS][ORDER_CONTEXT_LOOKUP] order_id={oid}, found={bool(meta.get('context_present', False))}, "
+            f"width={meta.get('width')}, thickness={meta.get('thickness')}, "
+            f"temp_low={meta.get('temp_low')}, temp_high={meta.get('temp_high')}, "
+            f"steel_group={meta.get('steel_group', '')}"
+        )
+        printed += 1
+        if printed >= int(limit):
+            break
+
+
 def _safe_preview(value, max_len: int = 180):
     text = str(value)
     return text if len(text) <= max_len else text[:max_len] + "..."
@@ -1198,6 +1891,31 @@ def _build_real_bridge_lookup(real_rows: list[dict]) -> dict[tuple[str, str, str
     return lookup
 
 
+def _build_virtual_bridge_lookup(virtual_rows: list[dict]) -> dict[tuple[str, str, str], list[dict]]:
+    lookup: dict[tuple[str, str, str], list[dict]] = {}
+    for row in virtual_rows:
+        if not _is_virtual_bridge_row(row):
+            continue
+        line = str(row.get("line", ""))
+        src, src_field = _extract_bridge_endpoint(row, "from")
+        dst, dst_field = _extract_bridge_endpoint(row, "to")
+        if not line or not src_field or not dst_field:
+            continue
+        lookup.setdefault((line, src, dst), []).append(row)
+    return lookup
+
+
+def _virtual_bridge_tons_from_row(row: dict) -> float:
+    for key in ("virtual_tons", "virtual_ton", "bridge_tons", "bridge_ton", "tons", "ton"):
+        val = _as_float_or_none((row or {}).get(key))
+        if val is not None:
+            return float(val)
+    tons10 = _as_float_or_none((row or {}).get("virtual_tons10"))
+    if tons10 is not None:
+        return float(tons10) / 10.0
+    return 0.0
+
+
 def _block_single_point_boundary_keys(block: list[CampaignSegment]) -> list[tuple[str, str, str]]:
     if not block:
         return []
@@ -1216,6 +1934,9 @@ def _block_boundary_band_keys(
     left_band_k: int,
     right_band_k: int,
     max_pairs_per_split: int,
+    order_context_by_id: dict[str, dict] | None = None,
+    block_id: int | None = None,
+    rule=None,
 ) -> tuple[list[tuple[str, str, str]], list[dict]]:
     if not block:
         return [], []
@@ -1227,9 +1948,21 @@ def _block_boundary_band_keys(
         right_orders = [str(v) for v in right.order_ids]
         left_band = left_orders[-max(1, int(left_band_k)):]
         right_band = right_orders[: max(1, int(right_band_k))]
+        left_generation = list(reversed(left_band))
+        right_generation = list(right_band)
+        if order_context_by_id:
+            left_generation, right_generation = _rank_band_orders_for_thickness(
+                order_context_by_id=order_context_by_id,
+                left_band=left_band,
+                right_band=right_band,
+                line=line,
+                block_id=block_id,
+                split_id=split_id,
+                rule=rule,
+            )
         pairs: list[tuple[str, str, str]] = []
-        for left_distance, left_oid in enumerate(reversed(left_band)):
-            for right_distance, right_oid in enumerate(right_band):
+        for left_distance, left_oid in enumerate(left_generation):
+            for right_distance, right_oid in enumerate(right_generation):
                 if len(pairs) >= int(max_pairs_per_split):
                     break
                 pairs.append((line, str(left_oid), str(right_oid)))
@@ -1242,6 +1975,8 @@ def _block_boundary_band_keys(
                 "split_id": split_id,
                 "left_band": left_band,
                 "right_band": right_band,
+                "left_generation_order": left_generation,
+                "right_generation_order": right_generation,
                 "band_pairs": dedup_pairs,
             }
         )
@@ -1257,6 +1992,8 @@ def _generate_endpoint_adjustments(
     adjustment_limit: int,
     enable_left_trim: bool,
     enable_right_trim: bool,
+    order_context_by_id: dict[str, dict] | None = None,
+    rule=None,
 ) -> list[dict]:
     adjustments: list[dict] = []
     seen: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
@@ -1282,9 +2019,43 @@ def _generate_endpoint_adjustments(
                     "adjusted_right_orders": adjusted_right,
                 }
             )
-            if len(adjustments) >= int(adjustment_limit):
-                return adjustments
-    return adjustments
+    if order_context_by_id:
+        adjustments.sort(
+            key=lambda item: (
+                _quick_pair_rank_metrics(
+                    order_context_by_id,
+                    str(item.get("adjusted_left_orders", [""])[-1]),
+                    str(item.get("adjusted_right_orders", [""])[0]),
+                    rule=rule,
+                ).get("hard_prefilter_fail_penalty", 0.0)
+                + _quick_pair_rank_metrics(
+                    order_context_by_id,
+                    str(item.get("adjusted_left_orders", [""])[-1]),
+                    str(item.get("adjusted_right_orders", [""])[0]),
+                    rule=rule,
+                ).get("thickness_penalty", 999999.0)
+                + _quick_pair_rank_metrics(
+                    order_context_by_id,
+                    str(item.get("adjusted_left_orders", [""])[-1]),
+                    str(item.get("adjusted_right_orders", [""])[0]),
+                    rule=rule,
+                ).get("width_penalty", 999999.0)
+                + _quick_pair_rank_metrics(
+                    order_context_by_id,
+                    str(item.get("adjusted_left_orders", [""])[-1]),
+                    str(item.get("adjusted_right_orders", [""])[0]),
+                    rule=rule,
+                ).get("temp_penalty", 999999.0)
+                + _quick_pair_rank_metrics(
+                    order_context_by_id,
+                    str(item.get("adjusted_left_orders", [""])[-1]),
+                    str(item.get("adjusted_right_orders", [""])[0]),
+                    rule=rule,
+                ).get("group_penalty", 999999.0),
+                int(item.get("left_trim", 0) or 0) + int(item.get("right_trim", 0) or 0),
+            )
+        )
+    return adjustments[: max(1, int(adjustment_limit))]
 
 
 def _build_adjustment_band_pairs(
@@ -1295,27 +2066,43 @@ def _build_adjustment_band_pairs(
     left_band_k: int,
     right_band_k: int,
     max_pairs_per_split: int,
-) -> tuple[list[tuple[str, str, str]], list[str], list[str]]:
+    order_context_by_id: dict[str, dict] | None = None,
+    block_id: int | None = None,
+    split_id: int | None = None,
+    rule=None,
+) -> tuple[list[tuple[str, str, str]], list[str], list[str], list[str], list[str]]:
     left_band = [str(v) for v in adjusted_left_orders[-max(1, int(left_band_k)):]]
     right_band = [str(v) for v in adjusted_right_orders[: max(1, int(right_band_k))]]
+    left_generation = list(reversed(left_band))
+    right_generation = list(right_band)
+    if order_context_by_id:
+        left_generation, right_generation = _rank_band_orders_for_thickness(
+            order_context_by_id=order_context_by_id,
+            left_band=left_band,
+            right_band=right_band,
+            line=str(line),
+            block_id=block_id,
+            split_id=split_id,
+            rule=rule,
+        )
     pairs: list[tuple[str, str, str]] = []
-    for left_oid in reversed(left_band):
-        for right_oid in right_band:
+    for left_oid in left_generation:
+        for right_oid in right_generation:
             if len(pairs) >= int(max_pairs_per_split):
                 break
             pairs.append((str(line), str(left_oid), str(right_oid)))
         if len(pairs) >= int(max_pairs_per_split):
             break
-    return list(dict.fromkeys(pairs)), left_band, right_band
+    return list(dict.fromkeys(pairs)), left_band, right_band, left_generation, right_generation
 
 
 def _boundary_band_distance_map(band_logs: list[dict]) -> dict[tuple[str, str], int]:
     distances: dict[tuple[str, str], int] = {}
     for item in band_logs:
-        left_band = [str(v) for v in item.get("left_band", [])]
-        right_band = [str(v) for v in item.get("right_band", [])]
-        left_distance = {oid: idx for idx, oid in enumerate(reversed(left_band))}
-        right_distance = {oid: idx for idx, oid in enumerate(right_band)}
+        left_order = [str(v) for v in item.get("left_generation_order", [])] or list(reversed([str(v) for v in item.get("left_band", [])]))
+        right_order = [str(v) for v in item.get("right_generation_order", [])] or [str(v) for v in item.get("right_band", [])]
+        left_distance = {oid: idx for idx, oid in enumerate(left_order)}
+        right_distance = {oid: idx for idx, oid in enumerate(right_order)}
         for _, left_oid, right_oid in item.get("band_pairs", []):
             dist = int(left_distance.get(str(left_oid), 999)) + int(right_distance.get(str(right_oid), 999))
             key = (str(left_oid), str(right_oid))
@@ -1326,11 +2113,569 @@ def _boundary_band_distance_map(band_logs: list[dict]) -> dict[tuple[str, str], 
 def _endpoint_adjustment_cost_map(adjustment_logs: list[dict]) -> dict[tuple[str, str], int]:
     costs: dict[tuple[str, str], int] = {}
     for item in adjustment_logs:
-        cost = int(item.get("left_trim", 0) or 0) + int(item.get("right_trim", 0) or 0)
+        cost = int(item.get("final_cost", item.get("left_trim", 0) + item.get("right_trim", 0)) or 0)
         for _, left_oid, right_oid in item.get("band_pairs", []):
             key = (str(left_oid), str(right_oid))
             costs[key] = min(costs.get(key, cost), cost)
     return costs
+
+
+def _classify_endpoint_miss(
+    *,
+    line: str,
+    block_id: int,
+    boundary_keys: list[tuple[str, str, str]],
+    real_bridge_lookup: dict[tuple[str, str, str], list[dict]],
+    order_context_by_id: dict[str, dict],
+    rule,
+) -> dict:
+    keys = list(dict.fromkeys(boundary_keys))
+    exact_hits = [key for key in keys if key in real_bridge_lookup]
+    same_line_graph_keys = [key for key in real_bridge_lookup if str(key[0]) == str(line)]
+    boundary_pairs = {(str(k[1]), str(k[2])) for k in keys}
+    same_left_or_right = [
+        key for key in same_line_graph_keys
+        if (str(key[1]), str(key[2])) not in boundary_pairs
+        and (str(key[1]) in {p[0] for p in boundary_pairs} or str(key[2]) in {p[1] for p in boundary_pairs})
+    ]
+    prefilter_results = []
+    for _, left_oid, right_oid in keys:
+        left_meta = _order_pair_meta(order_context_by_id, str(left_oid))
+        right_meta = _order_pair_meta(order_context_by_id, str(right_oid))
+        prefilter_results.append(_quick_bridge_rule_prefilter(left_meta, right_meta, rule=rule))
+    fail_counts = Counter()
+    for item in prefilter_results:
+        for reason in list(item.get("fail_reasons", []) or []):
+            fail_counts[str(reason)] += 1
+
+    if exact_hits:
+        cls = "HAS_ENDPOINT_EDGE"
+    elif prefilter_results and all(not bool(item.get("pass", False)) for item in prefilter_results):
+        cls = "RULE_PREFILTER_ALL_FAIL"
+    elif same_left_or_right:
+        cls = "BAND_TOO_NARROW"
+    elif not same_line_graph_keys or not exact_hits:
+        cls = "TEMPLATE_GRAPH_NO_EDGE"
+    elif same_line_graph_keys:
+        cls = "LOOKUP_KEY_MISMATCH"
+    else:
+        cls = "UNKNOWN_ENDPOINT_MISS"
+
+    details = {
+        "boundary_key_count": int(len(keys)),
+        "exact_hit_count": int(len(exact_hits)),
+        "same_line_graph_key_count": int(len(same_line_graph_keys)),
+        "near_graph_key_count": int(len(same_left_or_right)),
+        "prefilter_fail_counts": dict(fail_counts),
+        "sample_boundary_keys": keys[:5],
+        "sample_near_graph_keys": same_left_or_right[:5],
+    }
+    print(
+        f"[APS][REPAIR_BRIDGE_ENDPOINT_CLASSIFY] line={line}, block_id={block_id}, "
+        f"class={cls}, details={details}"
+    )
+    return {"class": cls, "details": details}
+
+
+def _segments_pair_integrity_ok(
+    segments: list[CampaignSegment],
+    *,
+    direct_edges: set[tuple[str, str]],
+    real_edges: set[tuple[str, str]],
+    max_real_bridge_per_segment: int,
+    virtual_edges: set[tuple[str, str]] | None = None,
+    max_virtual_bridge_per_segment: int = 0,
+) -> tuple[bool, str]:
+    for seg in segments:
+        real_used = 0
+        virtual_used = 0
+        for left_oid, right_oid in zip(seg.order_ids, seg.order_ids[1:]):
+            pair = (str(left_oid), str(right_oid))
+            if pair in direct_edges:
+                continue
+            if pair in real_edges:
+                real_used += 1
+                if real_used <= int(max_real_bridge_per_segment):
+                    continue
+                return False, "BRIDGE_LIMIT_EXCEEDED"
+            if pair in (virtual_edges or set()):
+                virtual_used += 1
+                if virtual_used <= int(max_virtual_bridge_per_segment):
+                    continue
+                return False, "VIRTUAL_BRIDGE_LIMIT_EXCEEDED"
+            return False, "PAIR_NOT_IN_TEMPLATE"
+    return True, ""
+
+
+def _should_apply_improvement(
+    *,
+    valid_before: int,
+    valid_after: int,
+    underfilled_before: int,
+    underfilled_after: int,
+    scheduled_orders_before: int,
+    scheduled_orders_after: int,
+    integrity_ok: bool,
+    pair_integrity_ok: bool,
+) -> tuple[bool, str]:
+    if int(valid_after) < int(valid_before):
+        return False, "VALID_COUNT_REGRESSION"
+    if not (int(underfilled_after) < int(underfilled_before) or int(scheduled_orders_after) > int(scheduled_orders_before)):
+        return False, "NO_APPLY_GAIN"
+    if not integrity_ok:
+        return False, "ORDER_INTEGRITY_FAIL"
+    if not pair_integrity_ok:
+        return False, "PAIR_INTEGRITY_FAIL"
+    return True, ""
+
+
+def _should_apply_virtual_pilot(
+    *,
+    gain: bool,
+    multiplicity_ok: bool,
+    pair_integrity_ok: bool,
+    virtual_used: int,
+    max_virtual_used: int,
+    virtual_tons: float,
+    max_virtual_tons: float,
+) -> tuple[bool, str]:
+    if not bool(gain):
+        return False, "NO_APPLY_GAIN"
+    if not bool(multiplicity_ok):
+        return False, "ORDER_INTEGRITY_FAIL"
+    if not bool(pair_integrity_ok):
+        return False, "PAIR_INTEGRITY_FAIL"
+    if int(virtual_used) <= 0:
+        return False, "NO_VIRTUAL_BRIDGE_USED"
+    if int(virtual_used) > int(max_virtual_used):
+        return False, "VIRTUAL_BRIDGE_LIMIT_EXCEEDED"
+    if float(virtual_tons) > float(max_virtual_tons) + 1e-6:
+        return False, "VIRTUAL_TON_LIMIT_EXCEEDED"
+    return True, ""
+
+
+def _small_block_pilot_score(block_orders: int, block_tons: float, campaign_ton_min: float) -> tuple[bool, float]:
+    if int(block_orders) <= 1 or float(block_tons) <= 1e-6:
+        return True, 999999.0
+    penalty = 0.0
+    if int(block_orders) <= 2:
+        penalty += 25.0
+    soft_ton_floor = float(campaign_ton_min) * 0.5
+    if float(block_tons) < soft_ton_floor:
+        penalty += max(0.0, soft_ton_floor - float(block_tons))
+    return False, float(penalty)
+
+
+def _record_virtual_pilot_fail_stage(
+    diag: dict,
+    *,
+    line: str,
+    block_id: int,
+    candidate_id: str,
+    fail_stage: str,
+    reason: str,
+    details: dict,
+) -> None:
+    stage_counts = diag.setdefault("virtual_pilot_fail_stage_count", {})
+    stage_counts[str(fail_stage)] = int(stage_counts.get(str(fail_stage), 0) or 0) + 1
+    reject_by_reason = diag.setdefault("virtual_pilot_reject_by_reason_count", {})
+    reject_by_reason[str(reason)] = int(reject_by_reason.get(str(reason), 0) or 0) + 1
+    print(
+        f"[APS][VIRTUAL_BRIDGE_PILOT_FAIL_STAGE] line={line}, block_id={block_id}, "
+        f"candidate_id={candidate_id}, fail_stage={fail_stage}, reason={reason}, details={details}"
+    )
+
+
+def _classify_virtual_pilot_recut_fail(pilot_diag: dict, virtual_used: int, virtual_tons: float) -> tuple[str, str, dict]:
+    details = {
+        "candidate_cutpoints_total": int(pilot_diag.get("candidate_cutpoints_total", 0) or 0),
+        "candidate_cutpoints_ton_window_valid": int(pilot_diag.get("candidate_cutpoints_ton_window_valid", 0) or 0),
+        "candidate_cutpoints_pair_valid": int(pilot_diag.get("candidate_cutpoints_pair_valid", 0) or 0),
+        "filtered_pair_invalid": int(pilot_diag.get("repair_only_real_bridge_filtered_pair_invalid", 0) or 0),
+        "filtered_ton_invalid": int(pilot_diag.get("repair_only_real_bridge_filtered_ton_invalid", 0) or 0),
+        "virtual_used": int(virtual_used),
+        "virtual_tons": float(virtual_tons),
+    }
+    if int(details["candidate_cutpoints_total"]) <= 0:
+        return "VIRTUAL_SPEC_BUILD_FAIL", "VIRTUAL_SPEC_BUILD_FAIL", details
+    if int(details["candidate_cutpoints_ton_window_valid"]) <= 0:
+        return "VIRTUAL_TON_BELOW_MIN", "VIRTUAL_TON_BELOW_MIN", details
+    if int(details["candidate_cutpoints_pair_valid"]) <= 0:
+        return "VIRTUAL_BOTH_TRANSITIONS_INVALID", "VIRTUAL_BOTH_TRANSITIONS_INVALID", details
+    if int(virtual_used) <= 0:
+        return "VIRTUAL_BOTH_TRANSITIONS_INVALID", "NO_VIRTUAL_BRIDGE_USED", details
+    return "VIRTUAL_LOCAL_RECUT_FAIL", "VIRTUAL_LOCAL_RECUT_FAIL", details
+
+
+def _virtual_pilot_failure_family(candidate: dict) -> str:
+    fail_reasons = {str(v) for v in list((candidate or {}).get("fail_reasons", []) or []) if str(v)}
+    if {"WIDTH_RULE_FAIL", "GROUP_SWITCH_FAIL"}.issubset(fail_reasons):
+        return "WIDTH_GROUP"
+    if "THICKNESS_RULE_FAIL" in fail_reasons and fail_reasons.issubset({"THICKNESS_RULE_FAIL"}):
+        return "THICKNESS"
+    return "OTHER"
+
+
+def _virtual_pilot_key(line: str, candidate: dict) -> tuple[str, str, str]:
+    return (
+        str(line),
+        str((candidate or {}).get("from_order_id", "") or ""),
+        str((candidate or {}).get("to_order_id", "") or ""),
+    )
+
+
+def _virtual_pilot_family_prefilter(family: str, selected_spec: dict | None) -> tuple[bool, str]:
+    if selected_spec is None:
+        return False, "NO_BOTH_VALID_SPEC"
+    left_fails = {str(v) for v in list(selected_spec.get("left_fail_reasons", []) or [])}
+    right_fails = {str(v) for v in list(selected_spec.get("right_fail_reasons", []) or [])}
+    all_fails = left_fails | right_fails
+    if str(family) == "WIDTH_GROUP":
+        if "WIDTH_RULE_FAIL" in all_fails or "GROUP_SWITCH_FAIL" in all_fails:
+            return False, "WIDTH_GROUP_TARGET_NOT_FIXED"
+    elif str(family) == "THICKNESS":
+        if "THICKNESS_RULE_FAIL" in all_fails:
+            return False, "THICKNESS_TARGET_NOT_FIXED"
+    if not (bool(selected_spec.get("left_ok", False)) and bool(selected_spec.get("right_ok", False))):
+        return False, "TRANSITION_NOT_BOTH_VALID"
+    return True, "OK"
+
+
+def _enumerate_virtual_pilot_specs(
+    left_meta: dict,
+    right_meta: dict,
+    rule,
+    max_specs: int = 5,
+    family: str = "OTHER",
+) -> tuple[list[dict], dict, dict | None]:
+    left = dict(left_meta or {})
+    right = dict(right_meta or {})
+    lw = _as_float_or_none(left.get("width"))
+    rw = _as_float_or_none(right.get("width"))
+    lt = _as_float_or_none(left.get("thickness"))
+    rt = _as_float_or_none(right.get("thickness"))
+    llow = _as_float_or_none(left.get("temp_low", left.get("temp_min")))
+    lhigh = _as_float_or_none(left.get("temp_high", left.get("temp_max")))
+    rlow = _as_float_or_none(right.get("temp_low", right.get("temp_min")))
+    rhigh = _as_float_or_none(right.get("temp_high", right.get("temp_max")))
+    lg = _txt(left.get("steel_group", ""))
+    rg = _txt(right.get("steel_group", ""))
+    family = str(family or "OTHER")
+    widths = []
+    thicknesses = []
+    if family == "WIDTH_GROUP":
+        if lw is not None and rw is not None:
+            widths.extend([min(float(lw), float(rw)), (float(lw) + float(rw)) / 2.0, float(rw), float(lw)])
+        elif lw is not None:
+            widths.append(float(lw))
+        elif rw is not None:
+            widths.append(float(rw))
+        if lt is not None and rt is not None:
+            thicknesses.extend([(float(lt) + float(rt)) / 2.0, float(lt), float(rt)])
+        elif lt is not None:
+            thicknesses.append(float(lt))
+        elif rt is not None:
+            thicknesses.append(float(rt))
+    elif family == "THICKNESS":
+        if lw is not None:
+            widths.append(float(lw))
+        if rw is not None:
+            widths.append(float(rw))
+        if lw is not None and rw is not None:
+            widths.append((float(lw) + float(rw)) / 2.0)
+        if lt is not None and rt is not None:
+            thicknesses.extend([
+                (float(lt) * 2.0 + float(rt)) / 3.0,
+                (float(lt) + float(rt)) / 2.0,
+                (float(lt) + float(rt) * 2.0) / 3.0,
+                float(lt),
+                float(rt),
+            ])
+        elif lt is not None:
+            thicknesses.append(float(lt))
+        elif rt is not None:
+            thicknesses.append(float(rt))
+    else:
+        if lw is not None:
+            widths.append(float(lw))
+        if rw is not None:
+            widths.append(float(rw))
+        if lw is not None and rw is not None:
+            widths.append((float(lw) + float(rw)) / 2.0)
+        if lt is not None:
+            thicknesses.append(float(lt))
+        if rt is not None:
+            thicknesses.append(float(rt))
+        if lt is not None and rt is not None:
+            thicknesses.extend([(float(lt) * 2.0 + float(rt)) / 3.0, (float(lt) + float(rt)) / 2.0, (float(lt) + float(rt) * 2.0) / 3.0])
+    temp_windows: list[tuple[float | None, float | None]] = []
+    if None not in (llow, lhigh, rlow, rhigh):
+        overlap_low = max(float(llow), float(rlow))
+        overlap_high = min(float(lhigh), float(rhigh))
+        if overlap_high >= overlap_low:
+            temp_windows.append((overlap_low, overlap_high))
+            mid = (overlap_low + overlap_high) / 2.0
+            temp_windows.append((max(overlap_low, mid - 5.0), min(overlap_high, mid + 5.0)))
+        temp_windows.append(((float(llow) + float(rlow)) / 2.0, (float(lhigh) + float(rhigh)) / 2.0))
+    else:
+        temp_windows.append((llow if llow is not None else rlow, lhigh if lhigh is not None else rhigh))
+    if family == "WIDTH_GROUP":
+        groups = [g for g in dict.fromkeys([lg if _is_pc(lg) else "", rg if _is_pc(rg) else "", lg, rg]) if g]
+    elif family == "THICKNESS":
+        groups = [g for g in dict.fromkeys([lg if lg == rg else "", lg, rg]) if g]
+    else:
+        groups = [g for g in dict.fromkeys([lg, rg]) if g]
+    if not groups:
+        groups = [""]
+    specs: list[dict] = []
+    for width in dict.fromkeys([round(v, 6) for v in widths if v is not None]):
+        for thickness in dict.fromkeys([round(v, 6) for v in thicknesses if v is not None]):
+            for temp_low, temp_high in temp_windows:
+                for group in groups:
+                    spec = {
+                        "width": float(width),
+                        "thickness": float(thickness),
+                        "temp_low": temp_low,
+                        "temp_high": temp_high,
+                        "temp_min": temp_low,
+                        "temp_max": temp_high,
+                        "steel_group": group,
+                        "context_present": True,
+                    }
+                    left_eval = _quick_bridge_rule_prefilter(left, spec, rule=rule)
+                    right_eval = _quick_bridge_rule_prefilter(spec, right, rule=rule)
+                    spec["left_ok"] = bool(left_eval.get("pass", False))
+                    spec["right_ok"] = bool(right_eval.get("pass", False))
+                    spec["left_fail_reasons"] = list(left_eval.get("fail_reasons", []) or [])
+                    spec["right_fail_reasons"] = list(right_eval.get("fail_reasons", []) or [])
+                    specs.append(spec)
+                    if len(specs) >= int(max_specs):
+                        break
+                if len(specs) >= int(max_specs):
+                    break
+            if len(specs) >= int(max_specs):
+                break
+        if len(specs) >= int(max_specs):
+            break
+    left_valid = sum(1 for spec in specs if bool(spec.get("left_ok", False)))
+    right_valid = sum(1 for spec in specs if bool(spec.get("right_ok", False)))
+    both_valid = [spec for spec in specs if bool(spec.get("left_ok", False)) and bool(spec.get("right_ok", False))]
+    diag = {
+        "specs_tested": int(len(specs)),
+        "left_valid_count": int(left_valid),
+        "right_valid_count": int(right_valid),
+        "both_valid_count": int(len(both_valid)),
+    }
+    selected = both_valid[0] if both_valid else None
+    return specs, diag, selected
+
+
+def _classify_virtual_transition_spec_failure(specs: list[dict], enum_diag: dict) -> tuple[str, str, dict]:
+    left_count = int(enum_diag.get("left_valid_count", 0) or 0)
+    right_count = int(enum_diag.get("right_valid_count", 0) or 0)
+    details = {
+        "specs_tested": int(enum_diag.get("specs_tested", 0) or 0),
+        "left_valid_count": left_count,
+        "right_valid_count": right_count,
+        "both_valid_count": int(enum_diag.get("both_valid_count", 0) or 0),
+        "sample_specs": specs[:3],
+    }
+    if left_count <= 0 and right_count <= 0:
+        return "VIRTUAL_BOTH_TRANSITIONS_INVALID", "VIRTUAL_BOTH_TRANSITIONS_INVALID", details
+    if left_count <= 0:
+        return "VIRTUAL_LEFT_TRANSITION_INVALID", "VIRTUAL_LEFT_TRANSITION_INVALID", details
+    if right_count <= 0:
+        return "VIRTUAL_RIGHT_TRANSITION_INVALID", "VIRTUAL_RIGHT_TRANSITION_INVALID", details
+    return "VIRTUAL_BOTH_TRANSITIONS_INVALID", "VIRTUAL_BOTH_TRANSITIONS_INVALID", details
+
+
+def _suggest_next_phase_from_census(census: dict) -> dict:
+    total = max(1, int(census.get("total_blocks", 0) or 0))
+    hard_no_edge = int(census.get("template_graph_no_edge_count", 0) or 0) + int(census.get("rule_prefilter_all_fail_count", 0) or 0)
+    has_endpoint = int(census.get("has_endpoint_edge_count", 0) or 0)
+    band_narrow = int(census.get("band_too_narrow_count", 0) or 0)
+    ton_success = int(census.get("ton_rescue_success_count", 0) or 0)
+    applied = int(census.get("improvement_applied_count", 0) or 0)
+    nonempty = int(census.get("candidate_pool_nonempty_count", 0) or 0)
+    reasons: list[str] = []
+    if hard_no_edge / total >= 0.50:
+        reasons.append("real_bridge_no_edge_or_prefilter_fail_dominates")
+    if ton_success <= 0:
+        reasons.append("ton_rescue_success_zero")
+    if applied <= 0:
+        reasons.append("improvement_applied_zero")
+    if has_endpoint + band_narrow > 0:
+        reasons.append("controlled_virtual_pilot_has_candidate_surface")
+    if hard_no_edge / total >= 0.50 and ton_success <= 0 and applied <= 0:
+        suggestion = "PREPARE_CONTROLLED_VIRTUAL_BRIDGE"
+    elif (has_endpoint + band_narrow + nonempty) > 0 and applied <= 0:
+        suggestion = "REAL_BRIDGE_ONLY_NEAR_LIMIT"
+    else:
+        suggestion = "CONTINUE_REAL_BRIDGE_ONLY"
+        if not reasons:
+            reasons.append("real_bridge_only_still_has_observed_gain")
+    return {"suggestion": suggestion, "reasons": reasons}
+
+
+def _dominant_bridge_fail_reason(bridge_candidate_audit: dict, reason_buckets: dict | None = None) -> str:
+    rule_counts = {
+        "THICKNESS_RULE_FAIL": int((bridge_candidate_audit or {}).get("pair_invalid_thickness", 0) or 0),
+        "WIDTH_RULE_FAIL": int((bridge_candidate_audit or {}).get("pair_invalid_width", 0) or 0),
+        "TEMP_OVERLAP_FAIL": int((bridge_candidate_audit or {}).get("pair_invalid_temp", 0) or 0),
+        "GROUP_SWITCH_FAIL": int((bridge_candidate_audit or {}).get("pair_invalid_group", 0) or 0),
+    }
+    active = {key: val for key, val in rule_counts.items() if val > 0}
+    if len(active) > 1:
+        return "MULTI_RULE_FAIL"
+    if len(active) == 1:
+        return next(iter(active.keys()))
+    if reason_buckets:
+        nonzero = {str(k): int(v) for k, v in reason_buckets.items() if int(v) > 0}
+        if nonzero:
+            return max(nonzero.items(), key=lambda kv: kv[1])[0]
+    return str((bridge_candidate_audit or {}).get("dominant_fail_reason", "") or "UNKNOWN")
+
+
+def _candidate_is_pilotable_rule_fail(candidate: dict, allowed_fail_reasons: set[str] | None = None) -> bool:
+    fail_reasons = [str(v) for v in list((candidate or {}).get("fail_reasons", []) or [])]
+    dominant = str((candidate or {}).get("dominant_fail_reason", "") or "")
+    allowed = set(allowed_fail_reasons or {"THICKNESS_RULE_FAIL", "WIDTH_RULE_FAIL", "GROUP_SWITCH_FAIL", "TEMP_OVERLAP_FAIL", "MULTI_RULE_FAIL"})
+    base_allowed = {"THICKNESS_RULE_FAIL", "WIDTH_RULE_FAIL", "GROUP_SWITCH_FAIL", "TEMP_OVERLAP_FAIL"}
+    if dominant in allowed:
+        if dominant == "MULTI_RULE_FAIL":
+            return 0 < len(fail_reasons) <= 2
+        return True
+    if "MULTI_RULE_FAIL" in allowed and dominant == "MULTI_RULE_FAIL" and 0 < len(fail_reasons) <= 2:
+        return True
+    explicit = [reason for reason in fail_reasons if reason in (allowed & base_allowed)]
+    return bool(explicit) and len(fail_reasons) <= 2
+
+
+def _select_virtual_pilot_targets(
+    candidates: list[dict],
+    *,
+    endpoint_class: str,
+    max_targets: int,
+    allowed_fail_reasons: set[str] | None = None,
+    campaign_ton_min: float = 0.0,
+) -> list[dict]:
+    pilotable = [
+        dict(candidate)
+        for candidate in candidates
+        if bool(candidate.get("frontier_consistent", False)) and _candidate_is_pilotable_rule_fail(candidate, allowed_fail_reasons)
+    ]
+    pilotable.sort(
+        key=lambda item: (
+            len(list(item.get("fail_reasons", []) or [])),
+            0 if str(endpoint_class) == "HAS_ENDPOINT_EDGE" else 1,
+            _small_block_pilot_score(
+                int(item.get("block_orders", 0) or 0),
+                float(item.get("block_tons", 0.0) or 0.0),
+                float(campaign_ton_min),
+            )[1],
+            float(item.get("rank_score", 999999999.0) or 999999999.0),
+            -float(item.get("block_tons", 0.0) or 0.0),
+            -int(item.get("block_orders", 0) or 0),
+        )
+    )
+    return pilotable[: max(0, int(max_targets))]
+
+
+def _evaluate_virtual_pilot_eligibility(
+    *,
+    endpoint_class: str,
+    candidate_count: int,
+    frontier_candidate_count: int,
+    pilot_candidates: list[dict],
+    block_orders_count: int,
+    block_tons: float,
+    campaign_ton_min: float,
+    attempts_so_far: int,
+    max_attempts: int,
+    allowed_endpoint_classes: set[str],
+    already_tried: bool,
+    applied_improvement_count: int,
+    enabled: bool,
+) -> VirtualPilotEligibilityResult:
+    details = {
+        "runtime_enabled": bool(enabled),
+        "pilotable_candidate_count": int(len(pilot_candidates)),
+        "block_orders": int(block_orders_count),
+        "block_tons": float(block_tons),
+        "attempts_so_far": int(attempts_so_far),
+        "max_attempts": int(max_attempts),
+        "applied_improvement_count": int(applied_improvement_count),
+    }
+    structural_eligible = True
+    structural_reason = "ELIGIBLE"
+    if endpoint_class == "RULE_PREFILTER_ALL_FAIL":
+        structural_eligible = False
+        structural_reason = "RULE_PREFILTER_ALL_FAIL"
+    elif endpoint_class == "TEMPLATE_GRAPH_NO_EDGE":
+        structural_eligible = False
+        structural_reason = "TEMPLATE_GRAPH_NO_EDGE"
+    elif endpoint_class not in set(allowed_endpoint_classes or {"HAS_ENDPOINT_EDGE", "BAND_TOO_NARROW"}):
+        structural_eligible = False
+        structural_reason = "NO_ENDPOINT_EDGE"
+    elif candidate_count <= 0:
+        structural_eligible = False
+        structural_reason = "NO_ENDPOINT_EDGE"
+    elif frontier_candidate_count <= 0:
+        structural_eligible = False
+        structural_reason = "NO_FRONTIER_CANDIDATE"
+    hard_small_reject, small_block_penalty = _small_block_pilot_score(block_orders_count, block_tons, campaign_ton_min)
+    details["small_block_penalty"] = float(small_block_penalty)
+    details["small_block_hard_reject"] = bool(hard_small_reject)
+    if hard_small_reject:
+        structural_eligible = False
+        structural_reason = "BLOCK_TOO_SMALL"
+    elif not pilot_candidates:
+        structural_eligible = False
+        structural_reason = "NO_PILOTABLE_CANDIDATE"
+    runtime_enabled = bool(enabled)
+    if not structural_eligible:
+        return VirtualPilotEligibilityResult(False, runtime_enabled, False, endpoint_class, candidate_count, frontier_candidate_count, len(pilot_candidates), structural_reason, details)
+    if not runtime_enabled:
+        return VirtualPilotEligibilityResult(True, False, False, endpoint_class, candidate_count, frontier_candidate_count, len(pilot_candidates), "PILOT_DISABLED", details)
+    if already_tried:
+        return VirtualPilotEligibilityResult(True, True, False, endpoint_class, candidate_count, frontier_candidate_count, len(pilot_candidates), "BLOCK_ALREADY_TRIED", details)
+    if attempts_so_far >= max_attempts:
+        return VirtualPilotEligibilityResult(True, True, False, endpoint_class, candidate_count, frontier_candidate_count, len(pilot_candidates), "RUN_LIMIT_REACHED", details)
+    if applied_improvement_count > 0:
+        return VirtualPilotEligibilityResult(True, True, False, endpoint_class, candidate_count, frontier_candidate_count, len(pilot_candidates), "RUN_ALREADY_HAS_APPLIED_IMPROVEMENT", details)
+    return VirtualPilotEligibilityResult(True, True, True, endpoint_class, candidate_count, frontier_candidate_count, len(pilot_candidates), "ELIGIBLE", details)
+
+
+def _record_bridgeability_census_item(census: BridgeabilityCensus, item: dict) -> None:
+    census.add_item(item)
+    print(
+        f"[APS][BRIDGEABILITY_CENSUS_ITEM] line={item.get('line')}, "
+        f"block_id={item.get('block_id')}, block_size={item.get('block_size')}, "
+        f"orders={item.get('orders')}, tons={float(item.get('tons', 0.0) or 0.0):.1f}, "
+        f"endpoint_class={item.get('endpoint_class')}, "
+        f"dominant_fail_reason={item.get('dominant_fail_reason')}, "
+        f"candidate_count={item.get('candidate_count')}, "
+        f"frontier_candidate_count={item.get('frontier_candidate_count')}, "
+        f"final_decision={item.get('final_decision')}"
+    )
+
+
+def _update_bridgeability_census_final_decision(
+    census: BridgeabilityCensus,
+    *,
+    line: str,
+    block_id: int,
+    final_decision: str,
+) -> None:
+    for item in reversed(census.items):
+        if str(item.get("line", "")) == str(line) and int(item.get("block_id", -1) or -1) == int(block_id):
+            previous = str(item.get("final_decision", "") or "")
+            item["final_decision"] = str(final_decision)
+            if previous != "IMPROVEMENT_RECORDED_BUT_NOT_APPLIED" and final_decision == "IMPROVEMENT_RECORDED_BUT_NOT_APPLIED":
+                census.improvement_recorded_count += 1
+            if previous != "IMPROVEMENT_APPLIED" and final_decision == "IMPROVEMENT_APPLIED":
+                census.improvement_applied_count += 1
+            return
 
 
 def _repair_bridge_candidate_audit(
@@ -1343,9 +2688,14 @@ def _repair_bridge_candidate_audit(
     frontier_contexts: dict[tuple[str, str, str], list[dict]],
     direct_edges: set[tuple[str, str]],
     real_edges: set[tuple[str, str]],
+    pair_rows_by_key: dict[tuple[str, str], list[dict]],
+    order_specs_by_id: dict[str, dict],
+    rule,
     order_tons: dict[str, float],
     campaign_ton_min: float,
     campaign_ton_max: float,
+    real_edge_adjustment_cost: dict[tuple[str, str], int] | None = None,
+    endpoint_class: str = "",
 ) -> dict:
     combined: list[str] = []
     for seg in block:
@@ -1367,7 +2717,13 @@ def _repair_bridge_candidate_audit(
         "pair_invalid_thickness": 0,
         "pair_invalid_temp": 0,
         "pair_invalid_group": 0,
+        "pair_invalid_context": 0,
         "pair_invalid_unknown": 0,
+        "prefilter_fail_thickness": 0,
+        "rank_pass_thickness": 0,
+        "rank_fail_thickness": 0,
+        "prefilter_reject_count": 0,
+        "pilot_candidates": [],
         "ton_rescue_candidates": [],
         "filtered_ton_below_min_current_block": 0,
         "filtered_ton_below_min_even_after_neighbor_expansion": 0,
@@ -1390,6 +2746,55 @@ def _repair_bridge_candidate_audit(
             candidate_no += 1
             candidate_id = f"BRIDGE_CAND_{line}_{block_id}_{candidate_no}"
             bridge_count = int(row.get("bridge_count", row.get("virtual_count", 1)) or 1)
+            rank_metrics = _quick_pair_rank_metrics(order_specs_by_id, str(src), str(dst), rule=rule)
+            prefilter_pass = bool(rank_metrics.get("pass", False))
+            thickness_prefilter_pass = bool(rank_metrics.get("thickness_prefilter_pass", False))
+            thickness_distance = float(rank_metrics.get("thickness_distance_mm", 999999.0) or 999999.0)
+            adjustment_cost = int((real_edge_adjustment_cost or {}).get((str(src), str(dst)), 0) or 0)
+            candidate_rank_score = (
+                int(round(float(rank_metrics.get("hard_prefilter_fail_penalty", 0.0))))
+                + int(round(float(rank_metrics.get("thickness_penalty", 0.0))))
+                + int(round(float(rank_metrics.get("width_penalty", 0.0))))
+                + int(round(float(rank_metrics.get("temp_penalty", 0.0))))
+                + int(round(float(rank_metrics.get("group_penalty", 0.0))))
+                + int(adjustment_cost)
+            )
+            print(
+                f"[APS][REPAIR_BRIDGE_MULTI_PREFILTER] candidate_id={candidate_id}, "
+                f"pair=({src},{dst}), pass={bool(prefilter_pass)}, "
+                f"thickness_pass={bool(rank_metrics.get('thickness_pass', False))}, "
+                f"width_pass={bool(rank_metrics.get('width_pass', False))}, "
+                f"temp_pass={bool(rank_metrics.get('temp_pass', False))}, "
+                f"group_pass={bool(rank_metrics.get('group_pass', False))}, "
+                f"dominant_fail_reason={rank_metrics.get('dominant_fail_reason', '')}, "
+                f"fail_reasons={list(rank_metrics.get('fail_reasons', []) or [])}"
+            )
+            if thickness_prefilter_pass:
+                out["rank_pass_thickness"] += 1
+            else:
+                out["rank_fail_thickness"] += 1
+                out["prefilter_fail_thickness"] += 1
+                print(
+                    f"[APS][REPAIR_BRIDGE_THICKNESS_PREFILTER_FAIL] candidate_id={candidate_id}, "
+                    f"pair=({src},{dst}), "
+                    f"left_thickness={rank_metrics.get('left_thickness')}, "
+                    f"right_thickness={rank_metrics.get('right_thickness')}, "
+                    f"reason=THICKNESS_RULE_FAIL, "
+                    f"delta_ratio={rank_metrics.get('thickness_delta_ratio')}, "
+                    f"delta_mm={rank_metrics.get('thickness_distance_mm')}"
+                )
+            print(
+                f"[APS][REPAIR_BRIDGE_CANDIDATE_RANK] candidate_id={candidate_id}, "
+                f"pair=({src},{dst}), prefilter_pass={bool(prefilter_pass)}, "
+                f"fail_reasons={list(rank_metrics.get('fail_reasons', []) or [])}, "
+                f"hard_prefilter_fail_penalty={float(rank_metrics.get('hard_prefilter_fail_penalty', 0.0)):.3f}, "
+                f"thickness_penalty={float(rank_metrics.get('thickness_penalty', 0.0)):.3f}, "
+                f"width_penalty={float(rank_metrics.get('width_penalty', 0.0)):.3f}, "
+                f"temp_penalty={float(rank_metrics.get('temp_penalty', 0.0)):.3f}, "
+                f"group_penalty={float(rank_metrics.get('group_penalty', 0.0)):.3f}, "
+                f"adjustment_cost={adjustment_cost}, "
+                f"rank_score={candidate_rank_score}"
+            )
             out["matched"] += 1
             print(
                 f"[APS][REPAIR_BRIDGE_CANDIDATE] candidate_id={candidate_id}, line={line}, "
@@ -1397,6 +2802,26 @@ def _repair_bridge_candidate_audit(
                 f"edge_type=REAL_BRIDGE_EDGE, bridge_count={bridge_count}"
             )
             print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=MATCHED")
+            pilot_candidate_base = {
+                "candidate_id": candidate_id,
+                "key": key,
+                "pair": (str(src), str(dst)),
+                "from_order_id": str(src),
+                "to_order_id": str(dst),
+                "frontier_consistent": False,
+                "prefilter_pass": bool(prefilter_pass),
+                "dominant_fail_reason": str(rank_metrics.get("dominant_fail_reason", "") or ""),
+                "fail_reasons": list(rank_metrics.get("fail_reasons", []) or []),
+                "fail_reason_count": len(list(rank_metrics.get("fail_reasons", []) or [])),
+                "rank_score": float(candidate_rank_score),
+                "adjustment_cost": int(adjustment_cost),
+                "thickness_gap": rank_metrics.get("thickness_gap"),
+                "width_delta": rank_metrics.get("width_delta"),
+                "temp_overlap": rank_metrics.get("temp_overlap"),
+                "group_pass": bool(rank_metrics.get("group_pass", False)),
+                "block_orders": int(len(combined)),
+                "block_tons": float(prefix[-1] if prefix else 0.0),
+            }
 
             contexts = frontier_contexts.get(key, [])
             if not contexts:
@@ -1440,6 +2865,35 @@ def _repair_bridge_candidate_audit(
                 print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=REJECTED, reason=TEMPLATE_PAIR_INVALID")
                 continue
             print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=FRONTIER_CHECKED")
+            pilot_candidate = dict(pilot_candidate_base)
+            pilot_candidate["frontier_consistent"] = True
+            pilot_candidate["adjustment_id"] = int(ctx.get("adjustment_id", 0) or 0)
+            out["pilot_candidates"].append(pilot_candidate)
+
+            adjustment_id = int(ctx.get("adjustment_id", 0) or 0)
+            allow_prefilter_bypass = (
+                str(endpoint_class) == "BAND_TOO_NARROW"
+                and 0 < int(adjustment_id) <= 2
+            )
+            if not prefilter_pass and not allow_prefilter_bypass:
+                out["prefilter_reject_count"] += 1
+                out["rejected_pair_invalid"] += 1
+                out["exact_invalid_pair_count"] += 1
+                dominant = str(rank_metrics.get("dominant_fail_reason", "") or "PREFILTER_REJECTED")
+                out["reject_buckets"]["PREFILTER_REJECTED"] += 1
+                out["reject_buckets"][dominant] += 1
+                print(
+                    f"[APS][REPAIR_BRIDGE_PREFILTER_REJECT] candidate_id={candidate_id}, "
+                    f"pair=({src},{dst}), fail_reasons={list(rank_metrics.get('fail_reasons', []) or [])}, "
+                    f"dominant_fail_reason={dominant}"
+                )
+                print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=REJECTED, reason=PREFILTER_REJECTED")
+                continue
+            if not prefilter_pass and allow_prefilter_bypass:
+                print(
+                    f"[APS][REPAIR_BRIDGE_PREFILTER_BYPASS] candidate_id={candidate_id}, "
+                    f"reason=BAND_TOO_NARROW_TOPK_EXCEPTION"
+                )
 
             left_materialized = adjusted_left_orders[: adjusted_left_orders.index(str(src)) + 1]
             right_materialized = adjusted_right_orders[adjusted_right_orders.index(str(dst)) :]
@@ -1481,23 +2935,49 @@ def _repair_bridge_candidate_audit(
                 )
                 print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=REJECTED, reason=TEMPLATE_PAIR_INVALID")
                 continue
-            template_ok = pair in direct_edges or pair in real_edges
             adjacency_ok = tentative_frontier_pair == pair
-            if not template_ok:
-                reason = "TEMPLATE_KEY_MISSING"
-            elif not adjacency_ok:
-                reason = "UNKNOWN_PAIR_INVALID"
-            else:
-                reason = ""
+            pair_eval = _evaluate_pair_violation(
+                left_order=str(src),
+                right_order=str(dst),
+                line=str(line),
+                template_lookup=pair_rows_by_key,
+                direct_edges=direct_edges,
+                real_edges=real_edges,
+                adjacency_ok=bool(adjacency_ok),
+                order_context_by_id=order_specs_by_id,
+                rule=rule,
+            )
             print(
                 f"[APS][REPAIR_BRIDGE_PAIR_CHECK] candidate_id={candidate_id}, pair=({src},{dst}), "
-                f"template_ok={bool(template_ok)}, adjacency_ok={bool(adjacency_ok)}, "
-                f"reason={reason or 'OK'}"
+                f"template_ok={bool(pair_eval.template_ok)}, adjacency_ok={bool(pair_eval.adjacency_ok)}, "
+                f"context_ok={bool(pair_eval.context_ok)}, reason={pair_eval.reason}"
             )
+            _print_pair_audit(
+                "REPAIR_BRIDGE_PAIR_AUDIT_PRE",
+                candidate_id=candidate_id,
+                pair=pair,
+                line=str(line),
+                eval_result=pair_eval,
+            )
+            if not pair_eval.context_ok:
+                _print_order_context_miss(candidate_id=candidate_id, pair=pair, eval_result=pair_eval)
+            reason = "" if pair_eval.reason == "OK" else str(pair_eval.reason)
             if reason:
                 out["rejected_pair_invalid"] += 1
                 out["exact_invalid_pair_count"] += 1
-                out["pair_invalid_unknown"] += 1
+                if reason == "WIDTH_RULE_FAIL":
+                    out["pair_invalid_width"] += 1
+                elif reason == "THICKNESS_RULE_FAIL":
+                    out["pair_invalid_thickness"] += 1
+                elif reason == "TEMP_OVERLAP_FAIL":
+                    out["pair_invalid_temp"] += 1
+                elif reason == "GROUP_SWITCH_FAIL":
+                    out["pair_invalid_group"] += 1
+                elif reason == "ORDER_CONTEXT_MISSING":
+                    out["pair_invalid_context"] += 1
+                else:
+                    out["pair_invalid_unknown"] += 1
+                out["reject_buckets"][reason] += 1
                 out["reject_buckets"]["TEMPLATE_PAIR_INVALID"] += 1
                 print(
                     f"[APS][REPAIR_BRIDGE_PAIR_INVALID] candidate_id={candidate_id}, "
@@ -1521,6 +3001,7 @@ def _repair_bridge_candidate_audit(
                             "bridge_from": str(src),
                             "bridge_to": str(dst),
                             "context": dict(ctx),
+                            "pre_pair_audit": pair_eval.to_dict(),
                             "materialized_tons": float(materialized_tons),
                             "tentative_sequence": list(tentative_sequence),
                         }
@@ -1557,6 +3038,25 @@ def _build_reconstruction_edge_maps(transition_pack) -> tuple[set[tuple[str, str
     return direct, real
 
 
+def _build_virtual_reconstruction_edges(transition_pack) -> tuple[set[tuple[str, str]], dict[tuple[str, str], float]]:
+    tpl_df = _transition_templates_df(transition_pack)
+    if tpl_df.empty:
+        return set(), {}
+    virtual: set[tuple[str, str]] = set()
+    virtual_tons_by_edge: dict[tuple[str, str], float] = {}
+    for row in tpl_df.to_dict("records"):
+        if not _is_virtual_bridge_row(row):
+            continue
+        src, src_field = _extract_bridge_endpoint(row, "from")
+        dst, dst_field = _extract_bridge_endpoint(row, "to")
+        if not src_field or not dst_field:
+            continue
+        key = (str(src), str(dst))
+        virtual.add(key)
+        virtual_tons_by_edge[key] = max(float(virtual_tons_by_edge.get(key, 0.0) or 0.0), float(_virtual_bridge_tons_from_row(row)))
+    return virtual, virtual_tons_by_edge
+
+
 def _bridge_filter_diag_template() -> dict:
     return {
         "repair_only_real_bridge_candidates_total": 0,
@@ -1581,11 +3081,11 @@ def _segment_edge_valid_for_reconstruction(
     allow_real_bridge: bool,
     allow_virtual_bridge: bool,
     max_real_bridge_per_segment: int,
-) -> tuple[bool, int]:
-    # Virtual bridge is explicitly blocked in this repair-only reconstruction.
-    if allow_virtual_bridge:
-        return False, 0
+    virtual_edges: set[tuple[str, str]] | None = None,
+    max_virtual_bridge_per_segment: int = 0,
+) -> tuple[bool, int, int]:
     real_used = 0
+    virtual_used = 0
     for i in range(len(oids) - 1):
         key = (str(oids[i]), str(oids[i + 1]))
         if key in direct_edges:
@@ -1593,8 +3093,11 @@ def _segment_edge_valid_for_reconstruction(
         if allow_real_bridge and key in real_edges and real_used < int(max_real_bridge_per_segment):
             real_used += 1
             continue
-        return False, real_used
-    return True, real_used
+        if allow_virtual_bridge and key in (virtual_edges or set()) and virtual_used < int(max_virtual_bridge_per_segment):
+            virtual_used += 1
+            continue
+        return False, real_used, virtual_used
+    return True, real_used, virtual_used
 
 
 def _segment_edge_stats_for_reconstruction(
@@ -1606,11 +3109,19 @@ def _segment_edge_stats_for_reconstruction(
     max_real_bridge_per_segment: int,
     real_edge_distance: dict[tuple[str, str], int] | None = None,
     real_edge_adjustment_cost: dict[tuple[str, str], int] | None = None,
+    allow_virtual_bridge: bool = False,
+    virtual_edges: set[tuple[str, str]] | None = None,
+    max_virtual_bridge_per_segment: int = 0,
+    virtual_tons_by_edge: dict[tuple[str, str], float] | None = None,
 ) -> dict:
     total_missing = 0
     real_candidate_edges = 0
+    virtual_candidate_edges = 0
     bridge_limit_exceeded = 0
+    virtual_limit_exceeded = 0
     real_used = 0
+    virtual_used = 0
+    virtual_tons = 0.0
     boundary_band_distance = 0
     endpoint_adjustment_cost = 0
     for i in range(len(oids) - 1):
@@ -1626,11 +3137,22 @@ def _segment_edge_stats_for_reconstruction(
                 endpoint_adjustment_cost += int((real_edge_adjustment_cost or {}).get(key, 0))
             elif allow_real_bridge:
                 bridge_limit_exceeded += 1
+        elif key in (virtual_edges or set()):
+            virtual_candidate_edges += 1
+            if allow_virtual_bridge and virtual_used < int(max_virtual_bridge_per_segment):
+                virtual_used += 1
+                virtual_tons += float((virtual_tons_by_edge or {}).get(key, 0.0) or 0.0)
+            elif allow_virtual_bridge:
+                virtual_limit_exceeded += 1
     return {
         "missing_edges": int(total_missing),
         "real_candidate_edges": int(real_candidate_edges),
+        "virtual_candidate_edges": int(virtual_candidate_edges),
         "real_used": int(real_used),
+        "virtual_used": int(virtual_used),
+        "virtual_tons": float(virtual_tons),
         "bridge_limit_exceeded": int(bridge_limit_exceeded),
+        "virtual_limit_exceeded": int(virtual_limit_exceeded),
         "boundary_band_distance": int(boundary_band_distance),
         "endpoint_adjustment_cost": int(endpoint_adjustment_cost),
     }
@@ -1666,6 +3188,10 @@ def _solve_underfilled_reconstruction_block(
     next_local_id: int,
     real_edge_distance: dict[tuple[str, str], int] | None = None,
     real_edge_adjustment_cost: dict[tuple[str, str], int] | None = None,
+    virtual_edges: set[tuple[str, str]] | None = None,
+    max_virtual_bridge_per_segment: int = 0,
+    virtual_tons_by_edge: dict[tuple[str, str], float] | None = None,
+    virtual_bridge_penalty: float = 0.0,
 ) -> tuple[list[CampaignSegment], list[CampaignSegment], dict]:
     combined: list[str] = []
     for seg in block:
@@ -1701,22 +3227,28 @@ def _solve_underfilled_reconstruction_block(
                 max_real_bridge_per_segment=max_real_bridge_per_segment,
                 real_edge_distance=real_edge_distance,
                 real_edge_adjustment_cost=real_edge_adjustment_cost,
+                allow_virtual_bridge=allow_virtual_bridge,
+                virtual_edges=virtual_edges,
+                max_virtual_bridge_per_segment=max_virtual_bridge_per_segment,
+                virtual_tons_by_edge=virtual_tons_by_edge,
             )
             obs["repair_only_real_bridge_candidates_total"] += int(edge_stats["real_candidate_edges"])
             obs["repair_only_real_bridge_filtered_bridge_limit_exceeded"] += int(edge_stats["bridge_limit_exceeded"])
-            ok, real_used = _segment_edge_valid_for_reconstruction(
+            ok, real_used, virtual_used = _segment_edge_valid_for_reconstruction(
                 oids,
                 direct_edges,
                 real_edges,
                 allow_real_bridge=allow_real_bridge,
                 allow_virtual_bridge=allow_virtual_bridge,
                 max_real_bridge_per_segment=max_real_bridge_per_segment,
+                virtual_edges=virtual_edges,
+                max_virtual_bridge_per_segment=max_virtual_bridge_per_segment,
             )
             if not ok:
                 obs["repair_only_real_bridge_filtered_pair_invalid"] += 1
                 continue
             obs["candidate_cutpoints_pair_valid"] += 1
-            if int(real_used) == 0:
+            if int(real_used) == 0 and int(virtual_used) == 0:
                 obs["direct_only_feasible"] = True
             else:
                 obs["repair_only_real_bridge_candidates_kept"] += int(real_used)
@@ -1726,6 +3258,8 @@ def _solve_underfilled_reconstruction_block(
                     "oids": oids,
                     "tons": tons,
                     "real_used": int(real_used),
+                    "virtual_used": int(virtual_used),
+                    "virtual_tons": float(edge_stats.get("virtual_tons", 0.0) or 0.0),
                     "boundary_band_distance": int(edge_stats.get("boundary_band_distance", 0)),
                     "endpoint_adjustment_cost": int(edge_stats.get("endpoint_adjustment_cost", 0)),
                     "target_gap": abs(tons - float(campaign_ton_target)),
@@ -1744,6 +3278,7 @@ def _solve_underfilled_reconstruction_block(
         valid_count = len(path)
         salvaged_orders = sum(len(item["oids"]) for item in path)
         real_used_total = sum(int(item.get("real_used", 0)) for item in path)
+        virtual_used_total = sum(int(item.get("virtual_used", 0)) for item in path)
         boundary_band_distance = sum(int(item.get("boundary_band_distance", 0)) for item in path)
         endpoint_adjustment_cost = sum(int(item.get("endpoint_adjustment_cost", 0)) for item in path)
         target_gap = sum(float(item.get("target_gap", 0.0)) for item in path)
@@ -1753,6 +3288,7 @@ def _solve_underfilled_reconstruction_block(
             -salvaged_orders,
             residual_count,
             real_used_total * float(bridge_cost_penalty),
+            virtual_used_total * float(virtual_bridge_penalty),
             boundary_band_distance,
             endpoint_adjustment_cost,
             target_gap,
@@ -1806,12 +3342,16 @@ def _solve_underfilled_reconstruction_block(
             )
         )
     real_bridge_used = sum(int(item.get("real_used", 0)) for item in best_path)
+    virtual_bridge_used = sum(int(item.get("virtual_used", 0)) for item in best_path)
+    virtual_bridge_tons = sum(float(item.get("virtual_tons", 0.0) or 0.0) for item in best_path)
     obs.update({
         "success": True,
         "valid_count": int(len(valid)),
         "salvaged_orders": int(sum(len(s.order_ids) for s in valid)),
         "residual_underfilled": int(len(residual_under)),
         "real_bridge_used": int(real_bridge_used),
+        "virtual_bridge_used": int(virtual_bridge_used),
+        "virtual_bridge_tons": float(virtual_bridge_tons),
     })
     return valid, residual_under, obs
 
@@ -1923,6 +3463,518 @@ def _generate_ton_rescue_windows(
     return windows
 
 
+def _enumerate_bridge_envelopes(
+    *,
+    left_anchor_idx: int,
+    right_anchor_idx: int,
+    order_count: int,
+    max_left_expand: int,
+    max_right_expand: int,
+    max_windows: int,
+) -> list[tuple[int, int, int, int]]:
+    out: list[tuple[int, int, int, int]] = []
+    max_windows = max(1, int(max_windows))
+    max_left = min(max(0, int(max_left_expand)), max(0, int(left_anchor_idx)))
+    max_right = min(max(0, int(max_right_expand)), max(0, int(order_count) - int(right_anchor_idx) - 1))
+    max_span = max(max_left, max_right)
+    for span in range(max_span + 1):
+        pairs: list[tuple[int, int]]
+        if span == 0:
+            pairs = [(0, 0)]
+        else:
+            pairs = [(0, span), (span, 0)]
+            pairs.extend((left, span) for left in range(1, span))
+            pairs.extend((span, right) for right in range(1, span))
+            pairs.append((span, span))
+        for left_expand, right_expand in pairs:
+            if left_expand > max_left or right_expand > max_right:
+                continue
+            start_idx = int(left_anchor_idx) - int(left_expand)
+            end_idx = int(right_anchor_idx) + int(right_expand)
+            if start_idx < 0 or end_idx >= int(order_count) or start_idx > end_idx:
+                continue
+            out.append((int(left_expand), int(right_expand), int(start_idx), int(end_idx)))
+            if len(out) >= int(max_windows):
+                return out
+    return out
+
+
+def _pair_fail_location(
+    *,
+    pair: tuple[str, str],
+    pair_global_left_idx: int,
+    start_idx: int,
+    left_anchor_idx: int,
+    right_anchor_idx: int,
+    left_expand: int,
+    right_expand: int,
+    real_edge: tuple[str, str],
+) -> str:
+    if pair == real_edge:
+        return "anchor_pair"
+    if int(pair_global_left_idx) < int(left_anchor_idx):
+        if int(left_expand) > 0 and int(pair_global_left_idx) == int(start_idx):
+            return "left_expansion_boundary"
+        return "left_internal"
+    if int(pair_global_left_idx) >= int(right_anchor_idx):
+        if int(right_expand) > 0 and int(pair_global_left_idx) == int(right_anchor_idx):
+            return "right_expansion_boundary"
+        return "right_internal"
+    return "anchor_pair"
+
+
+def _classify_pair_rule_failure(
+    left_oid: str,
+    right_oid: str,
+    *,
+    template_known: bool,
+    order_specs_by_id: dict[str, dict],
+    rule,
+) -> tuple[str, list[str]]:
+    sub_reasons: list[str] = []
+    left = order_specs_by_id.get(str(left_oid), {})
+    right = order_specs_by_id.get(str(right_oid), {})
+
+    lw = _as_float_or_none(left.get("width"))
+    rw = _as_float_or_none(right.get("width"))
+    if lw is not None and rw is not None and rule is not None:
+        if rw > lw and max(0.0, rw - lw) > float(getattr(rule, "real_reverse_step_max_mm", 0.0) or 0.0):
+            sub_reasons.append("WIDTH_RULE_FAIL")
+        elif lw - rw > float(getattr(rule, "max_width_drop", 0.0) or 0.0):
+            sub_reasons.append("WIDTH_RULE_FAIL")
+
+    lt = _as_float_or_none(left.get("thickness"))
+    rt = _as_float_or_none(right.get("thickness"))
+    if lt is not None and rt is not None and not _thick_ok(float(lt), float(rt)):
+        sub_reasons.append("THICKNESS_RULE_FAIL")
+
+    lmin = _as_float_or_none(left.get("temp_min"))
+    lmax = _as_float_or_none(left.get("temp_max"))
+    rmin = _as_float_or_none(right.get("temp_min"))
+    rmax = _as_float_or_none(right.get("temp_max"))
+    if None not in (lmin, lmax, rmin, rmax) and rule is not None:
+        overlap = _temp_overlap_len(float(lmin), float(lmax), float(rmin), float(rmax))
+        if overlap < float(getattr(rule, "min_temp_overlap_real_real", 0.0) or 0.0):
+            sub_reasons.append("TEMP_OVERLAP_FAIL")
+
+    lg = _txt(left.get("steel_group", "")).upper()
+    rg = _txt(right.get("steel_group", "")).upper()
+    if lg and rg and lg != rg and (not _is_pc(lg)) and (not _is_pc(rg)):
+        sub_reasons.append("GROUP_SWITCH_FAIL")
+
+    sub_reasons = list(dict.fromkeys(sub_reasons))
+    if len(sub_reasons) > 1:
+        return "MULTI_RULE_FAIL", sub_reasons
+    if len(sub_reasons) == 1:
+        return sub_reasons[0], sub_reasons
+    if not template_known:
+        return "TEMPLATE_KEY_MISSING", []
+    return "UNKNOWN_PAIR_INVALID", []
+
+
+def _validate_extracted_window_pairs(
+    *,
+    candidate_id: str,
+    line: str,
+    extracted_orders: list[str],
+    start_idx: int,
+    left_anchor_idx: int,
+    right_anchor_idx: int,
+    left_expand: int,
+    right_expand: int,
+    direct_edges: set[tuple[str, str]],
+    real_edge: tuple[str, str],
+    max_real_bridge_per_segment: int,
+    pair_rows_by_key: dict[tuple[str, str], list[dict]],
+    order_specs_by_id: dict[str, dict],
+    rule,
+    pre_pair_audit: dict | None = None,
+) -> dict:
+    failing_pairs: list[dict] = []
+    fail_counts: Counter = Counter()
+    real_used = 0
+    anchor_adjacent = False
+    anchor_eval: PairEvalResult | None = None
+
+    for local_idx in range(len(extracted_orders) - 1):
+        left_oid = str(extracted_orders[local_idx])
+        right_oid = str(extracted_orders[local_idx + 1])
+        pair = (left_oid, right_oid)
+        eval_result = _evaluate_pair_violation(
+            left_order=left_oid,
+            right_order=right_oid,
+            line=str(line),
+            template_lookup=pair_rows_by_key,
+            direct_edges=direct_edges,
+            real_edges={real_edge},
+            adjacency_ok=True,
+            order_context_by_id=order_specs_by_id,
+            rule=rule,
+        )
+        if pair == real_edge:
+            real_used += 1
+            anchor_adjacent = True
+            anchor_eval = eval_result
+        if eval_result.reason == "OK":
+            continue
+        reason = str(eval_result.reason or "UNKNOWN_PAIR_INVALID")
+        sub_reasons = list(eval_result.sub_reasons)
+        fail_counts[reason] += 1
+        failing_pairs.append(
+            {
+                "left_order_id": left_oid,
+                "right_order_id": right_oid,
+                "template_ok": bool(eval_result.template_ok),
+                "adjacency_ok": bool(eval_result.adjacency_ok),
+                "reason": reason,
+                "sub_reasons": list(sub_reasons),
+                "template_key": eval_result.template_key,
+                "context_snapshot": dict(eval_result.context_snapshot),
+                "location": _pair_fail_location(
+                    pair=pair,
+                    pair_global_left_idx=int(start_idx) + int(local_idx),
+                    start_idx=start_idx,
+                    left_anchor_idx=left_anchor_idx,
+                    right_anchor_idx=right_anchor_idx,
+                    left_expand=left_expand,
+                    right_expand=right_expand,
+                    real_edge=real_edge,
+                ),
+            }
+        )
+
+    if not anchor_adjacent:
+        anchor_eval = _evaluate_pair_violation(
+            left_order=str(real_edge[0]),
+            right_order=str(real_edge[1]),
+            line=str(line),
+            template_lookup=pair_rows_by_key,
+            direct_edges=direct_edges,
+            real_edges={real_edge},
+            adjacency_ok=False,
+            order_context_by_id=order_specs_by_id,
+            rule=rule,
+        )
+        reason = str(anchor_eval.reason or "UNKNOWN_PAIR_INVALID")
+        fail_counts[reason] += 1
+        failing_pairs.insert(
+            0,
+            {
+                "left_order_id": str(real_edge[0]),
+                "right_order_id": str(real_edge[1]),
+                "template_ok": bool(anchor_eval.template_ok),
+                "adjacency_ok": bool(anchor_eval.adjacency_ok),
+                "reason": reason,
+                "sub_reasons": list(anchor_eval.sub_reasons),
+                "template_key": anchor_eval.template_key,
+                "context_snapshot": dict(anchor_eval.context_snapshot),
+                "location": "anchor_pair",
+            },
+        )
+
+    if anchor_eval is not None:
+        _print_pair_audit(
+            "REPAIR_BRIDGE_PAIR_AUDIT_EXTRACT",
+            candidate_id=str(candidate_id),
+            pair=(str(real_edge[0]), str(real_edge[1])),
+            line=str(line),
+            eval_result=anchor_eval,
+        )
+        _print_anchor_context(
+            candidate_id=str(candidate_id),
+            pair=(str(real_edge[0]), str(real_edge[1])),
+            line=str(line),
+            eval_result=anchor_eval,
+        )
+        if not anchor_eval.context_ok:
+            _print_order_context_miss(
+                candidate_id=str(candidate_id),
+                pair=(str(real_edge[0]), str(real_edge[1])),
+                eval_result=anchor_eval,
+            )
+        pre = dict(pre_pair_audit or {})
+        pre_context = dict(pre.get("context_snapshot", {}) or {})
+        extract_context = dict(anchor_eval.context_snapshot)
+        changed_fields = _pair_context_changed_fields(pre_context, extract_context)
+        for key in ("template_ok", "adjacency_ok", "context_ok", "reason", "template_key"):
+            if pre.get(key) != anchor_eval.to_dict().get(key):
+                changed_fields.append(key)
+        changed_fields = list(dict.fromkeys(changed_fields))
+        pre_reason = str(pre.get("reason", "") or "")
+        extract_reason = str(anchor_eval.reason or "")
+        print(
+            f"[APS][REPAIR_BRIDGE_PAIR_AUDIT_DIFF] candidate_id={candidate_id}, "
+            f"pair=({real_edge[0]},{real_edge[1]}), changed_fields={changed_fields}, "
+            f"pre_reason={pre_reason}, extract_reason={extract_reason}"
+        )
+        if (
+            bool(pre.get("template_ok", False))
+            and bool(pre.get("adjacency_ok", False))
+            and pre_reason == "OK"
+            and extract_reason == "UNKNOWN_PAIR_INVALID"
+        ):
+            print(
+                f"[APS][REPAIR_BRIDGE_ANCHOR_INCONSISTENCY] candidate_id={candidate_id}, "
+                f"pair=({real_edge[0]},{real_edge[1]}), pre_reason=OK, "
+                f"extract_reason=UNKNOWN_PAIR_INVALID, changed_fields={changed_fields}"
+            )
+
+    return {
+        "pair_ok": bool(not failing_pairs and 0 < real_used <= int(max_real_bridge_per_segment)),
+        "real_used": int(real_used),
+        "anchor_adjacent": bool(anchor_adjacent),
+        "failing_pairs": failing_pairs,
+        "first_fail_reason": str(failing_pairs[0]["reason"]) if failing_pairs else "",
+        "fail_counts_by_reason": dict(fail_counts),
+    }
+
+
+def _extract_min_valid_segment_around_bridge(
+    *,
+    candidate_id: str,
+    line: str,
+    combined_orders: list[str],
+    bridge_from: str,
+    bridge_to: str,
+    direct_edges: set[tuple[str, str]],
+    real_edge: tuple[str, str],
+    pair_rows_by_key: dict[tuple[str, str], list[dict]],
+    order_specs_by_id: dict[str, dict],
+    rule,
+    order_tons: dict[str, float],
+    campaign_ton_min: float,
+    campaign_ton_max: float,
+    campaign_ton_target: float,
+    max_real_bridge_per_segment: int,
+    next_local_id: int,
+    max_left_expand: int,
+    max_right_expand: int,
+    max_windows_per_candidate: int,
+    pre_pair_audit: dict | None = None,
+) -> tuple[CampaignSegment | None, CampaignSegment | None, dict]:
+    diag = {
+        "success": False,
+        "left_expand": 0,
+        "right_expand": 0,
+        "extracted_orders": 0,
+        "extracted_tons": 0.0,
+        "pair_ok": False,
+        "ton_ok": False,
+        "first_fail_reason": "",
+        "fail_pair_count": 0,
+        "fail_counts_by_reason": {},
+        "dominant_fail_reason": "",
+        "first_success_window": "",
+        "left_blocked_by": "",
+        "right_blocked_by": "",
+        "residual_underfilled": 0,
+        "partial_success": False,
+        "full_success": False,
+        "real_bridge_used": 0,
+        "envelopes_tested": 0,
+    }
+    oids = [str(v) for v in combined_orders]
+    if not oids:
+        return None, None, diag
+
+    anchor_pairs = [
+        (left_idx, right_idx)
+        for left_idx, oid in enumerate(oids)
+        if str(oid) == str(bridge_from)
+        for right_idx, right_oid in enumerate(oids)
+        if str(right_oid) == str(bridge_to) and int(right_idx) > int(left_idx)
+    ]
+    if not anchor_pairs:
+        print(
+            f"[APS][REPAIR_BRIDGE_TON_RESCUE_EXTRACT_ERROR] candidate_id={candidate_id}, "
+            f"reason=ANCHOR_NOT_FOUND_OR_ORDER_INVALID"
+        )
+        return None, None, {**diag, "reject_reason": "TON_SPLIT_NOT_FOUND"}
+
+    left_anchor_idx, right_anchor_idx = min(anchor_pairs, key=lambda item: (int(item[1]) - int(item[0]), int(item[0])))
+
+    prefix = [0.0] * (len(oids) + 1)
+    for idx, oid in enumerate(oids):
+        prefix[idx + 1] = prefix[idx] + float(order_tons.get(str(oid), 0.0) or 0.0)
+
+    candidates: list[dict] = []
+    fail_counts_total: Counter = Counter()
+    left_direction_fails: Counter = Counter()
+    right_direction_fails: Counter = Counter()
+    first_success_window = ""
+    envelopes = _enumerate_bridge_envelopes(
+        left_anchor_idx=int(left_anchor_idx),
+        right_anchor_idx=int(right_anchor_idx),
+        order_count=len(oids),
+        max_left_expand=max_left_expand,
+        max_right_expand=max_right_expand,
+        max_windows=max_windows_per_candidate,
+    )
+    for left_expand, right_expand, start, end in envelopes:
+        segment_orders = oids[start : end + 1]
+        tons = prefix[end + 1] - prefix[start]
+        ton_ok = float(campaign_ton_min) - 1e-6 <= float(tons) <= float(campaign_ton_max) + 1e-6
+        if float(tons) > float(campaign_ton_max) + 1e-6:
+            diag["envelopes_tested"] = int(diag.get("envelopes_tested", 0) or 0) + 1
+            print(
+                f"[APS][REPAIR_BRIDGE_TON_RESCUE_EXTRACT] candidate_id={candidate_id}, "
+                f"left_expand={left_expand}, right_expand={right_expand}, "
+                f"extracted_orders={len(segment_orders)}, extracted_tons={float(tons):.1f}, "
+                f"pair_ok=False, ton_ok=False, success=False, "
+                f"first_fail_reason=TON_ABOVE_MAX_AFTER_EXPANSION, fail_pair_count=0, "
+                f"fail_counts_by_reason={{'TON_ABOVE_MAX_AFTER_EXPANSION': 1}}"
+            )
+            continue
+        pair_diag = _validate_extracted_window_pairs(
+            candidate_id=candidate_id,
+            line=str(line),
+            extracted_orders=segment_orders,
+            start_idx=start,
+            left_anchor_idx=int(left_anchor_idx),
+            right_anchor_idx=int(right_anchor_idx),
+            left_expand=left_expand,
+            right_expand=right_expand,
+            direct_edges=direct_edges,
+            real_edge=real_edge,
+            max_real_bridge_per_segment=max_real_bridge_per_segment,
+            pair_rows_by_key=pair_rows_by_key,
+            order_specs_by_id=order_specs_by_id,
+            rule=rule,
+            pre_pair_audit=pre_pair_audit,
+        )
+        pair_ok = bool(pair_diag.get("pair_ok", False))
+        real_used = int(pair_diag.get("real_used", 0) or 0)
+        success = bool(pair_ok and ton_ok)
+        diag["envelopes_tested"] = int(diag.get("envelopes_tested", 0) or 0) + 1
+        failing_pairs = list(pair_diag.get("failing_pairs", []) or [])
+        first_fail = failing_pairs[0] if failing_pairs else {}
+        fail_counts_by_reason = dict(pair_diag.get("fail_counts_by_reason", {}) or {})
+        fail_counts_total.update(fail_counts_by_reason)
+        if first_fail:
+            fail_reason = str(first_fail.get("reason", "") or "UNKNOWN_PAIR_INVALID")
+            location = str(first_fail.get("location", "") or "unknown")
+            if location.startswith("left_"):
+                left_direction_fails[fail_reason] += 1
+            elif location.startswith("right_"):
+                right_direction_fails[fail_reason] += 1
+            print(
+                f"[APS][REPAIR_BRIDGE_TON_RESCUE_PAIR_FAIL] candidate_id={candidate_id}, "
+                f"left_expand={left_expand}, right_expand={right_expand}, "
+                f"fail_location={location}, "
+                f"fail_pair=({first_fail.get('left_order_id', '')},{first_fail.get('right_order_id', '')}), "
+                f"reason={fail_reason}"
+            )
+            if str(first_fail.get("reason", "")) == "MULTI_RULE_FAIL":
+                print(
+                    f"[APS][REPAIR_BRIDGE_TON_RESCUE_PAIR_FAIL_DETAIL] candidate_id={candidate_id}, "
+                    f"fail_pair=({first_fail.get('left_order_id', '')},{first_fail.get('right_order_id', '')}), "
+                    f"sub_reasons={list(first_fail.get('sub_reasons', []) or [])}"
+                )
+        print(
+            f"[APS][REPAIR_BRIDGE_TON_RESCUE_EXTRACT] candidate_id={candidate_id}, "
+            f"left_expand={left_expand}, right_expand={right_expand}, "
+            f"extracted_orders={len(segment_orders)}, extracted_tons={float(tons):.1f}, "
+            f"pair_ok={bool(pair_ok)}, ton_ok={bool(ton_ok)}, success={bool(success)}, "
+            f"first_fail_reason={str(pair_diag.get('first_fail_reason', '') or '')}, "
+            f"fail_pair_count={len(failing_pairs)}, "
+            f"fail_counts_by_reason={fail_counts_by_reason}"
+        )
+        if not success:
+            continue
+        if not first_success_window:
+            first_success_window = f"left_expand={left_expand},right_expand={right_expand}"
+        candidates.append(
+            {
+                "start": int(start),
+                "end": int(end),
+                "orders": segment_orders,
+                "tons": float(tons),
+                "real_used": int(real_used),
+                "target_gap": abs(float(tons) - float(campaign_ton_target)),
+                "order_count": len(segment_orders),
+                "residual_count": max(0, len(oids) - len(segment_orders)),
+                "left_expand": int(left_expand),
+                "right_expand": int(right_expand),
+                "expand_total": int(left_expand) + int(right_expand),
+            }
+        )
+
+    if not candidates:
+        dominant_fail_reason = fail_counts_total.most_common(1)[0][0] if fail_counts_total else ""
+        left_blocked_by = left_direction_fails.most_common(1)[0][0] if left_direction_fails else ""
+        right_blocked_by = right_direction_fails.most_common(1)[0][0] if right_direction_fails else ""
+        if left_blocked_by or right_blocked_by:
+            print(
+                f"[APS][REPAIR_BRIDGE_TON_RESCUE_DIRECTION_HINT] candidate_id={candidate_id}, "
+                f"left_blocked_by={left_blocked_by}, right_blocked_by={right_blocked_by}"
+            )
+        diag.update(
+            {
+                "first_fail_reason": str(dominant_fail_reason),
+                "dominant_fail_reason": str(dominant_fail_reason),
+                "fail_pair_count": int(sum(fail_counts_total.values())),
+                "fail_counts_by_reason": dict(fail_counts_total),
+                "left_blocked_by": str(left_blocked_by),
+                "right_blocked_by": str(right_blocked_by),
+                "first_success_window": "",
+                "total_windows_tested": int(diag.get("envelopes_tested", 0) or 0),
+            }
+        )
+        return None, None, diag
+
+    best = min(
+        candidates,
+        key=lambda item: (
+            float(item["target_gap"]),
+            int(item["order_count"]),
+            int(item["residual_count"]),
+            int(item["expand_total"]),
+        ),
+    )
+    extracted_orders = [str(v) for v in best["orders"]]
+    residual_orders = oids[: int(best["start"])] + oids[int(best["end"]) + 1 :]
+
+    valid_seg = _campaign_segment_from_orders(
+        line=line,
+        campaign_local_id=next_local_id + 1,
+        order_ids=extracted_orders,
+        order_tons=order_tons,
+        is_valid=True,
+    )
+    if valid_seg is None:
+        return None, None, diag
+
+    residual_seg = _campaign_segment_from_orders(
+        line=line,
+        campaign_local_id=next_local_id + 2,
+        order_ids=residual_orders,
+        order_tons=order_tons,
+        is_valid=False,
+    )
+    diag.update(
+        {
+            "success": True,
+            "left_expand": int(best["left_expand"]),
+            "right_expand": int(best["right_expand"]),
+            "extracted_orders": int(len(extracted_orders)),
+            "extracted_tons": float(best["tons"]),
+            "pair_ok": True,
+            "ton_ok": True,
+            "first_fail_reason": "",
+            "dominant_fail_reason": fail_counts_total.most_common(1)[0][0] if fail_counts_total else "",
+            "fail_pair_count": int(sum(fail_counts_total.values())),
+            "fail_counts_by_reason": dict(fail_counts_total),
+            "first_success_window": first_success_window,
+            "total_windows_tested": int(diag.get("envelopes_tested", 0) or 0),
+            "residual_underfilled": 1 if residual_seg is not None else 0,
+            "partial_success": residual_seg is not None,
+            "full_success": residual_seg is None,
+            "real_bridge_used": int(best["real_used"]),
+        }
+    )
+    return valid_seg, residual_seg, diag
+
+
 def _try_bridge_ton_rescue_recut(
     *,
     candidate: dict,
@@ -1931,6 +3983,7 @@ def _try_bridge_ton_rescue_recut(
     window_id: int,
     direction: str,
     expansion_block: list[CampaignSegment],
+    current_block_segment_ids: list[int],
     direct_edges: set[tuple[str, str]],
     real_edge: tuple[str, str],
     order_tons: dict[str, float],
@@ -1940,6 +3993,12 @@ def _try_bridge_ton_rescue_recut(
     max_real_bridge_per_segment: int,
     bridge_cost_penalty: float,
     next_local_id: int,
+    ton_rescue_max_left_expand: int,
+    ton_rescue_max_right_expand: int,
+    ton_rescue_max_windows_per_candidate: int,
+    pair_rows_by_key: dict[tuple[str, str], list[dict]],
+    order_specs_by_id: dict[str, dict],
+    rule,
     real_edge_distance: dict[tuple[str, str], int] | None = None,
     real_edge_adjustment_cost: dict[tuple[str, str], int] | None = None,
 ) -> dict:
@@ -1949,9 +4008,24 @@ def _try_bridge_ton_rescue_recut(
     ctx = candidate.get("context", {}) if isinstance(candidate.get("context", {}), dict) else {}
     adjusted_left_orders = [str(v) for v in ctx.get("adjusted_left_orders", [])]
     adjusted_right_orders = [str(v) for v in ctx.get("adjusted_right_orders", [])]
+    pre_pair_audit = dict(candidate.get("pre_pair_audit", {}) or {})
     combined_orders = [str(oid) for seg in expansion_block for oid in seg.order_ids]
     combined_tons = sum(float(order_tons.get(str(oid), 0.0) or 0.0) for oid in combined_orders)
-    neighbor_ids = [int(seg.campaign_local_id) for seg in expansion_block[int(current_block_segment_count):]]
+    current_block_segment_ids_set = set(int(x) for x in current_block_segment_ids)
+    neighbor_ids = [
+        int(seg.campaign_local_id)
+        for seg in expansion_block
+        if int(seg.campaign_local_id) not in current_block_segment_ids_set
+    ]
+    diag = {}
+    if not neighbor_ids:
+        diag["neighbor_block_count"] = 0
+    else:
+        diag["neighbor_block_count"] = len(neighbor_ids)
+    print(
+        f"[APS][REPAIR_BRIDGE_TON_RESCUE_NEIGHBORS] candidate_id={candidate_id}, "
+        f"neighbor_ids={neighbor_ids}"
+    )
     print(
         f"[APS][REPAIR_BRIDGE_TON_RESCUE_WINDOW] candidate_id={candidate_id}, "
         f"window_id={window_id}, direction={direction}, neighbor_blocks={neighbor_ids}, "
@@ -2004,66 +4078,54 @@ def _try_bridge_ton_rescue_recut(
         print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_RESCUE_REJECTED")
         return {"success": False, "reject_reason": "TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION"}
 
-    synthetic = _campaign_segment_from_orders(
+    extracted_valid, residual_seg, recut_diag = _extract_min_valid_segment_around_bridge(
+        candidate_id=candidate_id,
         line=line,
-        campaign_local_id=next_local_id + 1,
-        order_ids=rescue_orders,
-        order_tons=order_tons,
-        is_valid=False,
-    )
-    if synthetic is None:
-        return {"success": False, "reject_reason": "TON_SPLIT_NOT_FOUND"}
-    valid, residual, recut_diag = _solve_underfilled_reconstruction_block(
-        [synthetic],
+        combined_orders=combined_orders,
+        bridge_from=bridge_from,
+        bridge_to=bridge_to,
         direct_edges=direct_edges,
-        real_edges={real_edge},
+        real_edge=real_edge,
+        pair_rows_by_key=pair_rows_by_key,
+        order_specs_by_id=order_specs_by_id,
+        rule=rule,
+        pre_pair_audit=pre_pair_audit,
         order_tons=order_tons,
         campaign_ton_min=campaign_ton_min,
         campaign_ton_max=campaign_ton_max,
         campaign_ton_target=campaign_ton_target,
-        allow_real_bridge=True,
-        allow_virtual_bridge=False,
         max_real_bridge_per_segment=max_real_bridge_per_segment,
-        bridge_cost_penalty=bridge_cost_penalty,
         next_local_id=next_local_id,
-        real_edge_distance=real_edge_distance,
-        real_edge_adjustment_cost=real_edge_adjustment_cost,
+        max_left_expand=ton_rescue_max_left_expand,
+        max_right_expand=ton_rescue_max_right_expand,
+        max_windows_per_candidate=ton_rescue_max_windows_per_candidate,
+    )
+    print(
+        f"[APS][REPAIR_BRIDGE_TON_RESCUE_EXTRACT_SUMMARY] candidate_id={candidate_id}, "
+        f"left_expand={int(recut_diag.get('left_expand', 0) or 0)}, "
+        f"right_expand={int(recut_diag.get('right_expand', 0) or 0)}, "
+        f"extracted_orders={int(recut_diag.get('extracted_orders', 0) or 0)}, "
+        f"extracted_tons={float(recut_diag.get('extracted_tons', 0.0) or 0.0):.1f}, "
+        f"pair_ok={bool(recut_diag.get('pair_ok', False))}, "
+        f"ton_ok={bool(recut_diag.get('ton_ok', False))}, "
+        f"dominant_fail_reason={str(recut_diag.get('dominant_fail_reason', '') or '')}, "
+        f"first_success_window={str(recut_diag.get('first_success_window', '') or '')}, "
+        f"total_windows_tested={int(recut_diag.get('total_windows_tested', recut_diag.get('envelopes_tested', 0)) or 0)}, "
+        f"success={bool(recut_diag.get('success', False))}"
     )
 
-    if not valid:
-        reason = "TON_SPLIT_NOT_FOUND"
-        if rescue_tons > float(campaign_ton_max) + 1e-6:
-            reason = "TON_SPLIT_NOT_FOUND"
+    if extracted_valid is None:
+        reason = str(recut_diag.get("reject_reason", "") or "TON_SPLIT_NOT_FOUND")
         print(
             f"[APS][REPAIR_BRIDGE_TON_RESCUE_RECUT] candidate_id={candidate_id}, "
-            f"window_id={window_id}, success=False, rescued_valid=0, residual_underfilled={len(residual)}"
+            f"window_id={window_id}, success=False, rescued_valid=0, residual_underfilled=1"
         )
         print(f"[APS][REPAIR_BRIDGE_TON_RESCUE_FAIL] candidate_id={candidate_id}, window_id={window_id}, reason={reason}")
         print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_RESCUE_REJECTED")
-        return {"success": False, "reject_reason": reason}
+        return {"success": False, "reject_reason": reason, "diag": recut_diag}
 
-    after_counter = Counter()
-    for seg in valid + residual:
-        after_counter.update([str(v) for v in seg.order_ids])
-    rescue_counter = Counter(rescue_orders)
-    omitted_counter = Counter(combined_orders) - rescue_counter
-    residual_all = list(residual)
-    local_id = next_local_id + len(valid) + len(residual)
-    if omitted_counter:
-        omitted_orders: list[str] = []
-        for oid in combined_orders:
-            if omitted_counter[str(oid)] > 0:
-                omitted_orders.append(str(oid))
-                omitted_counter[str(oid)] -= 1
-        omitted_seg = _campaign_segment_from_orders(
-            line=line,
-            campaign_local_id=local_id + 1,
-            order_ids=omitted_orders,
-            order_tons=order_tons,
-            is_valid=False,
-        )
-        if omitted_seg is not None:
-            residual_all.append(omitted_seg)
+    valid = [extracted_valid]
+    residual_all = [residual_seg] if residual_seg is not None else []
 
     before_counter = Counter(combined_orders)
     final_counter = Counter()
@@ -2088,10 +4150,10 @@ def _try_bridge_ton_rescue_recut(
         )
         print(
             f"[APS][REPAIR_BRIDGE_TON_RESCUE_FAIL] candidate_id={candidate_id}, "
-            f"window_id={window_id}, reason=TON_RESCUE_NO_GAIN"
+            f"window_id={window_id}, reason=ANCHOR_PAIR_NOT_USED"
         )
         print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_RESCUE_REJECTED")
-        return {"success": False, "reject_reason": "TON_RESCUE_NO_GAIN"}
+        return {"success": False, "reject_reason": "ANCHOR_PAIR_NOT_USED"}
 
     valid_delta = len(valid)
     underfilled_delta = len(residual_all) - len(expansion_block)
@@ -2100,7 +4162,8 @@ def _try_bridge_ton_rescue_recut(
     print(
         f"[APS][REPAIR_BRIDGE_TON_RESCUE_RECUT] candidate_id={candidate_id}, "
         f"window_id={window_id}, success={bool(improved)}, rescued_valid={len(valid)}, "
-        f"residual_underfilled={len(residual_all)}"
+        f"residual_underfilled={len(residual_all)}, "
+        f"partial_success={bool(recut_diag.get('partial_success', False))}"
     )
     if not improved:
         print(
@@ -2112,18 +4175,28 @@ def _try_bridge_ton_rescue_recut(
 
     print(
         f"[APS][REPAIR_BRIDGE_TON_RESCUE_ACCEPT] candidate_id={candidate_id}, "
-        f"window_id={window_id}, valid_delta={valid_delta}, underfilled_delta={underfilled_delta}, "
-        f"scheduled_orders_delta={scheduled_orders_delta}"
+        f"window_id={window_id}, left_expand={int(recut_diag.get('left_expand', 0) or 0)}, "
+        f"right_expand={int(recut_diag.get('right_expand', 0) or 0)}, "
+        f"extracted_tons={float(recut_diag.get('extracted_tons', 0.0) or 0.0):.1f}, "
+        f"rescued_valid={len(valid)}, residual_underfilled={len(residual_all)}, "
+        f"valid_delta={valid_delta}, underfilled_delta={underfilled_delta}, "
+        f"scheduled_orders_delta={scheduled_orders_delta}, "
+        f"partial_success={bool(recut_diag.get('partial_success', False))}"
     )
     print(f"[APS][REPAIR_BRIDGE_STAGE] candidate_id={candidate_id}, stage=TON_RESCUE_ACCEPTED")
     recut_diag.update(
         {
             "success": True,
+            "neighbor_block_count": int(diag.get("neighbor_block_count", 0) or 0),
+            "extract_success": True,
+            "partial_success": bool(recut_diag.get("partial_success", False)),
+            "full_success": bool(recut_diag.get("full_success", False)),
             "valid_delta": int(valid_delta),
             "underfilled_delta": int(underfilled_delta),
             "scheduled_orders_delta": int(scheduled_orders_delta),
             "salvaged_orders": int(scheduled_orders_delta),
             "real_bridge_used": max(1, int(recut_diag.get("real_bridge_used", 0) or 0)),
+            "residual_underfilled_count": int(len(residual_all)),
         }
     )
     return {
@@ -2147,6 +4220,7 @@ def _reconstruct_underfilled_segments(
     allow_real_bridge: bool = False,
     allow_virtual_bridge: bool = False,
     order_tons: dict[str, float] | None = None,
+    orders_df: pd.DataFrame | None = None,
     cfg: PlannerConfig | None = None,
 ) -> tuple[list[CampaignSegment], list[CampaignSegment], dict]:
     """
@@ -2219,13 +4293,77 @@ def _reconstruct_underfilled_segments(
         "repair_bridge_pair_invalid_thickness": 0,
         "repair_bridge_pair_invalid_temp": 0,
         "repair_bridge_pair_invalid_group": 0,
+        "repair_bridge_pair_invalid_context": 0,
         "repair_bridge_pair_invalid_unknown": 0,
+        "repair_bridge_pair_fail_thickness": 0,
+        "repair_bridge_prefilter_fail_thickness": 0,
+        "repair_bridge_rank_pass_thickness": 0,
+        "repair_bridge_rank_fail_thickness": 0,
+        "repair_bridge_template_no_edge_count": 0,
+        "repair_bridge_prefilter_all_fail_count": 0,
+        "repair_bridge_band_too_narrow_count": 0,
+        "repair_bridge_prefilter_reject_count": 0,
+        "repair_bridge_endpoint_early_stop_count": 0,
+        "repair_bridge_local_band_retry_count": 0,
+        "underfilled_reconstruction_improvement_recorded_count": 0,
+        "underfilled_reconstruction_improvement_applied_count": 0,
+        "underfilled_reconstruction_apply_reject_count": 0,
+        "bridgeability_route_suggestion": "",
+        "bridgeability_census": {},
+        "bridgeability_census_items": [],
+        "virtual_pilot_attempt_count": 0,
+        "virtual_pilot_success_count": 0,
+        "virtual_pilot_apply_count": 0,
+        "virtual_pilot_reject_count": 0,
+        "virtual_pilot_eligible_block_count": 0,
+        "virtual_pilot_structural_eligible_block_count": 0,
+        "virtual_pilot_runtime_enabled_block_count": 0,
+        "virtual_pilot_final_eligible_block_count": 0,
+        "virtual_pilot_selected_block_count": 0,
+        "virtual_pilot_skipped_block_count": 0,
+        "virtual_pilot_skipped_due_to_disabled_count": 0,
+        "virtual_pilot_skipped_due_to_limit_count": 0,
+        "virtual_pilot_skipped_due_to_no_pilotable_candidate_count": 0,
+        "virtual_pilot_reject_by_reason_count": {},
+        "virtual_pilot_small_block_soft_penalty_count": 0,
+        "virtual_pilot_fail_stage_count": {},
+        "virtual_pilot_scheduler_budget": 0,
+        "virtual_pilot_selected_by_bucket_count": {},
+        "virtual_pilot_scheduler_selected_blocks": [],
+        "virtual_pilot_scheduler_skipped_due_to_limit": [],
+        "virtual_pilot_spec_enum_total": 0,
+        "virtual_pilot_spec_enum_both_valid_count": 0,
+        "virtual_pilot_ton_fill_attempt_count": 0,
+        "virtual_pilot_ton_fill_success_count": 0,
+        "virtual_pilot_dedup_group_count": 0,
+        "virtual_pilot_duplicate_candidate_skipped_count": 0,
+        "virtual_pilot_selected_unique_pilot_key_count": 0,
+        "virtual_pilot_selected_by_family_count": {},
+        "virtual_pilot_family_prefilter_fail_count": 0,
+        "virtual_pilot_width_group_family_attempt_count": 0,
+        "virtual_pilot_thickness_family_attempt_count": 0,
+        "conservative_apply_attempt_count": 0,
+        "conservative_apply_success_count": 0,
+        "conservative_apply_reject_count": 0,
         "repair_bridge_ton_rescue_attempts": 0,
         "repair_bridge_ton_rescue_success": 0,
         "repair_bridge_ton_rescue_windows_tested": 0,
         "repair_bridge_ton_rescue_valid_delta": 0,
         "repair_bridge_ton_rescue_underfilled_delta": 0,
         "repair_bridge_ton_rescue_scheduled_orders_delta": 0,
+        "repair_bridge_ton_rescue_extract_attempts": 0,
+        "repair_bridge_ton_rescue_extract_success": 0,
+        "repair_bridge_ton_rescue_partial_success": 0,
+        "repair_bridge_ton_rescue_full_success": 0,
+        "repair_bridge_ton_rescue_residual_underfilled_count": 0,
+        "repair_bridge_ton_rescue_pair_fail_width": 0,
+        "repair_bridge_ton_rescue_pair_fail_thickness": 0,
+        "repair_bridge_ton_rescue_pair_fail_temp": 0,
+        "repair_bridge_ton_rescue_pair_fail_group": 0,
+        "repair_bridge_ton_rescue_pair_fail_context": 0,
+        "repair_bridge_ton_rescue_pair_fail_template": 0,
+        "repair_bridge_ton_rescue_pair_fail_multi": 0,
+        "repair_bridge_ton_rescue_pair_fail_unknown": 0,
         "repair_bridge_filtered_ton_below_min_current_block": 0,
         "repair_bridge_filtered_ton_below_min_even_after_neighbor_expansion": 0,
         "repair_bridge_filtered_ton_above_max_after_expansion": 0,
@@ -2243,6 +4381,8 @@ def _reconstruct_underfilled_segments(
     }
     lines = sorted({str(s.line) for s in underfilled_segments})
     tpl_df = _transition_templates_df(transition_pack)
+    order_specs_by_id = _build_order_spec_map_from_transition_context(transition_pack, tpl_df, orders_df=orders_df)
+    bridgeability_census = BridgeabilityCensus()
     pack_meta = _pack_debug_meta(transition_pack)
     diag.update(
         {
@@ -2280,14 +4420,36 @@ def _reconstruct_underfilled_segments(
         f"underfilled_in={len(underfilled_segments)}, lines={lines}"
     )
     if not underfilled_segments:
+        census_dict = bridgeability_census.to_dict()
+        suggestion = _suggest_next_phase_from_census(census_dict)
+        diag["bridgeability_census"] = census_dict
+        diag["bridgeability_census_items"] = list(census_dict.get("items", []))
+        diag["bridgeability_route_suggestion"] = str(suggestion.get("suggestion", "CONTINUE_REAL_BRIDGE_ONLY"))
         diag["underfilled_reconstruction_not_entered_reason"] = "NO_UNDERFILLED_SEGMENTS"
         diag["repair_only_real_bridge_not_entered_reason"] = "NO_UNDERFILLED_SEGMENTS"
         diag["underfilled_reconstruction_seconds"] = round(perf_counter() - t0, 6)
         diag["reconstruction_seconds"] = diag["underfilled_reconstruction_seconds"]
         print("[APS][UNDERFILLED_RECON_SKIP] line=ALL, block_id=0, reason=NO_UNDERFILLED_SEGMENTS")
         print(
+            "[APS][BRIDGEABILITY_CENSUS] total_blocks=0, has_endpoint_edge_count=0, "
+            "template_graph_no_edge_count=0, rule_prefilter_all_fail_count=0, "
+            "band_too_narrow_count=0, candidate_pool_empty_count=0, candidate_pool_nonempty_count=0, "
+            "ton_rescue_entered_count=0, ton_rescue_success_count=0, improvement_recorded_count=0, "
+            "improvement_applied_count=0, thickness_fail_dominant_count=0, width_fail_dominant_count=0, "
+            "temp_fail_dominant_count=0, group_fail_dominant_count=0, multi_fail_dominant_count=0"
+        )
+        print(
+            f"[APS][BRIDGEABILITY_ROUTE_SUGGESTION] suggestion={diag['bridgeability_route_suggestion']}, "
+            f"reasons={list(suggestion.get('reasons', []))}"
+        )
+        print(
             f"[APS][UNDERFILLED_RECON_SUMMARY] attempts=0, success=0, blocks_tested=0, "
-            f"valid_delta=0, underfilled_delta=0, salvaged_segments=0, salvaged_orders=0"
+            f"valid_delta=0, underfilled_delta=0, salvaged_segments=0, salvaged_orders=0, "
+            f"prefilter_reject_count=0, endpoint_early_stop_count=0, local_band_retry_count=0, "
+            f"improvement_recorded_count=0, improvement_applied_count=0, apply_reject_count=0, "
+            f"bridgeability_route_suggestion={diag['bridgeability_route_suggestion']}, "
+            f"virtual_pilot_attempt_count=0, virtual_pilot_success_count=0, "
+            f"virtual_pilot_apply_count=0, virtual_pilot_reject_count=0"
         )
         return list(valid_segments), [], diag
 
@@ -2310,6 +4472,27 @@ def _reconstruct_underfilled_segments(
     ton_rescue_enable_bidirectional = bool(getattr(cfg.model, "repair_bridge_ton_rescue_enable_bidirectional", True) if cfg and cfg.model else True)
     ton_rescue_max_orders_per_window = int(getattr(cfg.model, "repair_bridge_ton_rescue_max_orders_per_window", 50) if cfg and cfg.model else 50)
     ton_rescue_max_failed_after_min = int(getattr(cfg.model, "repair_bridge_ton_rescue_max_failed_windows_after_min", 2) if cfg and cfg.model else 2)
+    ton_rescue_max_left_expand = int(getattr(cfg.model, "repair_bridge_ton_rescue_max_left_expand", 12) if cfg and cfg.model else 12)
+    ton_rescue_max_right_expand = int(getattr(cfg.model, "repair_bridge_ton_rescue_max_right_expand", 12) if cfg and cfg.model else 12)
+    ton_rescue_max_extract_windows = int(getattr(cfg.model, "repair_bridge_ton_rescue_max_windows_per_candidate", 60) if cfg and cfg.model else 60)
+    virtual_pilot_enabled = bool(getattr(cfg.model, "repair_only_virtual_bridge_pilot_enabled", False) if cfg and cfg.model else False)
+    virtual_pilot_max_blocks = int(getattr(cfg.model, "virtual_bridge_pilot_max_blocks_per_run", 5) if cfg and cfg.model else 5)
+    virtual_pilot_max_per_block = int(getattr(cfg.model, "virtual_bridge_pilot_max_per_block", 1) if cfg and cfg.model else 1)
+    virtual_pilot_max_tons = float(getattr(cfg.model, "virtual_bridge_pilot_max_virtual_tons", 30.0) if cfg and cfg.model else 30.0)
+    virtual_pilot_penalty = float(getattr(cfg.model, "virtual_bridge_pilot_penalty", 1000000.0) if cfg and cfg.model else 1000000.0)
+    endpoint_class_cfg = getattr(cfg.model, "virtual_bridge_pilot_only_when_endpoint_class", None) if cfg and cfg.model else None
+    fail_reason_cfg = getattr(cfg.model, "virtual_bridge_pilot_only_when_dominant_fail", None) if cfg and cfg.model else None
+    virtual_pilot_endpoint_classes = set(endpoint_class_cfg or ["HAS_ENDPOINT_EDGE", "BAND_TOO_NARROW"])
+    virtual_pilot_fail_reasons = set(fail_reason_cfg or ["THICKNESS_RULE_FAIL", "WIDTH_RULE_FAIL", "GROUP_SWITCH_FAIL", "MULTI_RULE_FAIL"])
+    virtual_edges, virtual_tons_by_edge = _build_virtual_reconstruction_edges(transition_pack)
+    diag["virtual_pilot_scheduler_budget"] = int(virtual_pilot_max_blocks)
+    print(
+        f"[APS][VIRTUAL_BRIDGE_PILOT_CONFIG] enabled={bool(virtual_pilot_enabled)}, "
+        f"max_blocks_per_run={int(virtual_pilot_max_blocks)}, "
+        f"max_per_block={int(virtual_pilot_max_per_block)}, "
+        f"max_virtual_tons={float(virtual_pilot_max_tons):.1f}, "
+        f"penalty={float(virtual_pilot_penalty):.1f}"
+    )
 
     frozen_oids = Counter()
     for seg in valid_segments:
@@ -2332,9 +4515,26 @@ def _reconstruct_underfilled_segments(
     new_valid = list(valid_segments)
     remaining_under: list[CampaignSegment] = []
     max_local_id = max([s.campaign_local_id for s in valid_segments + underfilled_segments] or [0])
+    virtual_pilot_tried_blocks: set[tuple[str, int]] = set()
+    virtual_pilot_seen_keys: set[tuple[str, str, str]] = set()
+    virtual_pilot_selected_by_line: Counter = Counter()
+    virtual_pilot_selected_by_bucket: Counter = Counter()
+    virtual_pilot_selected_by_family: Counter = Counter()
+    virtual_pilot_scheduler_selected_blocks: list[dict] = []
+    virtual_pilot_scheduler_skipped_due_to_limit: list[dict] = []
+    virtual_pilot_line_quota = max(2, int(virtual_pilot_max_blocks) // max(1, len(lines)))
+    virtual_pilot_bucket_quota = max(3, int(virtual_pilot_max_blocks) // 3)
+    virtual_pilot_family_quota = {
+        "WIDTH_GROUP": min(5, int(virtual_pilot_max_blocks)),
+        "THICKNESS": min(5, int(virtual_pilot_max_blocks)),
+        "OTHER": max(0, int(virtual_pilot_max_blocks) - 10),
+    }
+    if int(virtual_pilot_max_blocks) > sum(virtual_pilot_family_quota.values()):
+        virtual_pilot_family_quota["OTHER"] += int(virtual_pilot_max_blocks) - sum(virtual_pilot_family_quota.values())
 
     for line in sorted({s.line for s in underfilled_segments}):
         line_under = sorted([s for s in underfilled_segments if s.line == line], key=lambda s: s.campaign_local_id)
+        line_pair_rows_by_key = _build_template_pair_rows_by_key(tpl_df, str(line))
         line_bridge_schema = _print_bridge_schema_samples(tpl_df, str(line))
         line_raw_real_rows = int(line_bridge_schema.get("raw_real_rows", 0) or 0)
         if bool(line_bridge_schema.get("field_name_mismatch", False)):
@@ -2359,15 +4559,21 @@ def _reconstruct_underfilled_segments(
                     continue
                 block = line_under[i : i + block_size]
                 block_orders = [oid for seg in block for oid in seg.order_ids]
+                _print_order_context_lookup_sample(order_specs_by_id, [str(oid) for oid in block_orders[:8]], limit=4)
                 block_tons = sum(float(tons_by_order.get(str(oid), 0.0) or 0.0) for oid in block_orders)
                 block_real_rows = _bridge_rows_for_line(tpl_df, str(line))
+                block_virtual_rows = _virtual_bridge_rows_for_line(tpl_df, str(line))
                 real_bridge_lookup = _build_real_bridge_lookup(block_real_rows)
+                virtual_bridge_lookup = _build_virtual_bridge_lookup(block_virtual_rows)
                 single_point_keys = _block_single_point_boundary_keys(block)
                 base_boundary_keys, base_band_logs = _block_boundary_band_keys(
                     block,
                     left_band_k=left_band_k,
                     right_band_k=right_band_k,
                     max_pairs_per_split=max_band_pairs,
+                    order_context_by_id=order_specs_by_id,
+                    block_id=int(block_id),
+                    rule=cfg.rule if cfg and cfg.rule else None,
                 )
                 adjustment_boundary_keys: list[tuple[str, str, str]] = []
                 adjustment_band_logs: list[dict] = []
@@ -2378,6 +4584,12 @@ def _reconstruct_underfilled_segments(
                 adjustment_hits_total = 0
                 adjustment_only_hits_total = 0
                 adjustment_best_cost: int | None = None
+                endpoint_class = "UNKNOWN_ENDPOINT_MISS"
+                dominant_fail_reason = "UNKNOWN"
+                final_decision_for_census = "NO_DIRECT_OR_BRIDGE_CANDIDATE"
+                ton_rescue_entered_for_census = False
+                ton_rescue_success_for_census = False
+                prefilter_rejected_for_census = False
                 single_match_diag = _count_real_bridge_matches(real_bridge_lookup, set(single_point_keys))
                 base_match_diag = _count_real_bridge_matches(real_bridge_lookup, set(base_boundary_keys))
                 base_band_only_hit = int(base_match_diag.get("matched_rows", 0) or 0) > 0 and int(single_match_diag.get("matched_rows", 0) or 0) <= 0
@@ -2415,109 +4627,168 @@ def _reconstruct_underfilled_segments(
                                 f"[APS][REPAIR_BRIDGE_BAND_HIT] line={line}, block_id={block_id}, split_id={split_id}, "
                                 f"single_point_miss=True, band_hit=True"
                             )
-                for split_id, (left_seg, right_seg) in enumerate(zip(block, block[1:]), start=1):
-                    left_orders = [str(v) for v in left_seg.order_ids]
-                    right_orders = [str(v) for v in right_seg.order_ids]
-                    adjustments = _generate_endpoint_adjustments(
-                        left_orders,
-                        right_orders,
-                        left_trim_max=left_trim_max,
-                        right_trim_max=right_trim_max,
-                        adjustment_limit=adjustment_limit,
-                        enable_left_trim=enable_left_trim,
-                        enable_right_trim=enable_right_trim,
+                endpoint_miss_result = _classify_endpoint_miss(
+                    line=str(line),
+                    block_id=int(block_id),
+                    boundary_keys=base_boundary_keys,
+                    real_bridge_lookup=real_bridge_lookup,
+                    order_context_by_id=order_specs_by_id,
+                    rule=cfg.rule if cfg and cfg.rule else None,
+                )
+                endpoint_class = str(endpoint_miss_result.get("class", "") or "")
+                if endpoint_class == "TEMPLATE_GRAPH_NO_EDGE":
+                    diag["repair_bridge_template_no_edge_count"] += 1
+                elif endpoint_class == "RULE_PREFILTER_ALL_FAIL":
+                    diag["repair_bridge_prefilter_all_fail_count"] += 1
+                elif endpoint_class == "BAND_TOO_NARROW":
+                    diag["repair_bridge_band_too_narrow_count"] += 1
+                endpoint_early_stop = endpoint_class in {"TEMPLATE_GRAPH_NO_EDGE", "RULE_PREFILTER_ALL_FAIL"}
+                if endpoint_early_stop:
+                    diag["repair_bridge_endpoint_early_stop_count"] += 1
+                    print(
+                        f"[APS][REPAIR_BRIDGE_EARLY_STOP] line={line}, block_id={block_id}, "
+                        f"endpoint_class={endpoint_class}, reason={endpoint_class}"
                     )
-                    adjustment_generated_total += int(len(adjustments))
-                    split_adjustment_hits = 0
-                    split_adjustment_pairs = 0
-                    split_best_adjust_cost: int | None = None
-                    base_split_pairs = list(base_band_logs[split_id - 1].get("band_pairs", [])) if 0 <= split_id - 1 < len(base_band_logs) else []
-                    base_split_hit = any(key in real_bridge_lookup for key in base_split_pairs)
-                    for adjustment_id, adjustment in enumerate(adjustments, start=1):
-                        adjusted_left_orders = [str(v) for v in adjustment.get("adjusted_left_orders", [])]
-                        adjusted_right_orders = [str(v) for v in adjustment.get("adjusted_right_orders", [])]
-                        band_pairs, adjusted_left_band, adjusted_right_band = _build_adjustment_band_pairs(
-                            line=str(line),
-                            adjusted_left_orders=adjusted_left_orders,
-                            adjusted_right_orders=adjusted_right_orders,
-                            left_band_k=left_band_k,
-                            right_band_k=right_band_k,
-                            max_pairs_per_split=max_band_pairs,
+                elif endpoint_class == "BAND_TOO_NARROW":
+                    diag["repair_bridge_local_band_retry_count"] += 1
+                    print(
+                        f"[APS][REPAIR_BRIDGE_LOCAL_BAND_RETRY] line={line}, block_id={block_id}, "
+                        f"split_id=ALL, expand_side=right, extra=1"
+                    )
+                if not endpoint_early_stop:
+                    for split_id, (left_seg, right_seg) in enumerate(zip(block, block[1:]), start=1):
+                        left_orders = [str(v) for v in left_seg.order_ids]
+                        right_orders = [str(v) for v in right_seg.order_ids]
+                        adjustments = _generate_endpoint_adjustments(
+                            left_orders,
+                            right_orders,
+                            left_trim_max=left_trim_max,
+                            right_trim_max=right_trim_max,
+                            adjustment_limit=adjustment_limit,
+                            enable_left_trim=enable_left_trim,
+                            enable_right_trim=enable_right_trim,
+                            order_context_by_id=order_specs_by_id,
+                            rule=cfg.rule if cfg and cfg.rule else None,
                         )
-                        left_trim = int(adjustment.get("left_trim", 0) or 0)
-                        right_trim = int(adjustment.get("right_trim", 0) or 0)
-                        adjustment_cost = left_trim + right_trim
-                        matched_pairs = [key for key in band_pairs if key in real_bridge_lookup]
-                        matched_rows_count = sum(len(real_bridge_lookup.get(key, [])) for key in matched_pairs)
-                        adjustment_pairs_tested_total += int(len(band_pairs))
-                        split_adjustment_pairs += int(len(band_pairs))
-                        adjustment_boundary_keys.extend(band_pairs)
-                        frontier_key: tuple[str, str, str] | None = None
-                        if adjusted_left_orders and adjusted_right_orders:
-                            frontier_key = (
-                                str(line),
-                                str(adjusted_left_orders[-1]),
-                                str(adjusted_right_orders[0]),
+                        adjustment_generated_total += int(len(adjustments))
+                        split_adjustment_hits = 0
+                        split_adjustment_pairs = 0
+                        split_best_adjust_cost: int | None = None
+                        base_split_pairs = list(base_band_logs[split_id - 1].get("band_pairs", [])) if 0 <= split_id - 1 < len(base_band_logs) else []
+                        base_split_hit = any(key in real_bridge_lookup for key in base_split_pairs)
+                        for adjustment_id, adjustment in enumerate(adjustments, start=1):
+                            adjusted_left_orders = [str(v) for v in adjustment.get("adjusted_left_orders", [])]
+                            adjusted_right_orders = [str(v) for v in adjustment.get("adjusted_right_orders", [])]
+                            band_pairs, adjusted_left_band, adjusted_right_band, adjusted_left_generation, adjusted_right_generation = _build_adjustment_band_pairs(
+                                line=str(line),
+                                adjusted_left_orders=adjusted_left_orders,
+                                adjusted_right_orders=adjusted_right_orders,
+                                left_band_k=left_band_k,
+                                right_band_k=right_band_k,
+                                max_pairs_per_split=max_band_pairs,
+                                order_context_by_id=order_specs_by_id,
+                                block_id=int(block_id),
+                                split_id=int(split_id),
+                                rule=cfg.rule if cfg and cfg.rule else None,
                             )
-                            frontier_boundary_keys.append(frontier_key)
-                            frontier_contexts.setdefault(frontier_key, []).append(
+                            left_trim = int(adjustment.get("left_trim", 0) or 0)
+                            right_trim = int(adjustment.get("right_trim", 0) or 0)
+                            base_adjustment_cost = left_trim + right_trim
+                            score_pair = (str(adjusted_left_orders[-1]), str(adjusted_right_orders[0])) if adjusted_left_orders and adjusted_right_orders else ("", "")
+                            score_metrics = _quick_pair_rank_metrics(order_specs_by_id, score_pair[0], score_pair[1], rule=cfg.rule if cfg and cfg.rule else None) if score_pair[0] and score_pair[1] else {}
+                            thickness_penalty = float(score_metrics.get("thickness_penalty", 0.0) or 0.0)
+                            width_penalty = float(score_metrics.get("width_penalty", 0.0) or 0.0)
+                            temp_penalty = float(score_metrics.get("temp_penalty", 0.0) or 0.0)
+                            group_penalty = float(score_metrics.get("group_penalty", 0.0) or 0.0)
+                            hard_penalty = float(score_metrics.get("hard_prefilter_fail_penalty", 0.0) or 0.0)
+                            adjustment_cost = int(base_adjustment_cost + round(hard_penalty + thickness_penalty + width_penalty + temp_penalty + group_penalty))
+                            print(
+                                f"[APS][REPAIR_BRIDGE_ADJUST_SCORE] line={line}, block_id={block_id}, "
+                                f"split_id={split_id}, adjustment_id={adjustment_id}, "
+                                f"pair=({score_pair[0]},{score_pair[1]}), base_cost={base_adjustment_cost}, "
+                                f"thickness_penalty={thickness_penalty:.3f}, width_penalty={width_penalty:.3f}, "
+                                f"temp_penalty={temp_penalty:.3f}, group_penalty={group_penalty:.3f}, "
+                                f"final_cost={adjustment_cost}"
+                            )
+                            matched_pairs = [key for key in band_pairs if key in real_bridge_lookup]
+                            matched_rows_count = sum(len(real_bridge_lookup.get(key, [])) for key in matched_pairs)
+                            adjustment_pairs_tested_total += int(len(band_pairs))
+                            split_adjustment_pairs += int(len(band_pairs))
+                            adjustment_boundary_keys.extend(band_pairs)
+                            frontier_key: tuple[str, str, str] | None = None
+                            if adjusted_left_orders and adjusted_right_orders:
+                                frontier_key = (
+                                    str(line),
+                                    str(adjusted_left_orders[-1]),
+                                    str(adjusted_right_orders[0]),
+                                )
+                                frontier_boundary_keys.append(frontier_key)
+                                frontier_contexts.setdefault(frontier_key, []).append(
+                                    {
+                                        "split_id": split_id,
+                                        "adjustment_id": adjustment_id,
+                                        "left_trim": left_trim,
+                                        "right_trim": right_trim,
+                                        "adjusted_left_orders": list(adjusted_left_orders),
+                                        "adjusted_right_orders": list(adjusted_right_orders),
+                                        "actual_left_tail": str(adjusted_left_orders[-1]),
+                                        "actual_right_head": str(adjusted_right_orders[0]),
+                                    }
+                                )
+                            adjustment_band_logs.append(
                                 {
                                     "split_id": split_id,
                                     "adjustment_id": adjustment_id,
                                     "left_trim": left_trim,
                                     "right_trim": right_trim,
-                                    "adjusted_left_orders": list(adjusted_left_orders),
-                                    "adjusted_right_orders": list(adjusted_right_orders),
-                                    "actual_left_tail": str(adjusted_left_orders[-1]),
-                                    "actual_right_head": str(adjusted_right_orders[0]),
+                                    "base_cost": int(base_adjustment_cost),
+                                    "thickness_penalty": float(thickness_penalty),
+                                    "width_penalty": float(width_penalty),
+                                    "temp_penalty": float(temp_penalty),
+                                    "group_penalty": float(group_penalty),
+                                    "final_cost": int(adjustment_cost),
+                                    "left_band": adjusted_left_band,
+                                    "right_band": adjusted_right_band,
+                                    "left_generation_order": list(adjusted_left_generation),
+                                    "right_generation_order": list(adjusted_right_generation),
+                                    "band_pairs": band_pairs,
                                 }
                             )
-                        adjustment_band_logs.append(
-                            {
-                                "split_id": split_id,
-                                "adjustment_id": adjustment_id,
-                                "left_trim": left_trim,
-                                "right_trim": right_trim,
-                                "left_band": adjusted_left_band,
-                                "right_band": adjusted_right_band,
-                                "band_pairs": band_pairs,
-                            }
-                        )
+                            print(
+                                f"[APS][REPAIR_BRIDGE_ADJUST] line={line}, block_id={block_id}, "
+                                f"split_id={split_id}, adjustment_id={adjustment_id}, "
+                                f"left_trim={left_trim}, right_trim={right_trim}"
+                            )
+                            print(
+                                f"[APS][REPAIR_BRIDGE_ADJUST_BAND] line={line}, block_id={block_id}, "
+                                f"split_id={split_id}, adjustment_id={adjustment_id}, "
+                                f"left_band={adjusted_left_band}, right_band={adjusted_right_band}, "
+                                f"band_pairs={band_pairs}"
+                            )
+                            print(
+                                f"[APS][REPAIR_BRIDGE_ADJUST_MATCH] line={line}, block_id={block_id}, "
+                                f"split_id={split_id}, adjustment_id={adjustment_id}, "
+                                f"matched_pairs={matched_pairs}, matched_rows={matched_rows_count}"
+                            )
+                            if matched_rows_count > 0:
+                                adjustment_hits_total += int(matched_rows_count)
+                                split_adjustment_hits += int(matched_rows_count)
+                                adjustment_best_cost = adjustment_cost if adjustment_best_cost is None else min(adjustment_best_cost, adjustment_cost)
+                                split_best_adjust_cost = adjustment_cost if split_best_adjust_cost is None else min(split_best_adjust_cost, adjustment_cost)
+                                if not base_split_hit and adjustment_cost > 0:
+                                    adjustment_only_hits_total += int(matched_rows_count)
+                                    print(
+                                        f"[APS][REPAIR_BRIDGE_ADJUST_HIT] line={line}, block_id={block_id}, "
+                                        f"split_id={split_id}, adjustment_id={adjustment_id}, "
+                                        f"left_trim={left_trim}, right_trim={right_trim}, "
+                                        f"base_hit=False, adjusted_hit=True"
+                                    )
                         print(
-                            f"[APS][REPAIR_BRIDGE_ADJUST] line={line}, block_id={block_id}, "
-                            f"split_id={split_id}, adjustment_id={adjustment_id}, "
-                            f"left_trim={left_trim}, right_trim={right_trim}"
+                            f"[APS][REPAIR_BRIDGE_ADJUST_SUMMARY] line={line}, block_id={block_id}, "
+                            f"split_id={split_id}, adjustments_generated={len(adjustments)}, "
+                            f"pairs_tested={split_adjustment_pairs}, adjustment_hits={split_adjustment_hits}, "
+                            f"best_adjustment_cost={-1 if split_best_adjust_cost is None else int(split_best_adjust_cost)}"
                         )
-                        print(
-                            f"[APS][REPAIR_BRIDGE_ADJUST_BAND] line={line}, block_id={block_id}, "
-                            f"split_id={split_id}, adjustment_id={adjustment_id}, "
-                            f"left_band={adjusted_left_band}, right_band={adjusted_right_band}, "
-                            f"band_pairs={band_pairs}"
-                        )
-                        print(
-                            f"[APS][REPAIR_BRIDGE_ADJUST_MATCH] line={line}, block_id={block_id}, "
-                            f"split_id={split_id}, adjustment_id={adjustment_id}, "
-                            f"matched_pairs={matched_pairs}, matched_rows={matched_rows_count}"
-                        )
-                        if matched_rows_count > 0:
-                            adjustment_hits_total += int(matched_rows_count)
-                            split_adjustment_hits += int(matched_rows_count)
-                            adjustment_best_cost = adjustment_cost if adjustment_best_cost is None else min(adjustment_best_cost, adjustment_cost)
-                            split_best_adjust_cost = adjustment_cost if split_best_adjust_cost is None else min(split_best_adjust_cost, adjustment_cost)
-                            if not base_split_hit and adjustment_cost > 0:
-                                adjustment_only_hits_total += int(matched_rows_count)
-                                print(
-                                    f"[APS][REPAIR_BRIDGE_ADJUST_HIT] line={line}, block_id={block_id}, "
-                                    f"split_id={split_id}, adjustment_id={adjustment_id}, "
-                                    f"left_trim={left_trim}, right_trim={right_trim}, "
-                                    f"base_hit=False, adjusted_hit=True"
-                                )
-                    print(
-                        f"[APS][REPAIR_BRIDGE_ADJUST_SUMMARY] line={line}, block_id={block_id}, "
-                        f"split_id={split_id}, adjustments_generated={len(adjustments)}, "
-                        f"pairs_tested={split_adjustment_pairs}, adjustment_hits={split_adjustment_hits}, "
-                        f"best_adjustment_cost={-1 if split_best_adjust_cost is None else int(split_best_adjust_cost)}"
-                    )
                 boundary_keys = list(dict.fromkeys(base_boundary_keys + adjustment_boundary_keys))
                 frontier_keys = list(dict.fromkeys(frontier_boundary_keys))
                 band_logs = base_band_logs + adjustment_band_logs
@@ -2527,8 +4798,24 @@ def _reconstruct_underfilled_segments(
                 frontier_match_diag = _count_real_bridge_matches(real_bridge_lookup, set(frontier_keys))
                 adjustment_match_diag = _count_real_bridge_matches(real_bridge_lookup, set(adjustment_boundary_keys))
                 band_only_hit = int(base_match_diag.get("matched_rows", 0) or 0) > 0 and int(single_match_diag.get("matched_rows", 0) or 0) <= 0
-                matched_bridge_keys = [key for key in boundary_keys if key in real_bridge_lookup]
-                frontier_matched_keys = [key for key in frontier_keys if key in real_bridge_lookup]
+                matched_bridge_keys = _rank_pair_keys_by_rules(
+                    [key for key in boundary_keys if key in real_bridge_lookup],
+                    order_specs_by_id,
+                    adjustment_cost_by_pair=real_edge_adjustment_cost,
+                    rule=cfg.rule if cfg and cfg.rule else None,
+                )
+                frontier_matched_keys = _rank_pair_keys_by_rules(
+                    [key for key in frontier_keys if key in real_bridge_lookup],
+                    order_specs_by_id,
+                    adjustment_cost_by_pair=real_edge_adjustment_cost,
+                    rule=cfg.rule if cfg and cfg.rule else None,
+                )
+                virtual_frontier_keys = _rank_pair_keys_by_rules(
+                    [key for key in frontier_keys if key in virtual_bridge_lookup],
+                    order_specs_by_id,
+                    adjustment_cost_by_pair=real_edge_adjustment_cost,
+                    rule=cfg.rule if cfg and cfg.rule else None,
+                )
                 bridge_candidate_audit = _repair_bridge_candidate_audit(
                     line=str(line),
                     block_id=int(block_id),
@@ -2538,6 +4825,11 @@ def _reconstruct_underfilled_segments(
                     frontier_contexts=frontier_contexts,
                     direct_edges=direct_edges,
                     real_edges=real_edges,
+                    pair_rows_by_key=line_pair_rows_by_key,
+                    order_specs_by_id=order_specs_by_id,
+                    rule=cfg.rule if cfg and cfg.rule else None,
+                    real_edge_adjustment_cost=real_edge_adjustment_cost,
+                    endpoint_class=endpoint_class,
                     order_tons=tons_by_order,
                     campaign_ton_min=campaign_ton_min,
                     campaign_ton_max=campaign_ton_max,
@@ -2553,7 +4845,13 @@ def _reconstruct_underfilled_segments(
                     "pair_invalid_thickness": 0,
                     "pair_invalid_temp": 0,
                     "pair_invalid_group": 0,
+                    "pair_invalid_context": 0,
                     "pair_invalid_unknown": 0,
+                    "prefilter_fail_thickness": 0,
+                    "rank_pass_thickness": 0,
+                    "rank_fail_thickness": 0,
+                    "prefilter_reject_count": 0,
+                    "pilot_candidates": [],
                     "reject_buckets": Counter(),
                 }
                 print(
@@ -2594,7 +4892,13 @@ def _reconstruct_underfilled_segments(
                 diag["repair_bridge_pair_invalid_thickness"] += int(bridge_candidate_audit.get("pair_invalid_thickness", 0) or 0)
                 diag["repair_bridge_pair_invalid_temp"] += int(bridge_candidate_audit.get("pair_invalid_temp", 0) or 0)
                 diag["repair_bridge_pair_invalid_group"] += int(bridge_candidate_audit.get("pair_invalid_group", 0) or 0)
+                diag["repair_bridge_pair_invalid_context"] += int(bridge_candidate_audit.get("pair_invalid_context", 0) or 0)
                 diag["repair_bridge_pair_invalid_unknown"] += int(bridge_candidate_audit.get("pair_invalid_unknown", 0) or 0)
+                diag["repair_bridge_pair_fail_thickness"] += int(bridge_candidate_audit.get("pair_invalid_thickness", 0) or 0)
+                diag["repair_bridge_prefilter_fail_thickness"] += int(bridge_candidate_audit.get("prefilter_fail_thickness", 0) or 0)
+                diag["repair_bridge_rank_pass_thickness"] += int(bridge_candidate_audit.get("rank_pass_thickness", 0) or 0)
+                diag["repair_bridge_rank_fail_thickness"] += int(bridge_candidate_audit.get("rank_fail_thickness", 0) or 0)
+                diag["repair_bridge_prefilter_reject_count"] += int(bridge_candidate_audit.get("prefilter_reject_count", 0) or 0)
                 diag["repair_bridge_filtered_ton_below_min_current_block"] += int(bridge_candidate_audit.get("filtered_ton_below_min_current_block", 0) or 0)
                 if adjustment_best_cost is not None:
                     old_adjust_cost = int(diag.get("repair_bridge_best_adjustment_cost", -1) or -1)
@@ -2674,6 +4978,24 @@ def _reconstruct_underfilled_segments(
                 if direct_valid:
                     best = (direct_valid, direct_under, direct_diag, "DIRECT", block)
                     best_size = block_size
+                    _record_bridgeability_census_item(
+                        bridgeability_census,
+                        {
+                            "line": str(line),
+                            "block_id": int(block_id),
+                            "block_size": int(block_size),
+                            "orders": int(len(block_orders)),
+                            "tons": float(block_tons),
+                            "endpoint_class": str(endpoint_class),
+                            "dominant_fail_reason": "DIRECT_ONLY_FEASIBLE",
+                            "candidate_count": int(bridge_match_diag.get("matched_rows", 0) or 0),
+                            "frontier_candidate_count": int(frontier_match_diag.get("matched_rows", 0) or 0),
+                            "prefilter_rejected": False,
+                            "ton_rescue_entered": False,
+                            "ton_rescue_success": False,
+                            "final_decision": "DIRECT_IMPROVEMENT_FOUND",
+                        },
+                    )
                     break
                 if allow_real_bridge:
                     real_t0 = perf_counter()
@@ -2744,6 +5066,24 @@ def _reconstruct_underfilled_segments(
                         diag["repair_bridge_candidates_accepted"] += max(1, int(real_diag_report.get("repair_only_real_bridge_candidates_kept", 0) or 0))
                         best = (real_valid, real_under, real_diag, "REAL", block)
                         best_size = block_size
+                        _record_bridgeability_census_item(
+                            bridgeability_census,
+                            {
+                                "line": str(line),
+                                "block_id": int(block_id),
+                                "block_size": int(block_size),
+                                "orders": int(len(block_orders)),
+                                "tons": float(block_tons),
+                                "endpoint_class": str(endpoint_class),
+                                "dominant_fail_reason": "REAL_BRIDGE_FEASIBLE",
+                                "candidate_count": int(bridge_match_diag.get("matched_rows", 0) or 0),
+                                "frontier_candidate_count": int(frontier_match_diag.get("matched_rows", 0) or 0),
+                                "prefilter_rejected": bool(int(bridge_candidate_audit.get("prefilter_reject_count", 0) or 0) > 0),
+                                "ton_rescue_entered": False,
+                                "ton_rescue_success": False,
+                                "final_decision": "REAL_IMPROVEMENT_FOUND",
+                            },
+                        )
                         break
                     ton_rescue_candidates = list(bridge_candidate_audit.get("ton_rescue_candidates", []) or [])
                     rescue_result = None
@@ -2789,6 +5129,7 @@ def _reconstruct_underfilled_segments(
                             )
                             failed_after_min = 0
                             last_tons: float | None = None
+                            current_block_segment_ids = [int(seg.campaign_local_id) for seg in block]
                             for window_id, window in enumerate(rescue_windows, start=1):
                                 combined_tons = float(window.get("tons", 0.0) or 0.0)
                                 if last_tons is not None and abs(combined_tons - last_tons) <= 1e-6:
@@ -2796,6 +5137,7 @@ def _reconstruct_underfilled_segments(
                                 last_tons = combined_tons
                                 expansion_block = list(window.get("block", []))
                                 diag["repair_bridge_ton_rescue_windows_tested"] += 1
+                                diag["repair_bridge_ton_rescue_extract_attempts"] += 1
                                 result = _try_bridge_ton_rescue_recut(
                                     candidate=rescue_candidate,
                                     line=str(line),
@@ -2803,6 +5145,7 @@ def _reconstruct_underfilled_segments(
                                     window_id=int(window_id),
                                     direction=str(window.get("direction", "")),
                                     expansion_block=expansion_block,
+                                    current_block_segment_ids=current_block_segment_ids,
                                     direct_edges=direct_edges,
                                     real_edge=rescue_edge,
                                     order_tons=tons_by_order,
@@ -2812,9 +5155,25 @@ def _reconstruct_underfilled_segments(
                                     max_real_bridge_per_segment=max_real,
                                     bridge_cost_penalty=bridge_penalty,
                                     next_local_id=max_local_id,
+                                    ton_rescue_max_left_expand=ton_rescue_max_left_expand,
+                                    ton_rescue_max_right_expand=ton_rescue_max_right_expand,
+                                    ton_rescue_max_windows_per_candidate=ton_rescue_max_extract_windows,
+                                    pair_rows_by_key=line_pair_rows_by_key,
+                                    order_specs_by_id=order_specs_by_id,
+                                    rule=cfg.rule if cfg and cfg.rule else None,
                                     real_edge_distance=real_edge_distance,
                                     real_edge_adjustment_cost=real_edge_adjustment_cost,
                                 )
+                                result_diag = dict(result.get("diag", {}) or {})
+                                fail_counts = dict(result_diag.get("fail_counts_by_reason", {}) or {})
+                                diag["repair_bridge_ton_rescue_pair_fail_width"] += int(fail_counts.get("WIDTH_RULE_FAIL", 0) or 0)
+                                diag["repair_bridge_ton_rescue_pair_fail_thickness"] += int(fail_counts.get("THICKNESS_RULE_FAIL", 0) or 0)
+                                diag["repair_bridge_ton_rescue_pair_fail_temp"] += int(fail_counts.get("TEMP_OVERLAP_FAIL", 0) or 0)
+                                diag["repair_bridge_ton_rescue_pair_fail_group"] += int(fail_counts.get("GROUP_SWITCH_FAIL", 0) or 0)
+                                diag["repair_bridge_ton_rescue_pair_fail_context"] += int(fail_counts.get("ORDER_CONTEXT_MISSING", 0) or 0)
+                                diag["repair_bridge_ton_rescue_pair_fail_template"] += int(fail_counts.get("TEMPLATE_KEY_MISSING", 0) or 0)
+                                diag["repair_bridge_ton_rescue_pair_fail_multi"] += int(fail_counts.get("MULTI_RULE_FAIL", 0) or 0)
+                                diag["repair_bridge_ton_rescue_pair_fail_unknown"] += int(fail_counts.get("UNKNOWN_PAIR_INVALID", 0) or 0)
                                 if result.get("success"):
                                     rescue_result = result
                                     best = (
@@ -2829,6 +5188,13 @@ def _reconstruct_underfilled_segments(
                                     diag["repair_bridge_ton_rescue_valid_delta"] += int(result.get("valid_delta", 0) or 0)
                                     diag["repair_bridge_ton_rescue_underfilled_delta"] += int(result.get("underfilled_delta", 0) or 0)
                                     diag["repair_bridge_ton_rescue_scheduled_orders_delta"] += int(result.get("scheduled_orders_delta", 0) or 0)
+                                    if bool(result_diag.get("extract_success", False)):
+                                        diag["repair_bridge_ton_rescue_extract_success"] += 1
+                                    if bool(result_diag.get("partial_success", False)):
+                                        diag["repair_bridge_ton_rescue_partial_success"] += 1
+                                    if bool(result_diag.get("full_success", False)):
+                                        diag["repair_bridge_ton_rescue_full_success"] += 1
+                                    diag["repair_bridge_ton_rescue_residual_underfilled_count"] += int(result_diag.get("residual_underfilled_count", 0) or 0)
                                     diag["repair_bridge_candidates_accepted"] += 1
                                     break
                                 reject_reason = str(result.get("reject_reason", "") or "")
@@ -2851,38 +5217,85 @@ def _reconstruct_underfilled_segments(
                             if rescue_result is not None:
                                 break
                         if rescue_result is not None:
+                            _record_bridgeability_census_item(
+                                bridgeability_census,
+                                {
+                                    "line": str(line),
+                                    "block_id": int(block_id),
+                                    "block_size": int(block_size),
+                                    "orders": int(len(block_orders)),
+                                    "tons": float(block_tons),
+                                    "endpoint_class": str(endpoint_class),
+                                    "dominant_fail_reason": "TON_RESCUE_SUCCESS",
+                                    "candidate_count": int(bridge_match_diag.get("matched_rows", 0) or 0),
+                                    "frontier_candidate_count": int(frontier_match_diag.get("matched_rows", 0) or 0),
+                                    "prefilter_rejected": bool(int(bridge_candidate_audit.get("prefilter_reject_count", 0) or 0) > 0),
+                                    "ton_rescue_entered": True,
+                                    "ton_rescue_success": True,
+                                    "final_decision": "TON_RESCUE_IMPROVEMENT_FOUND",
+                                },
+                            )
                             break
+                    ton_subtotal = (
+                        int(bridge_candidate_audit.get("filtered_ton_below_min_current_block", 0) or 0)
+                        + int(rescue_reason_counts.get("TON_RESCUE_IMPOSSIBLE", 0) or 0)
+                        + int(rescue_reason_counts.get("TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION", 0) or 0)
+                        + int(rescue_reason_counts.get("TON_SPLIT_NOT_FOUND", 0) or 0)
+                        + int(rescue_reason_counts.get("TON_RESCUE_NO_GAIN", 0) or 0)
+                        + int(rescue_reason_counts.get("TON_ABOVE_MAX_AFTER_EXPANSION", 0) or 0)
+                    )
+                    filtered_ton_invalid_effective = int(real_diag_report.get("repair_only_real_bridge_filtered_ton_invalid", 0) or 0)
+                    if ton_subtotal <= 0:
+                        filtered_ton_invalid_effective = 0
                     reason_buckets = {
+                        "ORDER_CONTEXT_MISSING": int(bridge_candidate_audit.get("pair_invalid_context", 0) or 0),
                         "TEMPLATE_PAIR_INVALID": int(real_diag_report.get("repair_only_real_bridge_filtered_pair_invalid", 0) or 0),
                         "TON_BELOW_MIN_CURRENT_BLOCK": int(bridge_candidate_audit.get("filtered_ton_below_min_current_block", 0) or 0),
                         "TON_RESCUE_IMPOSSIBLE": int(rescue_reason_counts.get("TON_RESCUE_IMPOSSIBLE", 0) or 0),
                         "TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION": int(rescue_reason_counts.get("TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION", 0) or 0),
                         "TON_SPLIT_NOT_FOUND": int(rescue_reason_counts.get("TON_SPLIT_NOT_FOUND", 0) or 0),
                         "TON_RESCUE_NO_GAIN": int(rescue_reason_counts.get("TON_RESCUE_NO_GAIN", 0) or 0),
-                        "TON_WINDOW_INVALID": int(real_diag_report.get("repair_only_real_bridge_filtered_ton_invalid", 0) or 0),
+                        "TON_WINDOW_INVALID": int(filtered_ton_invalid_effective),
                         "SCORE_WORSE_THAN_DIRECT_ONLY": int(real_diag_report.get("repair_only_real_bridge_filtered_score_worse", 0) or 0),
                         "BRIDGE_LIMIT_EXCEEDED": int(real_diag_report.get("repair_only_real_bridge_filtered_bridge_limit_exceeded", 0) or 0),
                         "BLOCK_MEMBERSHIP_MISMATCH": int(bridge_match_diag.get("block_membership_mismatch", 0) or 0),
                         "LINE_MISMATCH": int(bridge_match_diag.get("line_mismatch", 0) or 0),
                     }
-                    dominant_bucket = max(reason_buckets.items(), key=lambda kv: kv[1])[0] if any(v > 0 for v in reason_buckets.values()) else "NO_DIRECT_OR_BRIDGE_CANDIDATE"
+                    has_reject_bucket = any(v > 0 for v in reason_buckets.values())
+                    dominant_bucket = max(reason_buckets.items(), key=lambda kv: kv[1])[0] if has_reject_bucket else "NO_DIRECT_OR_BRIDGE_CANDIDATE"
                     reason = dominant_bucket
-                    if line_raw_real_rows <= 0:
+                    if not has_reject_bucket and line_raw_real_rows <= 0:
                         reason = "PACK_HAS_NO_REAL_BRIDGE_ROWS"
-                    elif bool(line_bridge_schema.get("field_name_mismatch", False)):
+                    elif not has_reject_bucket and bool(line_bridge_schema.get("field_name_mismatch", False)):
                         reason = "BRIDGE_FIELD_NAME_MISMATCH"
-                    elif int(bridge_match_diag.get("matched_rows", 0) or 0) <= 0:
-                        reason = "ENDPOINT_KEY_MISMATCH"
+                    elif not has_reject_bucket and int(bridge_match_diag.get("matched_rows", 0) or 0) <= 0:
+                        reason = endpoint_class if endpoint_class and endpoint_class != "HAS_ENDPOINT_EDGE" else "ENDPOINT_KEY_MISMATCH"
+                    dominant_fail_reason = _dominant_bridge_fail_reason(bridge_candidate_audit, reason_buckets)
+                    print(
+                        f"[APS][REPAIR_BRIDGE_RULE_AUDIT] line={line}, block_id={block_id}, "
+                        f"thickness_fail_count={int(bridge_candidate_audit.get('pair_invalid_thickness', 0) or 0)}, "
+                        f"width_fail_count={int(bridge_candidate_audit.get('pair_invalid_width', 0) or 0)}, "
+                        f"temp_fail_count={int(bridge_candidate_audit.get('pair_invalid_temp', 0) or 0)}, "
+                        f"group_fail_count={int(bridge_candidate_audit.get('pair_invalid_group', 0) or 0)}, "
+                        f"template_no_edge_count={1 if endpoint_class == 'TEMPLATE_GRAPH_NO_EDGE' else 0}, "
+                        f"prefilter_all_fail_count={1 if endpoint_class == 'RULE_PREFILTER_ALL_FAIL' else 0}, "
+                        f"band_too_narrow_count={1 if endpoint_class == 'BAND_TOO_NARROW' else 0}, "
+                        f"thickness_prefilter_fail_count={int(bridge_candidate_audit.get('prefilter_fail_thickness', 0) or 0)}, "
+                        f"thickness_rank_pass_count={int(bridge_candidate_audit.get('rank_pass_thickness', 0) or 0)}, "
+                        f"thickness_rank_fail_count={int(bridge_candidate_audit.get('rank_fail_thickness', 0) or 0)}"
+                    )
                     print(
                         f"[APS][REPAIR_BRIDGE_REASON_AUDIT] line={line}, block_id={block_id}, "
                         f"filtered_pair_invalid={int(real_diag_report.get('repair_only_real_bridge_filtered_pair_invalid', 0) or 0)}, "
-                        f"filtered_ton_invalid={int(real_diag_report.get('repair_only_real_bridge_filtered_ton_invalid', 0) or 0)}, "
+                        f"filtered_context_missing={int(bridge_candidate_audit.get('pair_invalid_context', 0) or 0)}, "
+                        f"filtered_ton_invalid={int(filtered_ton_invalid_effective)}, "
                         f"filtered_ton_below_min_current_block={int(bridge_candidate_audit.get('filtered_ton_below_min_current_block', 0) or 0)}, "
                         f"filtered_ton_rescue_impossible={int(rescue_reason_counts.get('TON_RESCUE_IMPOSSIBLE', 0) or 0)}, "
                         f"filtered_ton_below_min_even_after_neighbor_expansion={int(rescue_reason_counts.get('TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION', 0) or 0)}, "
                         f"filtered_ton_split_not_found={int(diag.get('repair_bridge_filtered_ton_split_not_found', 0) or 0)}, "
                         f"filtered_ton_rescue_no_gain={int(diag.get('repair_bridge_filtered_ton_rescue_no_gain', 0) or 0)}, "
                         f"filtered_score_worse={int(real_diag_report.get('repair_only_real_bridge_filtered_score_worse', 0) or 0)}, "
+                        f"dominant_bucket={dominant_bucket}, "
                         f"final_reason={reason}"
                     )
                     if reason != dominant_bucket and int(bridge_match_diag.get("matched_rows", 0) or 0) > 0:
@@ -2891,14 +5304,388 @@ def _reconstruct_underfilled_segments(
                             f"final_reason={reason}, dominant_bucket={dominant_bucket}"
                         )
                     print(f"[APS][REPAIR_BRIDGE_NO_HIT] line={line}, block_id={block_id}, reason={reason}")
+                    _record_bridgeability_census_item(
+                        bridgeability_census,
+                        {
+                            "line": str(line),
+                            "block_id": int(block_id),
+                            "block_size": int(block_size),
+                            "orders": int(len(block_orders)),
+                            "tons": float(block_tons),
+                            "endpoint_class": str(endpoint_class),
+                            "dominant_fail_reason": str(dominant_fail_reason),
+                            "candidate_count": int(bridge_match_diag.get("matched_rows", 0) or 0),
+                            "frontier_candidate_count": int(frontier_match_diag.get("matched_rows", 0) or 0),
+                            "prefilter_rejected": bool(int(bridge_candidate_audit.get("prefilter_reject_count", 0) or 0) > 0),
+                            "ton_rescue_entered": bool(len(ton_rescue_candidates) > 0 and int(frontier_match_diag.get("matched_rows", 0) or 0) > 0),
+                            "ton_rescue_success": False,
+                            "final_decision": str(reason),
+                        },
+                    )
+                    pilot_target_candidates = _select_virtual_pilot_targets(
+                        list(bridge_candidate_audit.get("pilot_candidates", []) or []),
+                        endpoint_class=str(endpoint_class),
+                        max_targets=1,
+                        allowed_fail_reasons=virtual_pilot_fail_reasons,
+                        campaign_ton_min=float(campaign_ton_min),
+                    )
+                    small_hard_reject, small_block_penalty = _small_block_pilot_score(
+                        int(len(block_orders)),
+                        float(block_tons),
+                        float(campaign_ton_min),
+                    )
+                    if float(small_block_penalty) > 0.0 and not bool(small_hard_reject):
+                        diag["virtual_pilot_small_block_soft_penalty_count"] += 1
+                    print(
+                        f"[APS][VIRTUAL_BRIDGE_SMALL_BLOCK_SCORE] line={line}, block_id={block_id}, "
+                        f"block_orders={int(len(block_orders))}, block_tons={float(block_tons):.1f}, "
+                        f"small_block_penalty={float(small_block_penalty):.3f}, hard_reject={bool(small_hard_reject)}"
+                    )
+                    eligible_result = _evaluate_virtual_pilot_eligibility(
+                        endpoint_class=str(endpoint_class),
+                        candidate_count=int(bridge_match_diag.get("matched_rows", 0) or 0),
+                        frontier_candidate_count=int(frontier_match_diag.get("matched_rows", 0) or 0),
+                        pilot_candidates=pilot_target_candidates,
+                        block_orders_count=int(len(block_orders)),
+                        block_tons=float(block_tons),
+                        campaign_ton_min=float(campaign_ton_min),
+                        attempts_so_far=int(diag.get("virtual_pilot_attempt_count", 0) or 0),
+                        max_attempts=int(virtual_pilot_max_blocks),
+                        allowed_endpoint_classes=virtual_pilot_endpoint_classes,
+                        already_tried=(str(line), int(block_id)) in virtual_pilot_tried_blocks,
+                        applied_improvement_count=int(diag.get("underfilled_reconstruction_improvement_applied_count", 0) or 0),
+                        enabled=bool(virtual_pilot_enabled),
+                    )
+                    pilot_eligible = bool(eligible_result.final_eligible)
+                    reject_by_reason = diag.setdefault("virtual_pilot_reject_by_reason_count", {})
+                    if bool(eligible_result.structural_eligible):
+                        diag["virtual_pilot_structural_eligible_block_count"] += 1
+                    if bool(eligible_result.runtime_enabled):
+                        diag["virtual_pilot_runtime_enabled_block_count"] += 1
+                    if bool(eligible_result.final_eligible):
+                        diag["virtual_pilot_final_eligible_block_count"] += 1
+                        diag["virtual_pilot_eligible_block_count"] += 1
+                    else:
+                        diag["virtual_pilot_skipped_block_count"] += 1
+                        reject_by_reason[str(eligible_result.reject_reason)] = int(reject_by_reason.get(str(eligible_result.reject_reason), 0) or 0) + 1
+                        if str(eligible_result.reject_reason) == "PILOT_DISABLED":
+                            diag["virtual_pilot_skipped_due_to_disabled_count"] += 1
+                        elif str(eligible_result.reject_reason) == "RUN_LIMIT_REACHED":
+                            diag["virtual_pilot_skipped_due_to_limit_count"] += 1
+                        elif str(eligible_result.reject_reason) in {"NO_PILOTABLE_CANDIDATE", "DOMINANT_FAIL_NOT_PILOTABLE"}:
+                            diag["virtual_pilot_skipped_due_to_no_pilotable_candidate_count"] += 1
+                    print(
+                        f"[APS][VIRTUAL_BRIDGE_PILOT_ELIGIBLE] line={line}, block_id={block_id}, "
+                        f"endpoint_class={endpoint_class}, dominant_fail_reason={dominant_fail_reason}, "
+                        f"eligible={bool(pilot_eligible)}"
+                    )
+                    print(
+                        f"[APS][VIRTUAL_BRIDGE_PILOT_ELIGIBILITY_AUDIT] line={line}, block_id={block_id}, "
+                        f"endpoint_class={endpoint_class}, "
+                        f"candidate_count={int(bridge_match_diag.get('matched_rows', 0) or 0)}, "
+                        f"frontier_candidate_count={int(frontier_match_diag.get('matched_rows', 0) or 0)}, "
+                        f"structural_eligible={bool(eligible_result.structural_eligible)}, "
+                        f"runtime_enabled={bool(eligible_result.runtime_enabled)}, "
+                        f"final_eligible={bool(eligible_result.final_eligible)}, "
+                        f"reject_reason={eligible_result.reject_reason}, "
+                        f"reject_details={eligible_result.reject_details}"
+                    )
+                    print(
+                        f"[APS][VIRTUAL_BRIDGE_PILOT_TARGETS] line={line}, block_id={block_id}, "
+                        f"selected_candidates={[{'candidate_id': c.get('candidate_id'), 'pair': c.get('pair'), 'fail_reasons': c.get('fail_reasons'), 'rank_score': c.get('rank_score')} for c in pilot_target_candidates]}, "
+                        f"reason={eligible_result.reject_reason}"
+                    )
+                    if pilot_eligible:
+                        target = dict(pilot_target_candidates[0])
+                        scheduler_family = _virtual_pilot_failure_family(target)
+                        scheduler_bucket = scheduler_family
+                        pilot_key = _virtual_pilot_key(str(line), target)
+                        if pilot_key in virtual_pilot_seen_keys:
+                            diag["virtual_pilot_skipped_block_count"] += 1
+                            diag["virtual_pilot_duplicate_candidate_skipped_count"] += 1
+                            reject_by_reason = diag.setdefault("virtual_pilot_reject_by_reason_count", {})
+                            reject_by_reason["DUPLICATE_PILOT_KEY"] = int(reject_by_reason.get("DUPLICATE_PILOT_KEY", 0) or 0) + 1
+                            print(
+                                f"[APS][VIRTUAL_BRIDGE_PILOT_DEDUP] candidate_id={target.get('candidate_id')}, "
+                                f"pilot_key={pilot_key}, kept=False, reason=DUPLICATE_PILOT_KEY"
+                            )
+                            continue
+                        virtual_pilot_seen_keys.add(pilot_key)
+                        diag["virtual_pilot_dedup_group_count"] += 1
+                        print(
+                            f"[APS][VIRTUAL_BRIDGE_PILOT_DEDUP] candidate_id={target.get('candidate_id')}, "
+                            f"pilot_key={pilot_key}, kept=True, reason=BEST_OF_DUP_GROUP"
+                        )
+                        scheduler_allowed = (
+                            int(diag.get("virtual_pilot_attempt_count", 0) or 0) < int(virtual_pilot_max_blocks)
+                            and int(virtual_pilot_selected_by_line[str(line)]) < int(virtual_pilot_line_quota)
+                            and int(virtual_pilot_selected_by_bucket[scheduler_bucket]) < int(virtual_pilot_family_quota.get(scheduler_bucket, virtual_pilot_bucket_quota))
+                        )
+                        if not scheduler_allowed:
+                            diag["virtual_pilot_skipped_block_count"] += 1
+                            diag["virtual_pilot_skipped_due_to_limit_count"] += 1
+                            skip_item = {
+                                "line": str(line),
+                                "block_id": int(block_id),
+                                "bucket": scheduler_bucket,
+                                "family": scheduler_family,
+                                "pilot_key": pilot_key,
+                                "line_selected": int(virtual_pilot_selected_by_line[str(line)]),
+                                "bucket_selected": int(virtual_pilot_selected_by_bucket[scheduler_bucket]),
+                                "bucket_quota": int(virtual_pilot_family_quota.get(scheduler_bucket, virtual_pilot_bucket_quota)),
+                            }
+                            virtual_pilot_scheduler_skipped_due_to_limit.append(skip_item)
+                            reject_by_reason = diag.setdefault("virtual_pilot_reject_by_reason_count", {})
+                            reject_by_reason["RUN_LIMIT_REACHED"] = int(reject_by_reason.get("RUN_LIMIT_REACHED", 0) or 0) + 1
+                            continue
+                        diag["virtual_pilot_selected_block_count"] += 1
+                        diag["virtual_pilot_selected_unique_pilot_key_count"] += 1
+                        virtual_pilot_tried_blocks.add((str(line), int(block_id)))
+                        virtual_pilot_selected_by_line[str(line)] += 1
+                        virtual_pilot_selected_by_bucket[scheduler_bucket] += 1
+                        virtual_pilot_selected_by_family[scheduler_family] += 1
+                        selected_by_family_diag = diag.setdefault("virtual_pilot_selected_by_family_count", {})
+                        selected_by_family_diag[scheduler_family] = int(selected_by_family_diag.get(scheduler_family, 0) or 0) + 1
+                        pair = (str(target.get("from_order_id", "")), str(target.get("to_order_id", "")))
+                        pilot_virtual_edges = {pair}
+                        pilot_virtual_tons = max(float(virtual_tons_by_edge.get(pair, 0.0) or 0.0), 0.0)
+                        virtual_pilot_scheduler_selected_blocks.append(
+                            {"line": str(line), "block_id": int(block_id), "bucket": scheduler_bucket, "family": scheduler_family, "pilot_key": pilot_key, "pair": pair}
+                        )
+                        left_meta = _order_pair_meta(order_specs_by_id, pair[0])
+                        right_meta = _order_pair_meta(order_specs_by_id, pair[1])
+                        print(
+                            f"[APS][VIRTUAL_BRIDGE_SPEC_FAMILY] candidate_id={target.get('candidate_id')}, "
+                            f"family={scheduler_family}"
+                        )
+                        specs, spec_diag, selected_spec = _enumerate_virtual_pilot_specs(
+                            left_meta,
+                            right_meta,
+                            cfg.rule if cfg and cfg.rule else None,
+                            max_specs=5,
+                            family=scheduler_family,
+                        )
+                        diag["virtual_pilot_spec_enum_total"] += int(spec_diag.get("specs_tested", 0) or 0)
+                        diag["virtual_pilot_spec_enum_both_valid_count"] += int(spec_diag.get("both_valid_count", 0) or 0)
+                        print(
+                            f"[APS][VIRTUAL_BRIDGE_SPEC_ENUM] line={line}, block_id={block_id}, "
+                            f"candidate_id={target.get('candidate_id')}, family={scheduler_family}, "
+                            f"specs_tested={int(spec_diag.get('specs_tested', 0) or 0)}, "
+                            f"left_valid_count={int(spec_diag.get('left_valid_count', 0) or 0)}, "
+                            f"right_valid_count={int(spec_diag.get('right_valid_count', 0) or 0)}, "
+                            f"both_valid_count={int(spec_diag.get('both_valid_count', 0) or 0)}"
+                        )
+                        family_prefilter_ok, family_prefilter_reason = _virtual_pilot_family_prefilter(scheduler_family, selected_spec)
+                        print(
+                            f"[APS][VIRTUAL_BRIDGE_FAMILY_PREFILTER] candidate_id={target.get('candidate_id')}, "
+                            f"family={scheduler_family}, pass={bool(family_prefilter_ok)}, reason={family_prefilter_reason}"
+                        )
+                        if selected_spec is None:
+                            diag["virtual_pilot_reject_count"] += 1
+                            fail_stage, fail_reason, fail_details = _classify_virtual_transition_spec_failure(specs, spec_diag)
+                            _record_virtual_pilot_fail_stage(
+                                diag,
+                                line=str(line),
+                                block_id=int(block_id),
+                                candidate_id=str(target.get("candidate_id", "")),
+                                fail_stage=str(fail_stage),
+                                reason=str(fail_reason),
+                                details=dict(fail_details),
+                            )
+                            print(
+                                f"[APS][VIRTUAL_BRIDGE_PILOT_FAIL] line={line}, block_id={block_id}, "
+                                f"reason={fail_reason}"
+                            )
+                            continue
+                        if not family_prefilter_ok:
+                            diag["virtual_pilot_reject_count"] += 1
+                            diag["virtual_pilot_family_prefilter_fail_count"] += 1
+                            _record_virtual_pilot_fail_stage(
+                                diag,
+                                line=str(line),
+                                block_id=int(block_id),
+                                candidate_id=str(target.get("candidate_id", "")),
+                                fail_stage="FAMILY_PREFILTER_FAIL",
+                                reason=str(family_prefilter_reason),
+                                details={"family": scheduler_family, "selected_spec": selected_spec},
+                            )
+                            print(
+                                f"[APS][VIRTUAL_BRIDGE_PILOT_FAIL] line={line}, block_id={block_id}, "
+                                f"reason=FAMILY_PREFILTER_FAIL"
+                            )
+                            continue
+                        print(
+                            f"[APS][VIRTUAL_BRIDGE_SPEC_SELECTED] line={line}, block_id={block_id}, "
+                            f"candidate_id={target.get('candidate_id')}, family={scheduler_family}, "
+                            f"selected_spec={{width:{selected_spec.get('width')}, thickness:{selected_spec.get('thickness')}, "
+                            f"temp_low:{selected_spec.get('temp_low')}, temp_high:{selected_spec.get('temp_high')}}}"
+                        )
+                        diag["virtual_pilot_attempt_count"] += 1
+                        if scheduler_family == "WIDTH_GROUP":
+                            diag["virtual_pilot_width_group_family_attempt_count"] += 1
+                        elif scheduler_family == "THICKNESS":
+                            diag["virtual_pilot_thickness_family_attempt_count"] += 1
+                        print(
+                            f"[APS][VIRTUAL_BRIDGE_PILOT_ATTEMPT] line={line}, block_id={block_id}, "
+                            f"candidate_id={target.get('candidate_id')}, pair=({pair[0]},{pair[1]}), "
+                            f"virtual_tons={pilot_virtual_tons:.1f}, "
+                            f"penalty={float(virtual_pilot_penalty):.1f}"
+                        )
+                        if pilot_virtual_tons > float(virtual_pilot_max_tons) + 1e-6:
+                            diag["virtual_pilot_reject_count"] += 1
+                            _record_virtual_pilot_fail_stage(
+                                diag,
+                                line=str(line),
+                                block_id=int(block_id),
+                                candidate_id=str(target.get("candidate_id", "")),
+                                fail_stage="VIRTUAL_TON_BELOW_MIN",
+                                reason="VIRTUAL_TON_LIMIT_EXCEEDED",
+                                details={"virtual_tons": float(pilot_virtual_tons), "max_virtual_tons": float(virtual_pilot_max_tons)},
+                            )
+                            print(
+                                f"[APS][VIRTUAL_BRIDGE_PILOT_FAIL] line={line}, block_id={block_id}, "
+                                f"reason=VIRTUAL_TON_LIMIT_EXCEEDED"
+                            )
+                        else:
+                            pilot_valid, pilot_under, pilot_diag = _solve_underfilled_reconstruction_block(
+                                block,
+                                direct_edges=direct_edges,
+                                real_edges={(str(k[1]), str(k[2])) for k in frontier_matched_keys},
+                                order_tons=tons_by_order,
+                                campaign_ton_min=campaign_ton_min,
+                                campaign_ton_max=campaign_ton_max,
+                                campaign_ton_target=ton_target,
+                                allow_real_bridge=True,
+                                allow_virtual_bridge=True,
+                                max_real_bridge_per_segment=max_real,
+                                bridge_cost_penalty=bridge_penalty,
+                                next_local_id=max_local_id,
+                                real_edge_distance=real_edge_distance,
+                                real_edge_adjustment_cost=real_edge_adjustment_cost,
+                                virtual_edges=pilot_virtual_edges,
+                                max_virtual_bridge_per_segment=int(virtual_pilot_max_per_block),
+                                virtual_tons_by_edge=virtual_tons_by_edge,
+                                virtual_bridge_penalty=float(virtual_pilot_penalty),
+                            )
+                            pilot_virtual_used = int(pilot_diag.get("virtual_bridge_used", 0) or 0)
+                            pilot_virtual_used_tons = float(pilot_diag.get("virtual_bridge_tons", 0.0) or 0.0)
+                            if (not pilot_valid) and int(pilot_diag.get("candidate_cutpoints_ton_window_valid", 0) or 0) <= 0:
+                                diag["virtual_pilot_ton_fill_attempt_count"] += 1
+                                fill_block = list(block)
+                                fill_success = False
+                                fill_after_tons = float(block_tons)
+                                if i + block_size < len(line_under):
+                                    fill_block = list(block) + [line_under[i + block_size]]
+                                    fill_after_tons = sum(
+                                        float(tons_by_order.get(str(oid), 0.0) or 0.0)
+                                        for seg in fill_block
+                                        for oid in seg.order_ids
+                                    )
+                                    fill_valid, fill_under, fill_diag = _solve_underfilled_reconstruction_block(
+                                        fill_block,
+                                        direct_edges=direct_edges,
+                                        real_edges={(str(k[1]), str(k[2])) for k in frontier_matched_keys},
+                                        order_tons=tons_by_order,
+                                        campaign_ton_min=campaign_ton_min,
+                                        campaign_ton_max=campaign_ton_max,
+                                        campaign_ton_target=ton_target,
+                                        allow_real_bridge=True,
+                                        allow_virtual_bridge=True,
+                                        max_real_bridge_per_segment=max_real,
+                                        bridge_cost_penalty=bridge_penalty,
+                                        next_local_id=max_local_id,
+                                        real_edge_distance=real_edge_distance,
+                                        real_edge_adjustment_cost=real_edge_adjustment_cost,
+                                        virtual_edges=pilot_virtual_edges,
+                                        max_virtual_bridge_per_segment=int(virtual_pilot_max_per_block),
+                                        virtual_tons_by_edge=virtual_tons_by_edge,
+                                        virtual_bridge_penalty=float(virtual_pilot_penalty),
+                                    )
+                                    fill_virtual_used = int(fill_diag.get("virtual_bridge_used", 0) or 0)
+                                    fill_virtual_tons = float(fill_diag.get("virtual_bridge_tons", 0.0) or 0.0)
+                                    fill_success = bool(
+                                        fill_valid
+                                        and 0 < fill_virtual_used <= int(virtual_pilot_max_per_block)
+                                        and fill_virtual_tons <= float(virtual_pilot_max_tons) + 1e-6
+                                    )
+                                    if fill_success:
+                                        diag["virtual_pilot_ton_fill_success_count"] += 1
+                                        pilot_valid, pilot_under, pilot_diag = fill_valid, fill_under, fill_diag
+                                        pilot_virtual_used = fill_virtual_used
+                                        pilot_virtual_used_tons = fill_virtual_tons
+                                        block = fill_block
+                                        block_size += 1
+                                print(
+                                    f"[APS][VIRTUAL_BRIDGE_TON_FILL_ATTEMPT] line={line}, block_id={block_id}, "
+                                    f"candidate_id={target.get('candidate_id')}, mode=EXPAND_ONE_NEIGHBOR, "
+                                    f"before_tons={float(block_tons):.1f}, after_tons={float(fill_after_tons):.1f}, "
+                                    f"success={bool(fill_success)}"
+                                )
+                            if pilot_valid and 0 < pilot_virtual_used <= int(virtual_pilot_max_per_block) and pilot_virtual_used_tons <= float(virtual_pilot_max_tons) + 1e-6:
+                                diag["virtual_pilot_success_count"] += 1
+                                pilot_diag["candidate_id"] = str(target.get("candidate_id", ""))
+                                best = (pilot_valid, pilot_under, pilot_diag, "VIRTUAL_PILOT", block)
+                                best_size = block_size
+                                print(
+                                    f"[APS][VIRTUAL_BRIDGE_PILOT_SUCCESS] line={line}, block_id={block_id}, "
+                                    f"salvaged_segments={len(pilot_valid)}, "
+                                    f"salvaged_orders={int(pilot_diag.get('salvaged_orders', 0) or 0)}"
+                                )
+                                break
+                            diag["virtual_pilot_reject_count"] += 1
+                            if pilot_virtual_used > int(virtual_pilot_max_per_block):
+                                fail_stage, fail_reason, fail_details = "VIRTUAL_TRANSITION_INVALID", "VIRTUAL_BRIDGE_LIMIT_EXCEEDED", {"virtual_used": int(pilot_virtual_used), "max_virtual_used": int(virtual_pilot_max_per_block)}
+                            elif pilot_virtual_used_tons > float(virtual_pilot_max_tons) + 1e-6:
+                                fail_stage, fail_reason, fail_details = "VIRTUAL_TON_BELOW_MIN", "VIRTUAL_TON_LIMIT_EXCEEDED", {"virtual_tons": float(pilot_virtual_used_tons), "max_virtual_tons": float(virtual_pilot_max_tons)}
+                            else:
+                                fail_stage, fail_reason, fail_details = _classify_virtual_pilot_recut_fail(pilot_diag, pilot_virtual_used, pilot_virtual_used_tons)
+                            _record_virtual_pilot_fail_stage(
+                                diag,
+                                line=str(line),
+                                block_id=int(block_id),
+                                candidate_id=str(target.get("candidate_id", "")),
+                                fail_stage=str(fail_stage),
+                                reason=str(fail_reason),
+                                details=dict(fail_details),
+                            )
+                            print(
+                                f"[APS][VIRTUAL_BRIDGE_PILOT_FAIL] line={line}, block_id={block_id}, "
+                                f"reason={fail_reason}"
+                            )
             if best is None:
                 diag["underfilled_reconstruction_blocks_skipped"] += 1
+                valid_before = 0
+                valid_after = 0
+                underfilled_before = len(block) if "block" in locals() else 1
+                underfilled_after = underfilled_before
+                scheduled_orders_before = 0
+                scheduled_orders_after = 0
+                gain = False
                 print(
-                    f"[APS][UNDERFILLED_RECON_NO_GAIN] line={line}, block_id={block_id}, "
-                    f"valid_before={len(valid_segments)}, valid_after={len(new_valid)}, "
-                    f"underfilled_before={len(underfilled_segments)}, underfilled_after={len(remaining_under) + 1}"
+                    f"[APS][UNDERFILLED_RECON_GAIN_AUDIT] line={line}, block_id={block_id}, "
+                    f"valid_before={valid_before}, valid_after={valid_after}, "
+                    f"underfilled_before={underfilled_before}, underfilled_after={underfilled_after}, "
+                    f"scheduled_orders_before={scheduled_orders_before}, "
+                    f"scheduled_orders_after={scheduled_orders_after}, gain={bool(gain)}"
                 )
-                print(f"[APS][UNDERFILLED_RECON_SKIP] line={line}, block_id={block_id}, reason=NO_DIRECT_OR_BRIDGE_CANDIDATE")
+                if not gain:
+                    print(
+                        f"[APS][UNDERFILLED_RECON_NO_GAIN] line={line}, block_id={block_id}, "
+                        f"valid_before={valid_before}, valid_after={valid_after}, "
+                        f"underfilled_before={underfilled_before}, underfilled_after={underfilled_after}"
+                    )
+                final_decision = "PREFILTER_ALL_FAIL" if endpoint_class == "RULE_PREFILTER_ALL_FAIL" else "NO_DIRECT_OR_BRIDGE_CANDIDATE"
+                _update_bridgeability_census_final_decision(
+                    bridgeability_census,
+                    line=str(line),
+                    block_id=int(block_id),
+                    final_decision=final_decision,
+                )
+                print(
+                    f"[APS][UNDERFILLED_RECON_FINAL_DECISION] line={line}, block_id={block_id}, "
+                    f"gain={bool(gain)}, final_decision={final_decision}, reason={final_decision}"
+                )
+                print(f"[APS][UNDERFILLED_RECON_SKIP] line={line}, block_id={block_id}, reason={final_decision}")
                 remaining_under.append(line_under[i])
                 i += 1
                 continue
@@ -2919,9 +5706,173 @@ def _reconstruct_underfilled_segments(
                 i += best_size
                 continue
 
+            valid_before = len(valid_segments)
             consumed_prev_ids = {int(seg.campaign_local_id) for seg in block if int(seg.campaign_local_id) < int(line_under[i].campaign_local_id)}
-            if consumed_prev_ids:
-                remaining_under = [seg for seg in remaining_under if int(seg.campaign_local_id) not in consumed_prev_ids]
+            remaining_after_apply = [seg for seg in remaining_under if int(seg.campaign_local_id) not in consumed_prev_ids] if consumed_prev_ids else list(remaining_under)
+            valid_after = len(new_valid) + len(valid_out)
+            underfilled_before = len(underfilled_segments)
+            underfilled_after = len(remaining_after_apply) + len(under_out)
+            scheduled_orders_before = sum(len(seg.order_ids) for seg in valid_segments)
+            scheduled_orders_after = sum(len(seg.order_ids) for seg in new_valid + valid_out)
+            recon_gain = (
+                int(valid_after) > int(valid_before)
+                or int(underfilled_after) < int(underfilled_before)
+                or int(scheduled_orders_after) > int(scheduled_orders_before)
+            )
+            apply_real_edges = real_edges if mode in {"REAL", "VIRTUAL_PILOT"} else set()
+            apply_virtual_edges = virtual_edges if mode == "VIRTUAL_PILOT" else set()
+            pair_integrity_ok, pair_integrity_reason = _segments_pair_integrity_ok(
+                list(valid_out),
+                direct_edges=direct_edges,
+                real_edges=apply_real_edges,
+                max_real_bridge_per_segment=max_real,
+                virtual_edges=apply_virtual_edges,
+                max_virtual_bridge_per_segment=int(virtual_pilot_max_per_block) if mode == "VIRTUAL_PILOT" else 0,
+            )
+            virtual_pilot_limit_ok = True
+            if mode == "VIRTUAL_PILOT":
+                virtual_pilot_limit_ok = (
+                    int(block_diag.get("virtual_bridge_used", 0) or 0) <= int(virtual_pilot_max_per_block)
+                    and float(block_diag.get("virtual_bridge_tons", 0.0) or 0.0) <= float(virtual_pilot_max_tons) + 1e-6
+                )
+            apply_ok, apply_reject_reason = _should_apply_improvement(
+                valid_before=valid_before,
+                valid_after=valid_after,
+                underfilled_before=underfilled_before,
+                underfilled_after=underfilled_after,
+                scheduled_orders_before=scheduled_orders_before,
+                scheduled_orders_after=scheduled_orders_after,
+                integrity_ok=True,
+                pair_integrity_ok=pair_integrity_ok,
+            )
+            if not pair_integrity_ok and apply_reject_reason in {"", "PAIR_INTEGRITY_FAIL"}:
+                apply_reject_reason = pair_integrity_reason or "PAIR_INTEGRITY_FAIL"
+            if apply_ok and not virtual_pilot_limit_ok:
+                apply_ok = False
+                apply_reject_reason = "VIRTUAL_PILOT_LIMIT_FAIL"
+            if mode == "VIRTUAL_PILOT":
+                virtual_apply_ok, virtual_apply_reject = _should_apply_virtual_pilot(
+                    gain=bool(recon_gain),
+                    multiplicity_ok=True,
+                    pair_integrity_ok=bool(pair_integrity_ok),
+                    virtual_used=int(block_diag.get("virtual_bridge_used", 0) or 0),
+                    max_virtual_used=int(virtual_pilot_max_per_block),
+                    virtual_tons=float(block_diag.get("virtual_bridge_tons", 0.0) or 0.0),
+                    max_virtual_tons=float(virtual_pilot_max_tons),
+                )
+                if not virtual_apply_ok:
+                    apply_ok = False
+                    apply_reject_reason = virtual_apply_reject
+            print(
+                f"[APS][UNDERFILLED_RECON_GAIN_AUDIT] line={line}, block_id={block_id}, "
+                f"valid_before={valid_before}, valid_after={valid_after}, "
+                f"underfilled_before={underfilled_before}, underfilled_after={underfilled_after}, "
+                f"scheduled_orders_before={scheduled_orders_before}, "
+                f"scheduled_orders_after={scheduled_orders_after}, gain={bool(recon_gain)}"
+            )
+            print(
+                f"[APS][UNDERFILLED_RECON_APPLY_CHECK] line={line}, block_id={block_id}, "
+                f"valid_before={valid_before}, valid_after={valid_after}, "
+                f"underfilled_before={underfilled_before}, underfilled_after={underfilled_after}, "
+                f"scheduled_orders_before={scheduled_orders_before}, scheduled_orders_after={scheduled_orders_after}, "
+                f"integrity_ok={bool(pair_integrity_ok)}, apply={bool(apply_ok)}, reject_reason={apply_reject_reason}"
+            )
+            if mode == "VIRTUAL_PILOT":
+                print(
+                    f"[APS][VIRTUAL_BRIDGE_PILOT_APPLY_CHECK] line={line}, block_id={block_id}, "
+                    f"gain={bool(recon_gain)}, integrity_ok={bool(pair_integrity_ok and virtual_pilot_limit_ok)}, "
+                    f"apply={bool(apply_ok)}, reject_reason={apply_reject_reason}"
+                )
+            conservative_apply = False
+            conservative_reject_reason = ""
+            if not apply_ok and bool(recon_gain):
+                diag["conservative_apply_attempt_count"] += 1
+                template_ok = bool(pair_integrity_ok)
+                hard_violation_delta = 0 if template_ok else 1
+                conservative_apply = (
+                    int(valid_after) >= int(valid_before)
+                    and (
+                        int(underfilled_after) < int(underfilled_before)
+                        or int(scheduled_orders_after) > int(scheduled_orders_before)
+                    )
+                    and bool(pair_integrity_ok)
+                    and template_ok
+                    and int(hard_violation_delta) <= 0
+                )
+                if not conservative_apply:
+                    diag["conservative_apply_reject_count"] += 1
+                    conservative_reject_reason = "PAIR_INTEGRITY_FAIL" if not pair_integrity_ok else "NO_CONSERVATIVE_GAIN"
+                else:
+                    diag["conservative_apply_success_count"] += 1
+                    apply_ok = True
+                    apply_reject_reason = ""
+                print(
+                    f"[APS][UNDERFILLED_RECON_CONSERVATIVE_APPLY_CHECK] line={line}, block_id={block_id}, "
+                    f"gain={bool(recon_gain)}, integrity_ok={bool(pair_integrity_ok)}, "
+                    f"template_ok={bool(template_ok)}, hard_violation_delta={int(hard_violation_delta)}, "
+                    f"apply={bool(conservative_apply)}, reject_reason={conservative_reject_reason}"
+                )
+                if conservative_apply:
+                    print(
+                        f"[APS][UNDERFILLED_RECON_CONSERVATIVE_APPLY] line={line}, block_id={block_id}, "
+                        f"applied=True, salvaged_segments={len(valid_out)}, "
+                        f"salvaged_orders={int(block_diag.get('salvaged_orders', 0))}"
+                    )
+            if not apply_ok:
+                diag["underfilled_reconstruction_apply_reject_count"] += 1
+                if mode == "VIRTUAL_PILOT":
+                    diag["virtual_pilot_reject_count"] += 1
+                    _record_virtual_pilot_fail_stage(
+                        diag,
+                        line=str(line),
+                        block_id=int(block_id),
+                        candidate_id=str(block_diag.get("candidate_id", "")),
+                        fail_stage="VIRTUAL_APPLY_GATE_REJECT",
+                        reason=str(apply_reject_reason or "VIRTUAL_APPLY_GATE_REJECT"),
+                        details={
+                            "gain": bool(recon_gain),
+                            "pair_integrity_ok": bool(pair_integrity_ok),
+                            "virtual_pilot_limit_ok": bool(virtual_pilot_limit_ok),
+                        },
+                    )
+                if recon_gain:
+                    diag["underfilled_reconstruction_improvement_recorded_count"] += 1
+                final_decision = "IMPROVEMENT_RECORDED_BUT_NOT_APPLIED" if recon_gain else "NO_GAIN"
+                if mode != "VIRTUAL_PILOT":
+                    _update_bridgeability_census_final_decision(
+                        bridgeability_census,
+                        line=str(line),
+                        block_id=int(block_id),
+                        final_decision=final_decision,
+                    )
+                print(
+                    f"[APS][UNDERFILLED_RECON_FINAL_DECISION] line={line}, block_id={block_id}, "
+                    f"gain={bool(recon_gain)}, final_decision={final_decision}, "
+                    f"reason={apply_reject_reason}"
+                )
+                remaining_under.extend(block)
+                i += best_size
+                continue
+            diag["underfilled_reconstruction_improvement_applied_count"] += 1
+            if mode == "VIRTUAL_PILOT":
+                diag["virtual_pilot_apply_count"] += 1
+            if mode != "VIRTUAL_PILOT":
+                _update_bridgeability_census_final_decision(
+                    bridgeability_census,
+                    line=str(line),
+                    block_id=int(block_id),
+                    final_decision="IMPROVEMENT_APPLIED",
+                )
+            print(
+                f"[APS][UNDERFILLED_RECON_FINAL_DECISION] line={line}, block_id={block_id}, "
+                f"gain={bool(recon_gain)}, final_decision=IMPROVEMENT_APPLIED, reason=GAIN_ACCEPTED"
+            )
+            print(
+                f"[APS][UNDERFILLED_RECON_APPLY] line={line}, block_id={block_id}, "
+                f"applied=True, salvaged_segments={len(valid_out)}, "
+                f"salvaged_orders={int(block_diag.get('salvaged_orders', 0))}"
+            )
+            remaining_under = remaining_after_apply
             max_local_id += len(valid_out) + len(under_out)
             new_valid.extend(valid_out)
             remaining_under.extend(under_out)
@@ -2961,8 +5912,47 @@ def _reconstruct_underfilled_segments(
     diag["underfilled_reconstruction_underfilled_after"] = int(len(remaining_under))
     diag["underfilled_reconstruction_seconds"] = round(perf_counter() - t0, 6)
     diag["reconstruction_seconds"] = diag["underfilled_reconstruction_seconds"]
+    census_dict = bridgeability_census.to_dict()
+    suggestion = _suggest_next_phase_from_census(census_dict)
+    diag["bridgeability_census"] = census_dict
+    diag["bridgeability_census_items"] = list(census_dict.get("items", []))
+    diag["bridgeability_route_suggestion"] = str(suggestion.get("suggestion", "CONTINUE_REAL_BRIDGE_ONLY"))
+    diag["virtual_pilot_selected_by_bucket_count"] = dict(virtual_pilot_selected_by_bucket)
+    diag["virtual_pilot_selected_by_family_count"] = dict(virtual_pilot_selected_by_family)
+    diag["virtual_pilot_scheduler_selected_blocks"] = list(virtual_pilot_scheduler_selected_blocks)
+    diag["virtual_pilot_scheduler_skipped_due_to_limit"] = list(virtual_pilot_scheduler_skipped_due_to_limit)
     if int(diag.get("repair_only_real_bridge_attempts", 0) or 0) <= 0:
         diag["repair_only_real_bridge_not_entered_reason"] = "DIRECT_ONLY_OR_NO_BRIDGE_STAGE"
+    print(
+        f"[APS][VIRTUAL_BRIDGE_PILOT_SCHEDULER] total_budget={int(virtual_pilot_max_blocks)}, "
+        f"bucket_quota={dict(virtual_pilot_family_quota)}, "
+        f"selected_by_bucket={dict(virtual_pilot_selected_by_bucket)}, "
+        f"selected_blocks={list(virtual_pilot_scheduler_selected_blocks)}, "
+        f"skipped_due_to_limit={list(virtual_pilot_scheduler_skipped_due_to_limit)}"
+    )
+    print(
+        f"[APS][BRIDGEABILITY_CENSUS] total_blocks={int(census_dict.get('total_blocks', 0) or 0)}, "
+        f"has_endpoint_edge_count={int(census_dict.get('has_endpoint_edge_count', 0) or 0)}, "
+        f"template_graph_no_edge_count={int(census_dict.get('template_graph_no_edge_count', 0) or 0)}, "
+        f"rule_prefilter_all_fail_count={int(census_dict.get('rule_prefilter_all_fail_count', 0) or 0)}, "
+        f"band_too_narrow_count={int(census_dict.get('band_too_narrow_count', 0) or 0)}, "
+        f"prefilter_rejected_block_count={int(census_dict.get('prefilter_rejected_block_count', 0) or 0)}, "
+        f"candidate_pool_empty_count={int(census_dict.get('candidate_pool_empty_count', 0) or 0)}, "
+        f"candidate_pool_nonempty_count={int(census_dict.get('candidate_pool_nonempty_count', 0) or 0)}, "
+        f"ton_rescue_entered_count={int(census_dict.get('ton_rescue_entered_count', 0) or 0)}, "
+        f"ton_rescue_success_count={int(census_dict.get('ton_rescue_success_count', 0) or 0)}, "
+        f"improvement_recorded_count={int(census_dict.get('improvement_recorded_count', 0) or 0)}, "
+        f"improvement_applied_count={int(census_dict.get('improvement_applied_count', 0) or 0)}, "
+        f"thickness_fail_dominant_count={int(census_dict.get('thickness_fail_dominant_count', 0) or 0)}, "
+        f"width_fail_dominant_count={int(census_dict.get('width_fail_dominant_count', 0) or 0)}, "
+        f"temp_fail_dominant_count={int(census_dict.get('temp_fail_dominant_count', 0) or 0)}, "
+        f"group_fail_dominant_count={int(census_dict.get('group_fail_dominant_count', 0) or 0)}, "
+        f"multi_fail_dominant_count={int(census_dict.get('multi_fail_dominant_count', 0) or 0)}"
+    )
+    print(
+        f"[APS][BRIDGEABILITY_ROUTE_SUGGESTION] suggestion={diag['bridgeability_route_suggestion']}, "
+        f"reasons={list(suggestion.get('reasons', []))}"
+    )
     print(
         f"[APS][RECON_GAIN] valid_before={len(valid_segments)}, valid_after={len(new_valid)}, "
         f"underfilled_before={len(underfilled_segments)}, underfilled_after={len(remaining_under)}"
@@ -2972,13 +5962,94 @@ def _reconstruct_underfilled_segments(
         f"repair_bridge_real={float(diag['repair_bridge_real_seconds']):.3f}"
     )
     print(
+        f"[APS][VIRTUAL_BRIDGE_PILOT_SUMMARY] "
+        f"scheduler_budget={int(diag.get('virtual_pilot_scheduler_budget', 0) or 0)}, "
+        f"selected_by_bucket_count={dict(diag.get('virtual_pilot_selected_by_bucket_count', {}) or {})}, "
+        f"dedup_group_count={int(diag.get('virtual_pilot_dedup_group_count', 0) or 0)}, "
+        f"duplicate_candidate_skipped_count={int(diag.get('virtual_pilot_duplicate_candidate_skipped_count', 0) or 0)}, "
+        f"selected_unique_pilot_key_count={int(diag.get('virtual_pilot_selected_unique_pilot_key_count', 0) or 0)}, "
+        f"selected_by_family_count={dict(diag.get('virtual_pilot_selected_by_family_count', {}) or {})}, "
+        f"family_prefilter_fail_count={int(diag.get('virtual_pilot_family_prefilter_fail_count', 0) or 0)}, "
+        f"width_group_family_attempt_count={int(diag.get('virtual_pilot_width_group_family_attempt_count', 0) or 0)}, "
+        f"thickness_family_attempt_count={int(diag.get('virtual_pilot_thickness_family_attempt_count', 0) or 0)}, "
+        f"structural_eligible_block_count={int(diag.get('virtual_pilot_structural_eligible_block_count', 0) or 0)}, "
+        f"runtime_enabled_block_count={int(diag.get('virtual_pilot_runtime_enabled_block_count', 0) or 0)}, "
+        f"final_eligible_block_count={int(diag.get('virtual_pilot_final_eligible_block_count', 0) or 0)}, "
+        f"eligible_block_count={int(diag.get('virtual_pilot_eligible_block_count', 0) or 0)}, "
+        f"selected_block_count={int(diag.get('virtual_pilot_selected_block_count', 0) or 0)}, "
+        f"attempt_count={int(diag.get('virtual_pilot_attempt_count', 0) or 0)}, "
+        f"success_count={int(diag.get('virtual_pilot_success_count', 0) or 0)}, "
+        f"apply_count={int(diag.get('virtual_pilot_apply_count', 0) or 0)}, "
+        f"reject_count={int(diag.get('virtual_pilot_reject_count', 0) or 0)}, "
+        f"skipped_count={int(diag.get('virtual_pilot_skipped_block_count', 0) or 0)}, "
+        f"skipped_due_to_disabled_count={int(diag.get('virtual_pilot_skipped_due_to_disabled_count', 0) or 0)}, "
+        f"skipped_due_to_limit_count={int(diag.get('virtual_pilot_skipped_due_to_limit_count', 0) or 0)}, "
+        f"skipped_due_to_no_pilotable_candidate_count={int(diag.get('virtual_pilot_skipped_due_to_no_pilotable_candidate_count', 0) or 0)}, "
+        f"small_block_soft_penalty_count={int(diag.get('virtual_pilot_small_block_soft_penalty_count', 0) or 0)}, "
+        f"spec_enum_total={int(diag.get('virtual_pilot_spec_enum_total', 0) or 0)}, "
+        f"spec_enum_both_valid_count={int(diag.get('virtual_pilot_spec_enum_both_valid_count', 0) or 0)}, "
+        f"ton_fill_attempt_count={int(diag.get('virtual_pilot_ton_fill_attempt_count', 0) or 0)}, "
+        f"ton_fill_success_count={int(diag.get('virtual_pilot_ton_fill_success_count', 0) or 0)}, "
+        f"fail_stage_count={dict(diag.get('virtual_pilot_fail_stage_count', {}) or {})}, "
+        f"reject_by_reason={dict(diag.get('virtual_pilot_reject_by_reason_count', {}) or {})}"
+    )
+    print(
         f"[APS][UNDERFILLED_RECON_SUMMARY] attempts={int(diag.get('underfilled_reconstruction_attempts', 0))}, "
         f"success={int(diag.get('underfilled_reconstruction_success', 0))}, "
         f"blocks_tested={int(diag.get('underfilled_reconstruction_blocks_tested', 0))}, "
         f"valid_delta={int(diag.get('underfilled_reconstruction_valid_delta', 0))}, "
         f"underfilled_delta={int(diag.get('underfilled_reconstruction_underfilled_delta', 0))}, "
         f"salvaged_segments={int(diag.get('underfilled_reconstruction_segments_salvaged', 0))}, "
-        f"salvaged_orders={int(diag.get('underfilled_reconstruction_orders_salvaged', 0))}"
+        f"salvaged_orders={int(diag.get('underfilled_reconstruction_orders_salvaged', 0))}, "
+        f"ton_rescue_extract_success={int(diag.get('repair_bridge_ton_rescue_extract_success', 0))}, "
+        f"ton_rescue_partial_success={int(diag.get('repair_bridge_ton_rescue_partial_success', 0))}, "
+        f"ton_rescue_pair_fail_width={int(diag.get('repair_bridge_ton_rescue_pair_fail_width', 0))}, "
+        f"ton_rescue_pair_fail_thickness={int(diag.get('repair_bridge_ton_rescue_pair_fail_thickness', 0))}, "
+        f"ton_rescue_pair_fail_temp={int(diag.get('repair_bridge_ton_rescue_pair_fail_temp', 0))}, "
+        f"ton_rescue_pair_fail_group={int(diag.get('repair_bridge_ton_rescue_pair_fail_group', 0))}, "
+        f"ton_rescue_pair_fail_context={int(diag.get('repair_bridge_ton_rescue_pair_fail_context', 0))}, "
+        f"ton_rescue_pair_fail_template={int(diag.get('repair_bridge_ton_rescue_pair_fail_template', 0))}, "
+        f"ton_rescue_pair_fail_multi={int(diag.get('repair_bridge_ton_rescue_pair_fail_multi', 0))}, "
+        f"ton_rescue_pair_fail_unknown={int(diag.get('repair_bridge_ton_rescue_pair_fail_unknown', 0))}, "
+        f"prefilter_reject_count={int(diag.get('repair_bridge_prefilter_reject_count', 0))}, "
+        f"endpoint_early_stop_count={int(diag.get('repair_bridge_endpoint_early_stop_count', 0))}, "
+        f"local_band_retry_count={int(diag.get('repair_bridge_local_band_retry_count', 0))}, "
+        f"improvement_recorded_count={int(diag.get('underfilled_reconstruction_improvement_recorded_count', 0))}, "
+        f"improvement_applied_count={int(diag.get('underfilled_reconstruction_improvement_applied_count', 0))}, "
+        f"apply_reject_count={int(diag.get('underfilled_reconstruction_apply_reject_count', 0))}, "
+        f"bridgeability_route_suggestion={str(diag.get('bridgeability_route_suggestion', ''))}, "
+        f"virtual_pilot_attempt_count={int(diag.get('virtual_pilot_attempt_count', 0) or 0)}, "
+        f"virtual_pilot_success_count={int(diag.get('virtual_pilot_success_count', 0) or 0)}, "
+        f"virtual_pilot_apply_count={int(diag.get('virtual_pilot_apply_count', 0) or 0)}, "
+        f"virtual_pilot_reject_count={int(diag.get('virtual_pilot_reject_count', 0) or 0)}, "
+        f"virtual_pilot_eligible_block_count={int(diag.get('virtual_pilot_eligible_block_count', 0) or 0)}, "
+        f"virtual_pilot_structural_eligible_block_count={int(diag.get('virtual_pilot_structural_eligible_block_count', 0) or 0)}, "
+        f"virtual_pilot_runtime_enabled_block_count={int(diag.get('virtual_pilot_runtime_enabled_block_count', 0) or 0)}, "
+        f"virtual_pilot_final_eligible_block_count={int(diag.get('virtual_pilot_final_eligible_block_count', 0) or 0)}, "
+        f"virtual_pilot_selected_block_count={int(diag.get('virtual_pilot_selected_block_count', 0) or 0)}, "
+        f"virtual_pilot_skipped_block_count={int(diag.get('virtual_pilot_skipped_block_count', 0) or 0)}, "
+        f"virtual_pilot_skipped_due_to_disabled_count={int(diag.get('virtual_pilot_skipped_due_to_disabled_count', 0) or 0)}, "
+        f"virtual_pilot_skipped_due_to_limit_count={int(diag.get('virtual_pilot_skipped_due_to_limit_count', 0) or 0)}, "
+        f"virtual_pilot_skipped_due_to_no_pilotable_candidate_count={int(diag.get('virtual_pilot_skipped_due_to_no_pilotable_candidate_count', 0) or 0)}, "
+        f"virtual_pilot_small_block_soft_penalty_count={int(diag.get('virtual_pilot_small_block_soft_penalty_count', 0) or 0)}, "
+        f"virtual_pilot_fail_stage_count={dict(diag.get('virtual_pilot_fail_stage_count', {}) or {})}, "
+        f"virtual_pilot_scheduler_budget={int(diag.get('virtual_pilot_scheduler_budget', 0) or 0)}, "
+        f"virtual_pilot_selected_by_bucket_count={dict(diag.get('virtual_pilot_selected_by_bucket_count', {}) or {})}, "
+        f"virtual_pilot_dedup_group_count={int(diag.get('virtual_pilot_dedup_group_count', 0) or 0)}, "
+        f"virtual_pilot_duplicate_candidate_skipped_count={int(diag.get('virtual_pilot_duplicate_candidate_skipped_count', 0) or 0)}, "
+        f"virtual_pilot_selected_unique_pilot_key_count={int(diag.get('virtual_pilot_selected_unique_pilot_key_count', 0) or 0)}, "
+        f"virtual_pilot_selected_by_family_count={dict(diag.get('virtual_pilot_selected_by_family_count', {}) or {})}, "
+        f"virtual_pilot_family_prefilter_fail_count={int(diag.get('virtual_pilot_family_prefilter_fail_count', 0) or 0)}, "
+        f"virtual_pilot_width_group_family_attempt_count={int(diag.get('virtual_pilot_width_group_family_attempt_count', 0) or 0)}, "
+        f"virtual_pilot_thickness_family_attempt_count={int(diag.get('virtual_pilot_thickness_family_attempt_count', 0) or 0)}, "
+        f"virtual_pilot_spec_enum_total={int(diag.get('virtual_pilot_spec_enum_total', 0) or 0)}, "
+        f"virtual_pilot_spec_enum_both_valid_count={int(diag.get('virtual_pilot_spec_enum_both_valid_count', 0) or 0)}, "
+        f"virtual_pilot_ton_fill_attempt_count={int(diag.get('virtual_pilot_ton_fill_attempt_count', 0) or 0)}, "
+        f"virtual_pilot_ton_fill_success_count={int(diag.get('virtual_pilot_ton_fill_success_count', 0) or 0)}, "
+        f"virtual_pilot_reject_by_reason_count={dict(diag.get('virtual_pilot_reject_by_reason_count', {}) or {})}, "
+        f"conservative_apply_attempt_count={int(diag.get('conservative_apply_attempt_count', 0) or 0)}, "
+        f"conservative_apply_success_count={int(diag.get('conservative_apply_success_count', 0) or 0)}, "
+        f"conservative_apply_reject_count={int(diag.get('conservative_apply_reject_count', 0) or 0)}"
     )
     diagnostics.update(diag)
     return new_valid, remaining_under, diag

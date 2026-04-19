@@ -619,6 +619,43 @@ class ColdRollingPipeline:
             "repair_bridge_filtered_ton_split_not_found": int(em.get("repair_bridge_filtered_ton_split_not_found", 0) or 0),
             "repair_bridge_filtered_ton_rescue_no_gain": int(em.get("repair_bridge_filtered_ton_rescue_no_gain", 0) or 0),
             "repair_bridge_filtered_ton_rescue_impossible": int(em.get("repair_bridge_filtered_ton_rescue_impossible", 0) or 0),
+            "bridgeability_route_suggestion": str(em.get("bridgeability_route_suggestion", "")),
+            "bridgeability_census": em.get("bridgeability_census", {}),
+            "bridgeability_census_items": em.get("bridgeability_census_items", []),
+            "virtual_pilot_attempt_count": int(em.get("virtual_pilot_attempt_count", 0) or 0),
+            "virtual_pilot_success_count": int(em.get("virtual_pilot_success_count", 0) or 0),
+            "virtual_pilot_apply_count": int(em.get("virtual_pilot_apply_count", 0) or 0),
+            "virtual_pilot_reject_count": int(em.get("virtual_pilot_reject_count", 0) or 0),
+            "virtual_pilot_eligible_block_count": int(em.get("virtual_pilot_eligible_block_count", 0) or 0),
+            "virtual_pilot_structural_eligible_block_count": int(em.get("virtual_pilot_structural_eligible_block_count", 0) or 0),
+            "virtual_pilot_runtime_enabled_block_count": int(em.get("virtual_pilot_runtime_enabled_block_count", 0) or 0),
+            "virtual_pilot_final_eligible_block_count": int(em.get("virtual_pilot_final_eligible_block_count", 0) or 0),
+            "virtual_pilot_selected_block_count": int(em.get("virtual_pilot_selected_block_count", 0) or 0),
+            "virtual_pilot_skipped_block_count": int(em.get("virtual_pilot_skipped_block_count", 0) or 0),
+            "virtual_pilot_skipped_due_to_disabled_count": int(em.get("virtual_pilot_skipped_due_to_disabled_count", 0) or 0),
+            "virtual_pilot_skipped_due_to_limit_count": int(em.get("virtual_pilot_skipped_due_to_limit_count", 0) or 0),
+            "virtual_pilot_skipped_due_to_no_pilotable_candidate_count": int(em.get("virtual_pilot_skipped_due_to_no_pilotable_candidate_count", 0) or 0),
+            "virtual_pilot_reject_by_reason_count": em.get("virtual_pilot_reject_by_reason_count", {}),
+            "virtual_pilot_small_block_soft_penalty_count": int(em.get("virtual_pilot_small_block_soft_penalty_count", 0) or 0),
+            "virtual_pilot_fail_stage_count": em.get("virtual_pilot_fail_stage_count", {}),
+            "virtual_pilot_scheduler_budget": int(em.get("virtual_pilot_scheduler_budget", 0) or 0),
+            "virtual_pilot_selected_by_bucket_count": em.get("virtual_pilot_selected_by_bucket_count", {}),
+            "virtual_pilot_scheduler_selected_blocks": em.get("virtual_pilot_scheduler_selected_blocks", []),
+            "virtual_pilot_scheduler_skipped_due_to_limit": em.get("virtual_pilot_scheduler_skipped_due_to_limit", []),
+            "virtual_pilot_spec_enum_total": int(em.get("virtual_pilot_spec_enum_total", 0) or 0),
+            "virtual_pilot_spec_enum_both_valid_count": int(em.get("virtual_pilot_spec_enum_both_valid_count", 0) or 0),
+            "virtual_pilot_ton_fill_attempt_count": int(em.get("virtual_pilot_ton_fill_attempt_count", 0) or 0),
+            "virtual_pilot_ton_fill_success_count": int(em.get("virtual_pilot_ton_fill_success_count", 0) or 0),
+            "virtual_pilot_dedup_group_count": int(em.get("virtual_pilot_dedup_group_count", 0) or 0),
+            "virtual_pilot_duplicate_candidate_skipped_count": int(em.get("virtual_pilot_duplicate_candidate_skipped_count", 0) or 0),
+            "virtual_pilot_selected_unique_pilot_key_count": int(em.get("virtual_pilot_selected_unique_pilot_key_count", 0) or 0),
+            "virtual_pilot_selected_by_family_count": em.get("virtual_pilot_selected_by_family_count", {}),
+            "virtual_pilot_family_prefilter_fail_count": int(em.get("virtual_pilot_family_prefilter_fail_count", 0) or 0),
+            "virtual_pilot_width_group_family_attempt_count": int(em.get("virtual_pilot_width_group_family_attempt_count", 0) or 0),
+            "virtual_pilot_thickness_family_attempt_count": int(em.get("virtual_pilot_thickness_family_attempt_count", 0) or 0),
+            "conservative_apply_attempt_count": int(em.get("conservative_apply_attempt_count", 0) or 0),
+            "conservative_apply_success_count": int(em.get("conservative_apply_success_count", 0) or 0),
+            "conservative_apply_reject_count": int(em.get("conservative_apply_reject_count", 0) or 0),
             "repair_only_real_bridge_used_segments": int(em.get("repair_only_real_bridge_used_segments", 0) or 0),
             "repair_only_real_bridge_used_orders": int(em.get("repair_only_real_bridge_used_orders", 0) or 0),
             "repair_only_real_bridge_not_entered_reason": str(em.get("repair_only_real_bridge_not_entered_reason", "")),
@@ -1443,6 +1480,50 @@ class ColdRollingPipeline:
                 "repair_bridge_filtered_ton_split_not_found",
                 "repair_bridge_filtered_ton_rescue_no_gain",
                 "repair_bridge_filtered_ton_rescue_impossible",
+                "repair_bridge_ton_rescue_pair_fail_width",
+                "repair_bridge_ton_rescue_pair_fail_thickness",
+                "repair_bridge_ton_rescue_pair_fail_temp",
+                "repair_bridge_ton_rescue_pair_fail_group",
+                "repair_bridge_ton_rescue_pair_fail_template",
+                "repair_bridge_ton_rescue_pair_fail_multi",
+                "repair_bridge_ton_rescue_pair_fail_unknown",
+                "bridgeability_route_suggestion",
+                "bridgeability_census",
+                "bridgeability_census_items",
+                "virtual_pilot_attempt_count",
+                "virtual_pilot_success_count",
+                "virtual_pilot_apply_count",
+                "virtual_pilot_reject_count",
+                "virtual_pilot_eligible_block_count",
+                "virtual_pilot_structural_eligible_block_count",
+                "virtual_pilot_runtime_enabled_block_count",
+                "virtual_pilot_final_eligible_block_count",
+                "virtual_pilot_selected_block_count",
+                "virtual_pilot_skipped_block_count",
+                "virtual_pilot_skipped_due_to_disabled_count",
+                "virtual_pilot_skipped_due_to_limit_count",
+                "virtual_pilot_skipped_due_to_no_pilotable_candidate_count",
+                "virtual_pilot_reject_by_reason_count",
+                "virtual_pilot_small_block_soft_penalty_count",
+                "virtual_pilot_fail_stage_count",
+                "virtual_pilot_scheduler_budget",
+                "virtual_pilot_selected_by_bucket_count",
+                "virtual_pilot_scheduler_selected_blocks",
+                "virtual_pilot_scheduler_skipped_due_to_limit",
+                "virtual_pilot_spec_enum_total",
+                "virtual_pilot_spec_enum_both_valid_count",
+                "virtual_pilot_ton_fill_attempt_count",
+                "virtual_pilot_ton_fill_success_count",
+                "virtual_pilot_dedup_group_count",
+                "virtual_pilot_duplicate_candidate_skipped_count",
+                "virtual_pilot_selected_unique_pilot_key_count",
+                "virtual_pilot_selected_by_family_count",
+                "virtual_pilot_family_prefilter_fail_count",
+                "virtual_pilot_width_group_family_attempt_count",
+                "virtual_pilot_thickness_family_attempt_count",
+                "conservative_apply_attempt_count",
+                "conservative_apply_success_count",
+                "conservative_apply_reject_count",
                 "repair_bridge_pack_type",
                 "repair_bridge_pack_keys",
                 "repair_bridge_pack_line_keys",
@@ -1456,9 +1537,21 @@ class ColdRollingPipeline:
                 if isinstance(cut_diags, dict) and _k in cut_diags:
                     updated_engine_meta[_k] = cut_diags.get(_k)
                 else:
-                    if _k in {"repair_bridge_pack_keys", "repair_bridge_pack_line_keys"}:
+                    if _k in {"repair_bridge_pack_keys", "repair_bridge_pack_line_keys", "bridgeability_census_items"}:
                         _default_val = []
-                    elif _k == "repair_bridge_pack_type" or _k.endswith("_reason"):
+                    elif _k == "bridgeability_census":
+                        _default_val = {}
+                    elif _k == "virtual_pilot_reject_by_reason_count":
+                        _default_val = {}
+                    elif _k == "virtual_pilot_fail_stage_count":
+                        _default_val = {}
+                    elif _k == "virtual_pilot_selected_by_bucket_count":
+                        _default_val = {}
+                    elif _k == "virtual_pilot_selected_by_family_count":
+                        _default_val = {}
+                    elif _k in {"virtual_pilot_scheduler_selected_blocks", "virtual_pilot_scheduler_skipped_due_to_limit"}:
+                        _default_val = []
+                    elif _k in {"repair_bridge_pack_type", "bridgeability_route_suggestion"} or _k.endswith("_reason"):
                         _default_val = ""
                     elif _k == "repair_bridge_pack_has_real_rows":
                         _default_val = False

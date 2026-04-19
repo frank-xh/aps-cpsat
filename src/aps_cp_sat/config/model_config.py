@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Tuple
 
 
@@ -99,6 +99,13 @@ class ModelConfig:
     # direct-only; these switches apply only to underfilled reconstruction.
     repair_only_real_bridge_enabled: bool = True
     repair_only_virtual_bridge_enabled: bool = False
+    repair_only_virtual_bridge_pilot_enabled: bool = False
+    virtual_bridge_pilot_max_blocks_per_run: int = 15
+    virtual_bridge_pilot_max_per_block: int = 1
+    virtual_bridge_pilot_max_virtual_tons: float = 30.0
+    virtual_bridge_pilot_penalty: float = 1000000.0
+    virtual_bridge_pilot_only_when_endpoint_class: list[str] = field(default_factory=lambda: ["HAS_ENDPOINT_EDGE", "BAND_TOO_NARROW"])
+    virtual_bridge_pilot_only_when_dominant_fail: list[str] = field(default_factory=lambda: ["THICKNESS_RULE_FAIL", "WIDTH_RULE_FAIL", "GROUP_SWITCH_FAIL", "MULTI_RULE_FAIL"])
     repair_only_bridge_max_per_segment: int = 1
     repair_only_bridge_cost_penalty: float = 100000.0
     repair_bridge_left_band_k: int = 3

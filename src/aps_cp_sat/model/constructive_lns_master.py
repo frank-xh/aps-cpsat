@@ -2634,6 +2634,7 @@ def run_constructive_lns_master(
         allow_real_bridge=bool(getattr(cfg.model, "repair_only_real_bridge_enabled", True)),
         allow_virtual_bridge=bool(getattr(cfg.model, "repair_only_virtual_bridge_enabled", False)),
         order_tons=order_tons_for_recon,
+        orders_df=orders_for_build,
         cfg=cfg,
     )
     if isinstance(cut_result.diagnostics, dict):
@@ -3507,7 +3508,58 @@ def run_constructive_lns_master(
         "repair_bridge_pair_invalid_thickness",
         "repair_bridge_pair_invalid_temp",
         "repair_bridge_pair_invalid_group",
+        "repair_bridge_pair_invalid_context",
         "repair_bridge_pair_invalid_unknown",
+        "repair_bridge_pair_fail_thickness",
+        "repair_bridge_prefilter_fail_thickness",
+        "repair_bridge_rank_pass_thickness",
+        "repair_bridge_rank_fail_thickness",
+        "repair_bridge_template_no_edge_count",
+        "repair_bridge_prefilter_all_fail_count",
+        "repair_bridge_band_too_narrow_count",
+        "repair_bridge_prefilter_reject_count",
+        "repair_bridge_endpoint_early_stop_count",
+        "repair_bridge_local_band_retry_count",
+        "underfilled_reconstruction_improvement_recorded_count",
+        "underfilled_reconstruction_improvement_applied_count",
+        "underfilled_reconstruction_apply_reject_count",
+        "bridgeability_route_suggestion",
+        "bridgeability_census",
+        "bridgeability_census_items",
+        "virtual_pilot_attempt_count",
+        "virtual_pilot_success_count",
+        "virtual_pilot_apply_count",
+        "virtual_pilot_reject_count",
+        "virtual_pilot_eligible_block_count",
+        "virtual_pilot_structural_eligible_block_count",
+        "virtual_pilot_runtime_enabled_block_count",
+        "virtual_pilot_final_eligible_block_count",
+        "virtual_pilot_selected_block_count",
+        "virtual_pilot_skipped_block_count",
+        "virtual_pilot_skipped_due_to_disabled_count",
+        "virtual_pilot_skipped_due_to_limit_count",
+        "virtual_pilot_skipped_due_to_no_pilotable_candidate_count",
+        "virtual_pilot_reject_by_reason_count",
+        "virtual_pilot_small_block_soft_penalty_count",
+        "virtual_pilot_fail_stage_count",
+        "virtual_pilot_scheduler_budget",
+        "virtual_pilot_selected_by_bucket_count",
+        "virtual_pilot_scheduler_selected_blocks",
+        "virtual_pilot_scheduler_skipped_due_to_limit",
+        "virtual_pilot_spec_enum_total",
+        "virtual_pilot_spec_enum_both_valid_count",
+        "virtual_pilot_ton_fill_attempt_count",
+        "virtual_pilot_ton_fill_success_count",
+        "virtual_pilot_dedup_group_count",
+        "virtual_pilot_duplicate_candidate_skipped_count",
+        "virtual_pilot_selected_unique_pilot_key_count",
+        "virtual_pilot_selected_by_family_count",
+        "virtual_pilot_family_prefilter_fail_count",
+        "virtual_pilot_width_group_family_attempt_count",
+        "virtual_pilot_thickness_family_attempt_count",
+        "conservative_apply_attempt_count",
+        "conservative_apply_success_count",
+        "conservative_apply_reject_count",
         "repair_bridge_ton_rescue_attempts",
         "repair_bridge_ton_rescue_success",
         "repair_bridge_ton_rescue_windows_tested",
@@ -3520,6 +3572,14 @@ def run_constructive_lns_master(
         "repair_bridge_filtered_ton_split_not_found",
         "repair_bridge_filtered_ton_rescue_no_gain",
         "repair_bridge_filtered_ton_rescue_impossible",
+        "repair_bridge_ton_rescue_pair_fail_width",
+        "repair_bridge_ton_rescue_pair_fail_thickness",
+        "repair_bridge_ton_rescue_pair_fail_temp",
+        "repair_bridge_ton_rescue_pair_fail_group",
+        "repair_bridge_ton_rescue_pair_fail_context",
+        "repair_bridge_ton_rescue_pair_fail_template",
+        "repair_bridge_ton_rescue_pair_fail_multi",
+        "repair_bridge_ton_rescue_pair_fail_unknown",
         "repair_bridge_pack_type",
         "repair_bridge_pack_keys",
         "repair_bridge_pack_line_keys",
@@ -3543,9 +3603,21 @@ def run_constructive_lns_master(
             return True
         if key in {"repair_bridge_band_best_distance", "repair_bridge_best_adjustment_cost"}:
             return -1
-        if key in {"repair_bridge_pack_keys", "repair_bridge_pack_line_keys"}:
+        if key in {"repair_bridge_pack_keys", "repair_bridge_pack_line_keys", "bridgeability_census_items"}:
             return []
-        if key == "repair_bridge_pack_type":
+        if key == "bridgeability_census":
+            return {}
+        if key == "virtual_pilot_reject_by_reason_count":
+            return {}
+        if key == "virtual_pilot_fail_stage_count":
+            return {}
+        if key == "virtual_pilot_selected_by_bucket_count":
+            return {}
+        if key == "virtual_pilot_selected_by_family_count":
+            return {}
+        if key in {"virtual_pilot_scheduler_selected_blocks", "virtual_pilot_scheduler_skipped_due_to_limit"}:
+            return []
+        if key in {"repair_bridge_pack_type", "bridgeability_route_suggestion"}:
             return ""
         if key.endswith("_reason"):
             return "NOT_REPORTED_BY_CUTTER"
