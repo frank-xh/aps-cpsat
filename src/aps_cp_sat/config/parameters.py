@@ -349,7 +349,20 @@ def build_profile_config(
     # Uses the new ALNS-driven constructive path (constructive_lns_master)
     # instead of the joint_master model.
     # -------------------------------------------------------------------------
-    if profile == "constructive_lns_search":
+    if profile in {
+        "constructive_lns_search",
+        "constructive_lns_real_bridge_frontload",
+        "constructive_lns_direct_only_baseline",
+    }:
+        real_bridge_frontload = profile == "constructive_lns_real_bridge_frontload"
+        direct_only_baseline = profile == "constructive_lns_direct_only_baseline"
+        profile_name = (
+            "constructive_lns_real_bridge_frontload"
+            if real_bridge_frontload
+            else "constructive_lns_direct_only_baseline"
+            if direct_only_baseline
+            else "constructive_lns_search"
+        )
         score = ScoreConfig(
             **{
                 **base_score.__dict__,
@@ -362,7 +375,7 @@ def build_profile_config(
         model = ModelConfig(
             **{
                 **base_model.__dict__,
-                "profile_name": "constructive_lns_search",
+                "profile_name": profile_name,
                 # Switch to new ALNS master path
                 "main_solver_strategy": "constructive_lns",
                 # LNS parameters
@@ -375,16 +388,16 @@ def build_profile_config(
                 "constructive_destroy_ratio_max": 0.35,
                 "constructive_subproblem_max_orders": 40,
                 "constructive_enable_cp_sat_repair": True,
-                # Route B/C: disable ALL bridge edges = direct_only mode (Route C)
-                # This is the strictest mode: only DIRECT_EDGE is allowed.
-                # Purpose: quickly verify whether the only blocker for official_exported=True
-                # is the bridge edge expansion itself.
+                # Isolated bridge-frontload experiment:
+                # constructive_lns_search stays direct_only; the frontload
+                # profile allows REAL_BRIDGE_EDGE in constructive/local inserter
+                # while VIRTUAL_BRIDGE_EDGE and bridge expansion stay disabled.
                 "allow_virtual_bridge_edge_in_constructive": False,
-                "allow_real_bridge_edge_in_constructive": False,
+                "allow_real_bridge_edge_in_constructive": bool(real_bridge_frontload),
                 "bridge_expansion_mode": "disabled",
                 "repair_only_real_bridge_enabled": True,
                 "repair_only_virtual_bridge_enabled": False,
-                "repair_only_virtual_bridge_pilot_enabled": True,
+                "repair_only_virtual_bridge_pilot_enabled": False if (real_bridge_frontload or direct_only_baseline) else True,
                 "virtual_bridge_pilot_max_blocks_per_run": 15,
                 "virtual_bridge_pilot_max_per_block": 1,
                 "virtual_bridge_pilot_max_virtual_tons": 30.0,
@@ -596,6 +609,140 @@ def build_profile_config(
                 "max_drop_count_for_partial": 1000,       # original: 20
                 "min_scheduled_orders_for_partial": 50,   # original: 100 (relaxed to 50)
                 "min_scheduled_tons_for_partial": 500.0,  # original: 1000.0 (relaxed to 500)
+            }
+        )
+        return PlannerConfig(rule=base_rule, model=model, score=score)
+
+    # -------------------------------------------------------------------------
+    # Constructive LNS bridge family master profile (future / oracle-ready)
+    # -------------------------------------------------------------------------
+    # This profile is a FUTURE placeholder that allows VIRTUAL_BRIDGE_FAMILY_EDGE
+    # to enter the Candidate Graph / Master as a controlled candidate.
+    #
+    # Key differences from existing profiles:
+    #   - allow_virtual_bridge_edge_in_constructive = True  (for family edge)
+    #   - bridge_expansion_mode = "disabled"  (no exact path expansion yet)
+    #   - Legacy virtual pilot remains available but marked as "legacy repair path"
+    #
+    # NOTE: This profile is NOT enabled by default. It is a占位 for the
+    # full oracle-driven realization pipeline that comes in the next iteration.
+    # -------------------------------------------------------------------------
+    if profile == "constructive_lns_bridge_family_master":
+        print(
+            "[APS][bridge_family_master] CONSTRUCTIVE_LNS_BRIDGE_FAMILY_MASTER profile: "
+            "VIRTUAL_BRIDGE_FAMILY_EDGE enters as controlled candidate; "
+            "exact path realization via BridgeRealizationOracle is stub (NOT_IMPLEMENTED_YET). "
+            "bridge_expansion_mode=disabled, legacy virtual pilot available."
+        )
+        score = ScoreConfig(
+            **{
+                **base_score.__dict__,
+                "slot_order_count_penalty": 0,
+                "unassigned_real": 0,
+                "virtual_bridge_penalty": 200,
+                "real_bridge_penalty": 40,
+            }
+        )
+        model = ModelConfig(
+            **{
+                **base_model.__dict__,
+                "profile_name": "constructive_lns_bridge_family_master",
+                # Switch to new ALNS master path
+                "main_solver_strategy": "constructive_lns",
+                # LNS parameters
+                "rounds": 10,
+                "constructive_lns_rounds": 10,
+                "lns_early_stop_no_improve_rounds": 3,
+                "lns_max_total_rounds": 10,
+                "lns_min_rounds_before_early_stop": 4,
+                "constructive_destroy_ratio_min": 0.20,
+                "constructive_destroy_ratio_max": 0.35,
+                "constructive_subproblem_max_orders": 40,
+                "constructive_enable_cp_sat_repair": True,
+                # ---- Bridge Family Master: allow family edge, no expansion ----
+                # allow_virtual = True → VIRTUAL_BRIDGE_FAMILY_EDGE enters graph
+                # bridge_expansion disabled → no exact path expansion (oracle stub)
+                "allow_virtual_bridge_edge_in_constructive": True,
+                "allow_real_bridge_edge_in_constructive": True,
+                "bridge_expansion_mode": "disabled",
+                "repair_only_real_bridge_enabled": True,
+                # Legacy virtual pilot stays available (marked as legacy repair path)
+                "repair_only_virtual_bridge_enabled": True,
+                "repair_only_virtual_bridge_pilot_enabled": True,
+                "virtual_bridge_pilot_max_blocks_per_run": 15,
+                "virtual_bridge_pilot_max_per_block": 1,
+                "virtual_bridge_pilot_max_virtual_tons": 30.0,
+                "virtual_bridge_pilot_penalty": 1000000.0,
+                "virtual_bridge_pilot_only_when_endpoint_class": ["HAS_ENDPOINT_EDGE", "BAND_TOO_NARROW"],
+                "virtual_bridge_pilot_only_when_dominant_fail": ["THICKNESS_RULE_FAIL", "WIDTH_RULE_FAIL", "GROUP_SWITCH_FAIL", "MULTI_RULE_FAIL"],
+                "repair_only_bridge_max_per_segment": 1,
+                "repair_only_bridge_cost_penalty": 100000.0,
+                "repair_bridge_left_band_k": 3,
+                "repair_bridge_right_band_k": 3,
+                "repair_bridge_band_max_pairs_per_split": 9,
+                "repair_bridge_left_trim_max": 2,
+                "repair_bridge_right_trim_max": 2,
+                "repair_bridge_endpoint_adjustment_limit_per_split": 9,
+                "repair_bridge_adjustment_enable_left_trim": True,
+                "repair_bridge_adjustment_enable_right_trim": True,
+                "repair_bridge_adjustment_enable_swap": False,
+                "repair_bridge_ton_rescue_max_neighbor_blocks": 6,
+                "repair_bridge_ton_rescue_enable_backward": True,
+                "repair_bridge_ton_rescue_enable_forward": True,
+                "repair_bridge_ton_rescue_enable_bidirectional": True,
+                "repair_bridge_ton_rescue_max_orders_per_window": 50,
+                "repair_bridge_ton_rescue_max_failed_windows_after_min": 2,
+                "strict_template_edges": True,
+                "allow_fallback": False,
+                "allow_legacy_fallback": False,
+                "enableSemanticFallback": False,
+                "enableScaleDownFallback": False,
+                "enableStructureFallback": False,
+                "enableLegacyFallback": False,
+                "validation_mode": bool(validation_mode),
+                "time_limit_seconds": 60.0,
+                "min_real_schedule_ratio": 0.90,
+                "master_profile_count": 1,
+                "master_seed_count": 1,
+                "max_campaign_slots": 14,
+                "min_campaign_slots": 6,
+                "big_roll_slot_soft_order_cap": 20,
+                "small_roll_slot_soft_order_cap": 24,
+                "export_failed_result_for_debug": True,
+                # Tail rebalancing
+                "tail_rebalance_enabled": True,
+                "tail_rebalance_max_pullback_orders": 8,
+                "tail_rebalance_max_pullback_tons10": 2500,
+                "tail_rebalance_accept_if_prev_stays_above_min": True,
+                # Tail Repair Budget
+                "max_tail_repair_windows_per_line": 12,
+                "max_tail_repair_windows_total": 24,
+                "max_recut_cutpoints_per_window": 12,
+                "max_fill_candidates_per_tail": 20,
+                "tail_repair_gap_to_min_limit": 220.0,
+                # Tail Fill From Dropped
+                "tail_fill_from_dropped_enabled": True,
+                "tail_fill_gap_to_min_limit": 220.0,
+                "tail_fill_accept_partial_progress": True,
+                "tail_fill_max_inserts_per_tail": 2,
+                "tail_fill_second_pass_gap_limit": 30.0,
+                # Small roll dual-order reserve
+                "small_roll_dual_reserve_enabled": True,
+                "small_roll_dual_reserve_penalty": 15,
+                "small_roll_dual_reserve_bucket_enabled": True,
+                "small_roll_dual_reserve_bucket_ratio": 0.45,
+                "small_roll_dual_reserve_bucket_max_orders": 120,
+                # Small roll seed-first
+                "small_roll_seed_first_enabled": True,
+                "small_roll_seed_min_orders": 20,
+                "small_roll_seed_min_tons10": 5000,
+                # Small roll dual-order reserve QUOTA
+                "small_roll_dual_reserve_quota_enabled": True,
+                "small_roll_dual_reserve_quota_min_orders": 25,
+                "small_roll_dual_reserve_quota_min_tons10": 6000,
+                "small_roll_dual_reserve_quota_max_orders": 60,
+                "small_roll_dual_reserve_quota_max_tons10": 14000,
+                "big_roll_dual_release_after_small_seed": True,
             }
         )
         return PlannerConfig(rule=base_rule, model=model, score=score)

@@ -171,6 +171,7 @@ from aps_cp_sat.model.joint_master import _run_global_joint_model, _run_unified_
 from aps_cp_sat.model.constructive_lns_master import run_constructive_lns_master
 from aps_cp_sat.model.local_router import _solve_slot_route_with_templates
 from aps_cp_sat.transition import build_transition_templates
+from aps_cp_sat.model.candidate_graph import build_candidate_graph
 
 
 def _is_diagnostic_profile(profile_name: str) -> bool:
@@ -951,10 +952,15 @@ def solve_master_model(
         profile_name = str(getattr(current_cfg.model, "profile_name", "") or "")
 
         # ---- Profile guard: hard enforcement ----
-        if profile_name != "constructive_lns_search":
+        allowed_constructive_profiles = {
+            "constructive_lns_search",
+            "constructive_lns_direct_only_baseline",
+            "constructive_lns_real_bridge_frontload",
+        }
+        if profile_name not in allowed_constructive_profiles:
             raise RuntimeError(
                 f"[APS][PROFILE_GUARD] illegal profile: {profile_name}; "
-                "Only constructive_lns_search is allowed in current engineering mode"
+                f"Only {sorted(allowed_constructive_profiles)} are allowed in current engineering mode"
             )
         if solver_strategy != "constructive_lns":
             raise RuntimeError(
@@ -977,7 +983,11 @@ def solve_master_model(
         print(f"[APS][constructive_lns] allow_real_bridge_edge_in_constructive={allow_real_bridge}")
         print(f"[APS][constructive_lns] constructive_edge_policy={constructive_edge_policy}")
         if constructive_edge_policy == "direct_only":
-            print(f"[APS][constructive_lns] 路线C(direct_only): 只允许 DIRECT_EDGE, 禁用所有桥接边, 快速验证桥接展开是否为 official_exported 唯一障碍")
+            print(f"[APS][constructive_lns] Route C / direct_only: only DIRECT_EDGE is allowed")
+        elif constructive_edge_policy == "direct_plus_real_bridge":
+            print(f"[APS][constructive_lns] Route RB / direct_plus_real_bridge: DIRECT_EDGE + REAL_BRIDGE_EDGE allowed, VIRTUAL_BRIDGE_EDGE blocked, bridge_expansion_mode={bridge_expansion_mode}")
+        else:
+            print(f"[APS][constructive_lns] edge_policy={constructive_edge_policy}, bridge_expansion_mode={bridge_expansion_mode}")
         health = _assess_template_graph_health(current_transition_pack, current_cfg)
         precheck_autorelax_applied = False
         if health.get("template_graph_health") in {"SPARSE", "DISCONNECTED"}:
@@ -1104,8 +1114,12 @@ def solve_master_model(
             "lns_diagnostics": lns_result.diagnostics,
             "lns_engine_meta": lns_result.engine_meta,
             "lns_status": lns_result.status.value,
+            "candidate_graph_diagnostics": (
+                current_transition_pack.get("candidate_graph_diagnostics", {})
+                if isinstance(current_transition_pack, dict) else {}
+            ),
             # Enforced path enforcement metadata
-            "enforced_profile": "constructive_lns_search",
+            "enforced_profile": profile_name,
             "enforced_main_solver_strategy": "constructive_lns",
             "joint_master_branch_enabled": False,
             "old_master_blocked": True,

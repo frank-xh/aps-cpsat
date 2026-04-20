@@ -10,6 +10,7 @@ import pandas as pd
 from aps_cp_sat.decode import decode_candidate_allocation, decode_solution
 from aps_cp_sat.domain.models import ColdRollingRequest, ColdRollingResult
 from aps_cp_sat.io import export_schedule_results
+from aps_cp_sat.model.candidate_graph import build_candidate_graph
 from aps_cp_sat.model import solve_master_model
 from aps_cp_sat.preprocess import prepare_orders_for_model
 from aps_cp_sat.rules import RULE_REGISTRY
@@ -101,6 +102,37 @@ class ColdRollingPipeline:
                     f"diagnostics_build_seconds={float(total.get('diagnostics_build_seconds', 0.0)):.3f}, "
                     f"template_build_seconds={float(total.get('template_build_seconds', 0.0)):.3f}"
                 )
+                print(
+                    f"[APS][CandidateGraph] edges={int(total.get('candidate_graph_edge_count', 0) or 0)}, "
+                    f"direct={int(total.get('candidate_graph_direct_edge_count', 0) or 0)}, "
+                    f"real_bridge={int(total.get('candidate_graph_real_bridge_edge_count', 0) or 0)}, "
+                    f"virtual_family={int(total.get('candidate_graph_virtual_bridge_family_edge_count', 0) or 0)}, "
+                    f"filtered_width={int(total.get('candidate_graph_filtered_by_width_count', 0) or 0)}, "
+                    f"filtered_thickness={int(total.get('candidate_graph_filtered_by_thickness_count', 0) or 0)}, "
+                    f"filtered_temp={int(total.get('candidate_graph_filtered_by_temp_count', 0) or 0)}, "
+                    f"filtered_group={int(total.get('candidate_graph_filtered_by_group_count', 0) or 0)}, "
+                    f"filtered_chain={int(total.get('candidate_graph_filtered_by_max_virtual_chain_count', 0) or 0)}"
+                )
+
+    @staticmethod
+    def _attach_candidate_graph(orders_df: pd.DataFrame, transition_pack: dict, cfg) -> dict:
+        if not isinstance(transition_pack, dict):
+            return transition_pack
+        tpl_df = transition_pack.get("templates")
+        candidate_graph = build_candidate_graph(
+            orders_df,
+            tpl_df if isinstance(tpl_df, pd.DataFrame) else pd.DataFrame(),
+            cfg,
+        )
+        transition_pack["candidate_graph"] = candidate_graph
+        transition_pack["candidate_graph_diagnostics"] = dict(candidate_graph.diagnostics)
+        build_debug = transition_pack.get("build_debug")
+        if isinstance(build_debug, list):
+            for item in build_debug:
+                if isinstance(item, dict) and str(item.get("line")) == "__all__":
+                    item.update(candidate_graph.diagnostics)
+                    break
+        return transition_pack
 
     # ---------------------------------------------------------------------------
     # Profile guard: enforce constructive_lns_search as the only allowed path
@@ -119,7 +151,13 @@ class ColdRollingPipeline:
         requested_profile = str(req.config.model.profile_name or "").strip()
 
         # ---- Allowed ALNS profiles ----
-        _ALLOWED_ALNS_PROFILES = {"constructive_lns_search", "constructive_lns_debug_acceptance"}
+        _ALLOWED_ALNS_PROFILES = {
+            "constructive_lns_search",
+            "constructive_lns_direct_only_baseline",
+            "constructive_lns_debug_acceptance",
+            "constructive_lns_real_bridge_frontload",
+            "constructive_lns_bridge_family_master",  # Future: family edge + oracle stub
+        }
 
         # Case B: auto-correct empty/default
         if requested_profile in ("", "default"):
@@ -143,6 +181,288 @@ class ColdRollingPipeline:
             f"[APS][PROFILE_GUARD] illegal profile: {requested_profile}; "
             f"Only {sorted(_ALLOWED_ALNS_PROFILES)} are allowed in current engineering mode"
         )
+
+    _UNIFIED_ENGINE_META_FIELDS = (
+        "profile_name",
+        "solver_path",
+        "constructive_edge_policy",
+        "bridge_expansion_mode",
+        "allow_virtual_bridge_edge_in_constructive",
+        "allow_real_bridge_edge_in_constructive",
+        "repair_only_real_bridge_enabled",
+        "repair_only_virtual_bridge_enabled",
+        "repair_only_virtual_bridge_pilot_enabled",
+        "scheduled_real_orders",
+        "scheduled_virtual_orders",
+        "dropped_count",
+        "campaign_count",
+        "low_slots",
+        "tail_underfilled_count",
+        "selected_real_bridge_edge_count",
+        "selected_virtual_bridge_edge_count",
+        "selected_virtual_bridge_family_edge_count",
+        "max_bridge_count_used",
+        "lns_accepted_rounds",
+        "lns_drop_delta",
+        "reconstruction_no_gain",
+        "virtual_pilot_attempt_count",
+        "virtual_pilot_success_count",
+        "virtual_pilot_apply_count",
+        "acceptance",
+        "acceptance_gate_reason",
+        "validation_gate_reason",
+        # Family edge diagnostics
+        "virtual_family_edge_count",
+        "virtual_family_filtered_by_chain_limit_count",
+        "virtual_family_filtered_by_temp_count",
+        "virtual_family_filtered_by_group_count",
+        "virtual_family_topk_pruned_count",
+        "accepted_virtual_bridge_family_edge_count",
+        "real_bridge_arcs_allowed",
+    )
+
+    @staticmethod
+    def _constructive_edge_policy_from_flags(allow_virtual_bridge: bool, allow_real_bridge: bool) -> str:
+        if allow_virtual_bridge:
+            return "all_edges_allowed"
+        if allow_real_bridge:
+            return "direct_plus_real_bridge"
+        return "direct_only"
+
+    @staticmethod
+    def _count_campaigns(df: pd.DataFrame | None) -> int:
+        if df is None or df.empty:
+            return 0
+        for col in ("campaign_id", "campaign_id_hint", "slot_no", "round_id"):
+            if col in df.columns:
+                return int(df[col].dropna().nunique())
+        return 0
+
+    @staticmethod
+    def _count_edge_type(df: pd.DataFrame | None, edge_type: str) -> int:
+        if df is None or df.empty or "selected_edge_type" not in df.columns:
+            return 0
+        return int((df["selected_edge_type"].astype(str) == edge_type).sum())
+
+    @classmethod
+    def _ensure_unified_engine_meta(
+        cls,
+        engine_meta: dict,
+        cfg,
+        schedule_df: pd.DataFrame | None = None,
+        dropped_df: pd.DataFrame | None = None,
+        rounds_df: pd.DataFrame | None = None,
+    ) -> dict:
+        """Normalize top-level run metadata so logs, Excel and APIs share one key set."""
+        em = dict(engine_meta or {})
+        model_cfg = getattr(cfg, "model", cfg)
+        lns_engine_meta = em.get("lns_engine_meta", {}) if isinstance(em.get("lns_engine_meta"), dict) else {}
+        lns_diag = em.get("lns_diagnostics", {}) if isinstance(em.get("lns_diagnostics"), dict) else {}
+        candidate_graph_diag = em.get("candidate_graph_diagnostics", {}) if isinstance(em.get("candidate_graph_diagnostics"), dict) else {}
+        rounds_summary = lns_diag.get("rounds_summary", {}) if isinstance(lns_diag.get("rounds_summary"), dict) else {}
+        cut_diags = lns_diag.get("campaign_cut_diags", {}) if isinstance(lns_diag.get("campaign_cut_diags"), dict) else {}
+
+        profile_name = str(em.get("profile_name") or getattr(model_cfg, "profile_name", "") or "unknown")
+        solver_path = str(
+            em.get("solver_path")
+            or em.get("main_path")
+            or em.get("engine_used")
+            or getattr(model_cfg, "main_solver_strategy", "")
+            or "unknown"
+        )
+        allow_virtual = bool(
+            em.get(
+                "allow_virtual_bridge_edge_in_constructive",
+                em.get(
+                    "virtual_bridge_edge_enabled_in_constructive",
+                    lns_engine_meta.get(
+                        "allow_virtual_bridge_edge_in_constructive",
+                        lns_engine_meta.get(
+                            "virtual_bridge_edge_enabled_in_constructive",
+                            getattr(model_cfg, "allow_virtual_bridge_edge_in_constructive", False),
+                        ),
+                    ),
+                ),
+            )
+        )
+        allow_real = bool(
+            em.get(
+                "allow_real_bridge_edge_in_constructive",
+                em.get(
+                    "real_bridge_edge_enabled_in_constructive",
+                    lns_engine_meta.get(
+                        "allow_real_bridge_edge_in_constructive",
+                        lns_engine_meta.get(
+                            "real_bridge_edge_enabled_in_constructive",
+                            getattr(model_cfg, "allow_real_bridge_edge_in_constructive", False),
+                        ),
+                    ),
+                ),
+            )
+        )
+        bridge_expansion_mode = str(
+            em.get("bridge_expansion_mode")
+            or lns_engine_meta.get("bridge_expansion_mode")
+            or getattr(model_cfg, "bridge_expansion_mode", "disabled")
+            or "disabled"
+        )
+        constructive_edge_policy = str(
+            em.get("constructive_edge_policy")
+            or lns_engine_meta.get("constructive_edge_policy")
+            or cls._constructive_edge_policy_from_flags(allow_virtual, allow_real)
+        )
+        for key in (
+            "candidate_graph_edge_count",
+            "candidate_graph_direct_edge_count",
+            "candidate_graph_real_bridge_edge_count",
+            "candidate_graph_virtual_bridge_family_edge_count",
+            "candidate_graph_filtered_by_width_count",
+            "candidate_graph_filtered_by_thickness_count",
+            "candidate_graph_filtered_by_temp_count",
+            "candidate_graph_filtered_by_group_count",
+            "candidate_graph_filtered_by_max_virtual_chain_count",
+            "candidate_graph_reason_histogram",
+            # Virtual family edge pruning diagnostics
+            "virtual_family_edge_count",
+            "virtual_family_filtered_by_chain_limit_count",
+            "virtual_family_filtered_by_temp_count",
+            "virtual_family_filtered_by_group_count",
+            "virtual_family_topk_pruned_count",
+            "virtual_family_bridge_family_counts",
+            "virtual_family_max_chain_limit",
+            # Constructive builder accepted counts
+            "accepted_virtual_bridge_family_edge_count",
+        ):
+            if key in candidate_graph_diag:
+                em[key] = candidate_graph_diag.get(key)
+
+        if schedule_df is None:
+            schedule_df = pd.DataFrame()
+        if dropped_df is None:
+            dropped_df = pd.DataFrame()
+        if rounds_df is None:
+            rounds_df = pd.DataFrame()
+
+        if not schedule_df.empty and "is_virtual" in schedule_df.columns:
+            scheduled_virtual = int(schedule_df["is_virtual"].fillna(False).astype(bool).sum())
+            scheduled_real = int(len(schedule_df) - scheduled_virtual)
+        else:
+            scheduled_real = int(len(schedule_df)) if schedule_df is not None else 0
+            scheduled_virtual = int(
+                em.get(
+                    "scheduled_virtual_orders",
+                    em.get("decodedTemplateVirtualCoilCount", em.get("decodedTemplateVirtualCoilCountTotal", 0)),
+                )
+                or 0
+            )
+        dropped_count = (
+            int(dropped_df["order_id"].nunique())
+            if isinstance(dropped_df, pd.DataFrame) and not dropped_df.empty and "order_id" in dropped_df.columns
+            else int(len(dropped_df)) if isinstance(dropped_df, pd.DataFrame) else int(em.get("dropped_count", 0) or 0)
+        )
+        lns_initial_drop = int(lns_diag.get("initial_dropped_count", em.get("lns_initial_dropped_count", 0)) or 0)
+        lns_final_drop = int(lns_diag.get("final_dropped_count", em.get("lns_final_dropped_count", dropped_count)) or dropped_count)
+
+        em.update(
+            {
+                "profile_name": profile_name,
+                "solver_path": solver_path,
+                "constructive_edge_policy": constructive_edge_policy,
+                "bridge_expansion_mode": bridge_expansion_mode,
+                "allow_virtual_bridge_edge_in_constructive": allow_virtual,
+                "allow_real_bridge_edge_in_constructive": allow_real,
+                # Backward-compatible aliases used by older writer/decoder code.
+                "virtual_bridge_edge_enabled_in_constructive": allow_virtual,
+                "real_bridge_edge_enabled_in_constructive": allow_real,
+                "repair_only_real_bridge_enabled": bool(
+                    em.get("repair_only_real_bridge_enabled", getattr(model_cfg, "repair_only_real_bridge_enabled", False))
+                ),
+                "repair_only_virtual_bridge_enabled": bool(
+                    em.get("repair_only_virtual_bridge_enabled", getattr(model_cfg, "repair_only_virtual_bridge_enabled", False))
+                ),
+                "repair_only_virtual_bridge_pilot_enabled": bool(
+                    em.get(
+                        "repair_only_virtual_bridge_pilot_enabled",
+                        getattr(model_cfg, "repair_only_virtual_bridge_pilot_enabled", False),
+                    )
+                ),
+                "scheduled_real_orders": scheduled_real,
+                "scheduled_virtual_orders": scheduled_virtual,
+                "dropped_count": dropped_count,
+                "campaign_count": int(em.get("campaign_count", cls._count_campaigns(schedule_df)) or cls._count_campaigns(schedule_df)),
+                "low_slots": int(em.get("low_slots", em.get("ultra_low_slot_count", 0)) or 0),
+                "tail_underfilled_count": int(
+                    em.get(
+                        "tail_underfilled_count",
+                        cut_diags.get(
+                            "underfilled_reconstruction_underfilled_after",
+                            cut_diags.get("total_underfilled_segments", 0),
+                        ),
+                    )
+                    or 0
+                ),
+                "selected_real_bridge_edge_count": int(
+                    em.get("selected_real_bridge_edge_count", cls._count_edge_type(schedule_df, "REAL_BRIDGE_EDGE")) or 0
+                ),
+                "selected_virtual_bridge_edge_count": int(
+                    em.get("selected_virtual_bridge_edge_count", cls._count_edge_type(schedule_df, "VIRTUAL_BRIDGE_EDGE")) or 0
+                ),
+                "selected_virtual_bridge_family_edge_count": int(
+                    em.get("selected_virtual_bridge_family_edge_count", cls._count_edge_type(schedule_df, "VIRTUAL_BRIDGE_FAMILY_EDGE")) or 0
+                ),
+                "max_bridge_count_used": int(
+                    em.get(
+                        "max_bridge_count_used",
+                        int(schedule_df["bridge_count"].max()) if not schedule_df.empty and "bridge_count" in schedule_df.columns else 0,
+                    )
+                    or 0
+                ),
+                "lns_accepted_rounds": int(
+                    em.get("lns_accepted_rounds", rounds_summary.get("accepted_count", 0)) or 0
+                ),
+                "lns_drop_delta": int(em.get("lns_drop_delta", lns_final_drop - lns_initial_drop) or 0),
+                "reconstruction_no_gain": bool(
+                    em.get(
+                        "reconstruction_no_gain",
+                        int(em.get("underfilled_reconstruction_valid_delta", cut_diags.get("underfilled_reconstruction_valid_delta", 0)) or 0) == 0
+                        and int(em.get("underfilled_reconstruction_underfilled_delta", cut_diags.get("underfilled_reconstruction_underfilled_delta", 0)) or 0) == 0,
+                    )
+                ),
+                "virtual_pilot_attempt_count": int(em.get("virtual_pilot_attempt_count", cut_diags.get("virtual_pilot_attempt_count", 0)) or 0),
+                "virtual_pilot_success_count": int(em.get("virtual_pilot_success_count", cut_diags.get("virtual_pilot_success_count", 0)) or 0),
+                "virtual_pilot_apply_count": int(em.get("virtual_pilot_apply_count", cut_diags.get("virtual_pilot_apply_count", 0)) or 0),
+                "acceptance": str(em.get("acceptance", em.get("result_acceptance_status", "unknown")) or "unknown"),
+                "acceptance_gate_reason": str(em.get("acceptance_gate_reason", "unknown") or "unknown"),
+                "validation_gate_reason": str(em.get("validation_gate_reason", "unknown") or "unknown"),
+            }
+        )
+        for key in cls._UNIFIED_ENGINE_META_FIELDS:
+            em.setdefault(key, 0 if key.endswith("_count") or key.endswith("_orders") else "unknown")
+        return em
+
+    @classmethod
+    def _print_config_snapshot(cls, cfg) -> None:
+        model_cfg = getattr(cfg, "model", cfg)
+        allow_virtual = bool(getattr(model_cfg, "allow_virtual_bridge_edge_in_constructive", False))
+        allow_real = bool(getattr(model_cfg, "allow_real_bridge_edge_in_constructive", False))
+        print(
+            "[APS][CONFIG_SNAPSHOT] "
+            f"profile_name={getattr(model_cfg, 'profile_name', 'unknown')}, "
+            f"solver_path={getattr(model_cfg, 'main_solver_strategy', 'unknown')}, "
+            f"constructive_edge_policy={cls._constructive_edge_policy_from_flags(allow_virtual, allow_real)}, "
+            f"allow_virtual_bridge_edge_in_constructive={allow_virtual}, "
+            f"allow_real_bridge_edge_in_constructive={allow_real}, "
+            f"bridge_expansion_mode={getattr(model_cfg, 'bridge_expansion_mode', 'disabled')}, "
+            f"repair_only_real_bridge_enabled={bool(getattr(model_cfg, 'repair_only_real_bridge_enabled', False))}, "
+            f"repair_only_virtual_bridge_enabled={bool(getattr(model_cfg, 'repair_only_virtual_bridge_enabled', False))}, "
+            f"repair_only_virtual_bridge_pilot_enabled={bool(getattr(model_cfg, 'repair_only_virtual_bridge_pilot_enabled', False))}"
+        )
+
+    @classmethod
+    def _print_result_snapshot(cls, engine_meta: dict) -> None:
+        em = engine_meta or {}
+        fields = ", ".join(f"{key}={em.get(key, 'unknown')}" for key in cls._UNIFIED_ENGINE_META_FIELDS)
+        print(f"[APS][RESULT_SNAPSHOT] {fields}")
 
     @staticmethod
     def _allowed_lines(line_capability: str) -> list[str]:
@@ -653,6 +973,20 @@ class ColdRollingPipeline:
             "virtual_pilot_family_prefilter_fail_count": int(em.get("virtual_pilot_family_prefilter_fail_count", 0) or 0),
             "virtual_pilot_width_group_family_attempt_count": int(em.get("virtual_pilot_width_group_family_attempt_count", 0) or 0),
             "virtual_pilot_thickness_family_attempt_count": int(em.get("virtual_pilot_thickness_family_attempt_count", 0) or 0),
+            "virtual_pilot_selected_candidate_count": int(em.get("virtual_pilot_selected_candidate_count", 0) or 0),
+            "virtual_pilot_dedup_kept_count": int(em.get("virtual_pilot_dedup_kept_count", 0) or 0),
+            "virtual_pilot_dedup_skipped_count": int(em.get("virtual_pilot_dedup_skipped_count", 0) or 0),
+            "virtual_pilot_attempt_started_count": int(em.get("virtual_pilot_attempt_started_count", 0) or 0),
+            "virtual_pilot_spec_enum_done_count": int(em.get("virtual_pilot_spec_enum_done_count", 0) or 0),
+            "virtual_pilot_recut_entered_count": int(em.get("virtual_pilot_recut_entered_count", 0) or 0),
+            "virtual_pilot_segment_valid_count": int(em.get("virtual_pilot_segment_valid_count", 0) or 0),
+            "virtual_pilot_ton_fill_entered_count": int(em.get("virtual_pilot_ton_fill_entered_count", 0) or 0),
+            "virtual_pilot_apply_check_entered_count": int(em.get("virtual_pilot_apply_check_entered_count", 0) or 0),
+            "virtual_pilot_apply_success_count": int(em.get("virtual_pilot_apply_success_count", 0) or 0),
+            "virtual_pilot_execution_stage_by_family": em.get("virtual_pilot_execution_stage_by_family", {}),
+            "virtual_pilot_post_spec_fail_stage_count": em.get("virtual_pilot_post_spec_fail_stage_count", {}),
+            "virtual_pilot_family_execution_audit": em.get("virtual_pilot_family_execution_audit", {}),
+            "virtual_pilot_width_group_guarantee_attempted": bool(em.get("virtual_pilot_width_group_guarantee_attempted", False)),
             "conservative_apply_attempt_count": int(em.get("conservative_apply_attempt_count", 0) or 0),
             "conservative_apply_success_count": int(em.get("conservative_apply_success_count", 0) or 0),
             "conservative_apply_reject_count": int(em.get("conservative_apply_reject_count", 0) or 0),
@@ -842,8 +1176,13 @@ class ColdRollingPipeline:
             print(f"[APS][constructive_lns] allow_real_bridge_edge_in_constructive={allow_real_bridge}")
             constructive_edge_policy = "direct_only" if (not allow_virtual_bridge and not allow_real_bridge) else ("direct_plus_real_bridge" if not allow_virtual_bridge else "all_edges_allowed")
             print(f"[APS][constructive_lns] constructive_edge_policy={constructive_edge_policy}")
+            self._print_config_snapshot(req.config)
             if constructive_edge_policy == "direct_only":
                 print(f"[APS][constructive_lns] 路线C(direct_only): 只允许 DIRECT_EDGE, 禁用所有桥接边, 快速验证桥接展开是否为 official_exported 唯一障碍")
+            elif constructive_edge_policy == "direct_plus_real_bridge":
+                print(f"[APS][constructive_lns] 路线RB(direct_plus_real_bridge): 允许 DIRECT_EDGE + REAL_BRIDGE_EDGE, 禁用 VIRTUAL_BRIDGE_EDGE, bridge_expansion_mode={bridge_expansion_mode}")
+            else:
+                print(f"[APS][constructive_lns] edge_policy={constructive_edge_policy}, bridge_expansion_mode={bridge_expansion_mode}")
             print(
                 f"[APS][Profile] unassigned_real={req.config.score.unassigned_real}, "
                 f"route_risk=({req.config.score.slot_isolation_risk_penalty},"
@@ -857,6 +1196,7 @@ class ColdRollingPipeline:
 
             build_t0 = perf_counter()
             transition_pack = build_transition_templates(orders_df, req.config)
+            transition_pack = self._attach_candidate_graph(orders_df, transition_pack, req.config)
             template_build_seconds = perf_counter() - build_t0
             self._print_template_diagnostics(transition_pack)
 
@@ -864,6 +1204,7 @@ class ColdRollingPipeline:
             effective_cfg = engine_meta.get("effective_config", req.config) if isinstance(engine_meta, dict) else req.config
             if isinstance(engine_meta, dict) and engine_meta.get("precheck_autorelax_applied") and effective_cfg is not req.config:
                 transition_pack = build_transition_templates(orders_df, effective_cfg)
+                transition_pack = self._attach_candidate_graph(orders_df, transition_pack, effective_cfg)
             result = ColdRollingResult(
                 schedule_df=schedule_df,
                 rounds_df=rounds_df,
@@ -1521,6 +1862,20 @@ class ColdRollingPipeline:
                 "virtual_pilot_family_prefilter_fail_count",
                 "virtual_pilot_width_group_family_attempt_count",
                 "virtual_pilot_thickness_family_attempt_count",
+                "virtual_pilot_selected_candidate_count",
+                "virtual_pilot_dedup_kept_count",
+                "virtual_pilot_dedup_skipped_count",
+                "virtual_pilot_attempt_started_count",
+                "virtual_pilot_spec_enum_done_count",
+                "virtual_pilot_recut_entered_count",
+                "virtual_pilot_segment_valid_count",
+                "virtual_pilot_ton_fill_entered_count",
+                "virtual_pilot_apply_check_entered_count",
+                "virtual_pilot_apply_success_count",
+                "virtual_pilot_execution_stage_by_family",
+                "virtual_pilot_post_spec_fail_stage_count",
+                "virtual_pilot_family_execution_audit",
+                "virtual_pilot_width_group_guarantee_attempted",
                 "conservative_apply_attempt_count",
                 "conservative_apply_success_count",
                 "conservative_apply_reject_count",
@@ -1549,8 +1904,16 @@ class ColdRollingPipeline:
                         _default_val = {}
                     elif _k == "virtual_pilot_selected_by_family_count":
                         _default_val = {}
+                    elif _k == "virtual_pilot_execution_stage_by_family":
+                        _default_val = {}
+                    elif _k == "virtual_pilot_post_spec_fail_stage_count":
+                        _default_val = {}
+                    elif _k == "virtual_pilot_family_execution_audit":
+                        _default_val = {}
                     elif _k in {"virtual_pilot_scheduler_selected_blocks", "virtual_pilot_scheduler_skipped_due_to_limit"}:
                         _default_val = []
+                    elif _k == "virtual_pilot_width_group_guarantee_attempted":
+                        _default_val = False
                     elif _k in {"repair_bridge_pack_type", "bridgeability_route_suggestion"} or _k.endswith("_reason"):
                         _default_val = ""
                     elif _k == "repair_bridge_pack_has_real_rows":
@@ -1574,8 +1937,16 @@ class ColdRollingPipeline:
             updated_engine_meta["final_segment_demoted_fragment_count"] = _int(lns_diag.get("final_segment_demoted_fragment_count"))
             updated_engine_meta["final_segment_full_drop_count"] = _int(lns_diag.get("final_segment_full_drop_count"))
 
+            updated_engine_meta = self._ensure_unified_engine_meta(
+                updated_engine_meta,
+                result.config,
+                schedule_df=result.schedule_df if isinstance(result.schedule_df, pd.DataFrame) else pd.DataFrame(),
+                dropped_df=result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else pd.DataFrame(),
+                rounds_df=result.rounds_df if isinstance(result.rounds_df, pd.DataFrame) else pd.DataFrame(),
+            )
             result = replace(result, engine_meta=updated_engine_meta, output_path=export_path)
             em = result.engine_meta or {}
+            self._print_result_snapshot(em)
             diagnostics = self._build_run_diagnostics(orders_df, transition_pack, result)
             diagnostics["validation_summary"] = dict(summary)
             if bool(em.get("best_candidate_available", False)) and int(em.get("candidate_schedule_rows", 0) or 0) > 0:

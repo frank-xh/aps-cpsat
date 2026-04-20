@@ -25,6 +25,8 @@ from typing import Dict, List, Tuple
 import pandas as pd
 
 from aps_cp_sat.config import PlannerConfig
+from aps_cp_sat.model.candidate_graph import build_candidate_graph
+from aps_cp_sat.model.candidate_graph_types import DIRECT_EDGE, REAL_BRIDGE_EDGE, VIRTUAL_BRIDGE_EDGE, VIRTUAL_BRIDGE_FAMILY_EDGE
 from aps_cp_sat.model.local_router import _template_total_cost
 
 
@@ -133,6 +135,7 @@ class TemplateEdgeGraph:
         # Edge filtering diagnostics
         self.filtered_virtual_bridge_edge_count: int = 0
         self.filtered_real_bridge_edge_count: int = 0
+        self.candidate_graph_diagnostics: Dict = {}
 
         # ---- Small roll dual-order reserve: per-line degree tracking ----
         # big_deg[oid] = in + out degree on big_roll
@@ -142,14 +145,22 @@ class TemplateEdgeGraph:
 
         self.accepted_direct_edge_count: int = 0
         self.accepted_real_bridge_edge_count: int = 0
+        self.accepted_virtual_bridge_family_edge_count: int = 0
 
         # Determine edge policy string (Route C = direct_only)
+        # Policy determines which edge types are allowed in constructive building:
+        #   direct_only           : DIRECT only (Route C)
+        #   direct_plus_real_bridge: DIRECT + REAL (Route RB)
+        #   all_edges_allowed     : all three types allowed
+        #   family_frontload      : DIRECT + REAL + VIRTUAL_BRIDGE_FAMILY_EDGE (future)
         if not self.allow_virtual and self.allow_real:
             self.edge_policy: str = "direct_plus_real_bridge"
         elif not self.allow_virtual and not self.allow_real:
             self.edge_policy = "direct_only"  # Route C: strictest mode
         elif self.allow_virtual and self.allow_real:
             self.edge_policy = "all_edges_allowed"
+        elif self.allow_real:
+            self.edge_policy = "family_frontload"  # allow_virtual means family edge
         else:
             self.edge_policy = "virtual_only"
 
@@ -173,35 +184,42 @@ class TemplateEdgeGraph:
             else:
                 self.order_to_lines[oid] = ["big_roll", "small_roll"]
 
-        # Build adjacency lists from templates
+        candidate_graph = build_candidate_graph(self.orders_df, self.tpl_df, self.cfg)
+        self.candidate_graph_diagnostics = dict(candidate_graph.diagnostics)
+
+        # Build adjacency lists from normalized Candidate Graph edges
         if self.tpl_df.empty:
             return
 
-        for _, tpl_row in self.tpl_df.iterrows():
-            from_oid = str(tpl_row["from_order_id"])
-            to_oid = str(tpl_row["to_order_id"])
+        for candidate_edge in candidate_graph.edges:
+            tpl_row = candidate_edge.to_template_row()
+            from_oid = str(candidate_edge.from_order_id)
+            to_oid = str(candidate_edge.to_order_id)
             if from_oid not in self.order_record or to_oid not in self.order_record:
                 continue
 
-            edge_line = str(tpl_row.get("line", "big_roll"))
+            edge_line = str(candidate_edge.line or tpl_row.get("line", "big_roll"))
             if edge_line not in {"big_roll", "small_roll"}:
                 edge_line = "big_roll"
 
             # ---- Bridge edge type filtering ----
-            edge_type = str(tpl_row.get("edge_type", "DIRECT_EDGE") or "DIRECT_EDGE")
-            if edge_type == "VIRTUAL_BRIDGE_EDGE" and not self.allow_virtual:
+            edge_type = str(candidate_edge.edge_type or DIRECT_EDGE)
+            is_virtual = edge_type in (VIRTUAL_BRIDGE_EDGE, VIRTUAL_BRIDGE_FAMILY_EDGE)
+            if is_virtual and not self.allow_virtual:
                 self.filtered_virtual_bridge_edge_count += 1
-                continue  # Skip virtual bridge edge
-            if edge_type == "REAL_BRIDGE_EDGE" and not self.allow_real:
+                continue  # Skip virtual bridge edge (both legacy and family)
+            if edge_type == REAL_BRIDGE_EDGE and not self.allow_real:
                 self.filtered_real_bridge_edge_count += 1
                 continue  # Skip real bridge edge
             # DIRECT_EDGE is always allowed
 
             # Track accepted edge counts for diagnostics
-            if edge_type == "DIRECT_EDGE":
+            if edge_type == DIRECT_EDGE:
                 self.accepted_direct_edge_count += 1
-            elif edge_type == "REAL_BRIDGE_EDGE":
+            elif edge_type == REAL_BRIDGE_EDGE:
                 self.accepted_real_bridge_edge_count += 1
+            elif edge_type == VIRTUAL_BRIDGE_FAMILY_EDGE:
+                self.accepted_virtual_bridge_family_edge_count += 1
 
             # Only add edge if from_oid can run on this line
             if edge_line in self.order_to_lines.get(from_oid, []):
@@ -1403,8 +1421,14 @@ def build_constructive_sequences(
         f"edge_policy={graph.edge_policy}, "
         f"accepted_direct={graph.accepted_direct_edge_count}, "
         f"accepted_real_bridge={graph.accepted_real_bridge_edge_count}, "
+        f"accepted_virtual_family={graph.accepted_virtual_bridge_family_edge_count}, "
         f"filtered_virtual={graph.filtered_virtual_bridge_edge_count}, "
         f"filtered_real={graph.filtered_real_bridge_edge_count}, "
+        f"virtual_family_in_graph={graph.candidate_graph_diagnostics.get('virtual_family_edge_count', 0)}, "
+        f"virtual_family_pruned_by_chain={graph.candidate_graph_diagnostics.get('virtual_family_filtered_by_chain_limit_count', 0)}, "
+        f"virtual_family_pruned_by_temp={graph.candidate_graph_diagnostics.get('virtual_family_filtered_by_temp_count', 0)}, "
+        f"virtual_family_pruned_by_group={graph.candidate_graph_diagnostics.get('virtual_family_filtered_by_group_count', 0)}, "
+        f"virtual_family_topk_pruned={graph.candidate_graph_diagnostics.get('virtual_family_topk_pruned_count', 0)}, "
         f"seed_first={diagnostics.get('small_roll_seed_first_enabled', False)}, "
         f"small_seed_orders={diagnostics.get('small_roll_seed_orders', 0)}, "
         f"small_seed_tons10={diagnostics.get('small_roll_seed_tons10', 0)}, "
@@ -1437,7 +1461,9 @@ def build_constructive_sequences(
     diagnostics["filtered_real_bridge_edge_count"] = graph.filtered_real_bridge_edge_count
     diagnostics["accepted_direct_edge_count"] = graph.accepted_direct_edge_count
     diagnostics["accepted_real_bridge_edge_count"] = graph.accepted_real_bridge_edge_count
+    diagnostics["accepted_virtual_bridge_family_edge_count"] = graph.accepted_virtual_bridge_family_edge_count
     diagnostics["constructive_edge_policy"] = graph.edge_policy
+    diagnostics.update(graph.candidate_graph_diagnostics)
 
     return ConstructiveBuildResult(
         chains_by_line=chains_by_line,

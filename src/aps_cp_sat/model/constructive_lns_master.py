@@ -1917,6 +1917,11 @@ def _run_alns_iteration(
         "tail_rebalance_lns_fail_reasons": [],
         "tail_rebalance_lns_dropped_reinsertion_attempts": 0,
         "tail_rebalance_lns_dropped_reinsertion_success": 0,
+        "local_inserter_direct_arcs_allowed": 0,
+        "local_inserter_real_bridge_arcs_allowed": 0,
+        "local_inserter_real_bridge_arcs_blocked": 0,
+        "local_inserter_virtual_bridge_arcs_blocked": 0,
+        "local_inserter_edge_policy_used": "",
         "low_fill_candidates": 0,
         "low_fill_avg_gap_to_min": 0.0,
         "low_fill_selected_gap": 0.0,
@@ -2245,6 +2250,12 @@ def _run_alns_iteration(
         result = solve_local_insertion_subproblem(
             req, orders_df, transition_pack, cfg,
         )
+        if isinstance(result.diagnostics, dict):
+            tail_repair_diag["local_inserter_direct_arcs_allowed"] += int(result.diagnostics.get("direct_arcs_allowed", 0) or 0)
+            tail_repair_diag["local_inserter_real_bridge_arcs_allowed"] += int(result.diagnostics.get("real_bridge_arcs_allowed", 0) or 0)
+            tail_repair_diag["local_inserter_real_bridge_arcs_blocked"] += int(result.diagnostics.get("real_bridge_arcs_blocked", 0) or 0)
+            tail_repair_diag["local_inserter_virtual_bridge_arcs_blocked"] += int(result.diagnostics.get("virtual_bridge_arcs_blocked", 0) or 0)
+            tail_repair_diag["local_inserter_edge_policy_used"] = str(result.diagnostics.get("edge_policy_used", "") or tail_repair_diag.get("local_inserter_edge_policy_used", ""))
 
         if result.status in (InsertStatus.OPTIMAL, InsertStatus.FEASIBLE):
             repair_count += 1
@@ -2802,6 +2813,11 @@ def run_constructive_lns_master(
         "tail_rebalance_lns_recut_count": 0,
         "tail_rebalance_lns_dropped_reinsertion_attempts": 0,
         "tail_rebalance_lns_dropped_reinsertion_success": 0,
+        "local_inserter_direct_arcs_allowed": 0,
+        "local_inserter_real_bridge_arcs_allowed": 0,
+        "local_inserter_real_bridge_arcs_blocked": 0,
+        "local_inserter_virtual_bridge_arcs_blocked": 0,
+        "local_inserter_edge_policy_used": "",
         "low_fill_candidates_total": 0,
     }
 
@@ -2879,6 +2895,8 @@ def run_constructive_lns_master(
         for k, v in round_tail_diag.items():
             if k in accum_tail_repair_diag and isinstance(v, (int, float)):
                 accum_tail_repair_diag[k] += v
+            elif k == "local_inserter_edge_policy_used" and v:
+                accum_tail_repair_diag[k] = str(v)
             elif k == "low_fill_candidates":
                 accum_tail_repair_diag["low_fill_candidates_total"] += v
 
@@ -3346,20 +3364,30 @@ def run_constructive_lns_master(
         clean_final_segs, orders_for_build, tpl_df, cfg=cfg
     )
 
-    # ---- Route C (direct_only) leak detection ----
-    # Check if any bridge edges leaked into planned_df despite allow_*=False
+
+    edge_policy_label = (
+        "direct_only"
+        if not allow_virtual_bridge and not allow_real_bridge
+        else "direct_plus_real_bridge"
+        if not allow_virtual_bridge
+        else "all_edges_allowed"
+    )
+    # ---- Constructive edge policy leak detection ----
+    # Check only edge types forbidden by the currently selected policy.
     if not allow_virtual_bridge or not allow_real_bridge:
         real_bridge_leak = 0
         virtual_bridge_leak = 0
         if not final_planned_df.empty and "selected_edge_type" in final_planned_df.columns:
-            real_bridge_leak = int((final_planned_df["selected_edge_type"] == "REAL_BRIDGE_EDGE").sum())
-            virtual_bridge_leak = int((final_planned_df["selected_edge_type"] == "VIRTUAL_BRIDGE_EDGE").sum())
+            if not allow_real_bridge:
+                real_bridge_leak = int((final_planned_df["selected_edge_type"] == "REAL_BRIDGE_EDGE").sum())
+            if not allow_virtual_bridge:
+                virtual_bridge_leak = int((final_planned_df["selected_edge_type"] == "VIRTUAL_BRIDGE_EDGE").sum())
         if real_bridge_leak > 0 or virtual_bridge_leak > 0:
             print(
-                f"[APS][WARNING] 路线C(direct_only)桥接泄漏检测: "
-                f"allow_virtual={allow_virtual_bridge}, allow_real={allow_real_bridge}, "
-                f"但结果中包含 {real_bridge_leak} 条 REAL_BRIDGE_EDGE, "
-                f"{virtual_bridge_leak} 条 VIRTUAL_BRIDGE_EDGE！"
+                f"[APS][WARNING] constructive edge policy leak detected: "
+                f"edge_policy={edge_policy_label}, allow_virtual={allow_virtual_bridge}, "
+                f"allow_real={allow_real_bridge}, forbidden_real_edges={real_bridge_leak}, "
+                f"forbidden_virtual_edges={virtual_bridge_leak}"
             )
             diagnostics["bridge_edge_leak_detected"] = True
             diagnostics["bridge_edge_leak_real_count"] = real_bridge_leak
@@ -3367,8 +3395,8 @@ def run_constructive_lns_master(
             engine_meta["bridge_edge_leak_detected"] = True
         else:
             print(
-                f"[APS][路线C确认] constructive_edge_policy=direct_only, "
-                f"结果中无桥接边泄漏, direct_only 语义正确"
+                f"[APS][constructive_edge_policy_confirm] constructive_edge_policy={edge_policy_label}, "
+                f"forbidden edge leak count=0"
             )
             diagnostics["bridge_edge_leak_detected"] = False
             diagnostics["bridge_edge_leak_real_count"] = 0
@@ -3557,6 +3585,20 @@ def run_constructive_lns_master(
         "virtual_pilot_family_prefilter_fail_count",
         "virtual_pilot_width_group_family_attempt_count",
         "virtual_pilot_thickness_family_attempt_count",
+        "virtual_pilot_selected_candidate_count",
+        "virtual_pilot_dedup_kept_count",
+        "virtual_pilot_dedup_skipped_count",
+        "virtual_pilot_attempt_started_count",
+        "virtual_pilot_spec_enum_done_count",
+        "virtual_pilot_recut_entered_count",
+        "virtual_pilot_segment_valid_count",
+        "virtual_pilot_ton_fill_entered_count",
+        "virtual_pilot_apply_check_entered_count",
+        "virtual_pilot_apply_success_count",
+        "virtual_pilot_execution_stage_by_family",
+        "virtual_pilot_post_spec_fail_stage_count",
+        "virtual_pilot_family_execution_audit",
+        "virtual_pilot_width_group_guarantee_attempted",
         "conservative_apply_attempt_count",
         "conservative_apply_success_count",
         "conservative_apply_reject_count",
@@ -3615,6 +3657,14 @@ def run_constructive_lns_master(
             return {}
         if key == "virtual_pilot_selected_by_family_count":
             return {}
+        if key == "virtual_pilot_execution_stage_by_family":
+            return {}
+        if key == "virtual_pilot_post_spec_fail_stage_count":
+            return {}
+        if key == "virtual_pilot_family_execution_audit":
+            return {}
+        if key == "virtual_pilot_width_group_guarantee_attempted":
+            return False
         if key in {"virtual_pilot_scheduler_selected_blocks", "virtual_pilot_scheduler_skipped_due_to_limit"}:
             return []
         if key in {"repair_bridge_pack_type", "bridgeability_route_suggestion"}:
@@ -3661,6 +3711,10 @@ def run_constructive_lns_master(
             if not allow_virtual_bridge
             else "all_edges_allowed"
         ),
+        "accepted_direct_edge_count": int(build_result.diagnostics.get("accepted_direct_edge_count", 0) or 0),
+        "accepted_real_bridge_edge_count": int(build_result.diagnostics.get("accepted_real_bridge_edge_count", 0) or 0),
+        "filtered_virtual_bridge_edge_count": int(build_result.diagnostics.get("filtered_virtual_bridge_edge_count", 0) or 0),
+        "filtered_real_bridge_edge_count": int(build_result.diagnostics.get("filtered_real_bridge_edge_count", 0) or 0),
         "joint_master_branch_enabled": False,
         "old_master_blocked": True,
         "campaign_id_string_preserved": True,
@@ -3780,6 +3834,10 @@ def run_constructive_lns_master(
             if not allow_virtual_bridge
             else "all_edges_allowed"
         ),
+        "accepted_direct_edge_count": int(build_result.diagnostics.get("accepted_direct_edge_count", 0) or 0),
+        "accepted_real_bridge_edge_count": int(build_result.diagnostics.get("accepted_real_bridge_edge_count", 0) or 0),
+        "filtered_virtual_bridge_edge_count": int(build_result.diagnostics.get("filtered_virtual_bridge_edge_count", 0) or 0),
+        "filtered_real_bridge_edge_count": int(build_result.diagnostics.get("filtered_real_bridge_edge_count", 0) or 0),
         # Leak detection: if direct_only mode but REAL/VIRTUAL_BRIDGE_EDGE appears in planned_df
         "bridge_edge_leak_detected": False,  # Will be set below after planned_df check
         # neighborhood pool diagnostics
@@ -3794,6 +3852,11 @@ def run_constructive_lns_master(
         "tail_rebalance_lns_recut_count": accum_tail_repair_diag.get("tail_rebalance_lns_recut_count", 0),
         "tail_rebalance_lns_dropped_reinsertion_attempts": accum_tail_repair_diag.get("tail_rebalance_lns_dropped_reinsertion_attempts", 0),
         "tail_rebalance_lns_dropped_reinsertion_success": accum_tail_repair_diag.get("tail_rebalance_lns_dropped_reinsertion_success", 0),
+        "local_inserter_direct_arcs_allowed": accum_tail_repair_diag.get("local_inserter_direct_arcs_allowed", 0),
+        "local_inserter_real_bridge_arcs_allowed": accum_tail_repair_diag.get("local_inserter_real_bridge_arcs_allowed", 0),
+        "local_inserter_real_bridge_arcs_blocked": accum_tail_repair_diag.get("local_inserter_real_bridge_arcs_blocked", 0),
+        "local_inserter_virtual_bridge_arcs_blocked": accum_tail_repair_diag.get("local_inserter_virtual_bridge_arcs_blocked", 0),
+        "local_inserter_edge_policy_used": accum_tail_repair_diag.get("local_inserter_edge_policy_used", ""),
         "low_fill_neighborhood_total_count": sum(
             1 for r in rounds_records if r.neighborhood_type == NeighborhoodType.LOW_FILL_SEGMENT
         ),
