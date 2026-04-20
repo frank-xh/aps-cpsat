@@ -147,17 +147,25 @@ class _StrictTemplateGraph:
 
         # Arc filtering diagnostics
         self.virtual_bridge_arcs_blocked: int = 0
+        self.virtual_bridge_family_arcs_allowed: int = 0
         self.real_bridge_arcs_blocked: int = 0
         self.real_bridge_arcs_allowed: int = 0
         self.direct_arcs_allowed: int = 0
 
         # Determine edge policy string (Route C = direct_only)
+        # Policy determines which arc types are allowed in local inserter:
+        #   direct_only           : DIRECT_EDGE only
+        #   direct_plus_real_bridge: DIRECT_EDGE + REAL_BRIDGE_EDGE
+        #   all_edges_allowed     : all three types (legacy virtual)
+        #   family_frontload      : DIRECT + REAL + VIRTUAL_BRIDGE_FAMILY_EDGE (future)
         if not self.allow_virtual and self.allow_real:
             self.edge_policy_used: str = "direct_plus_real_bridge"
         elif not self.allow_virtual and not self.allow_real:
             self.edge_policy_used = "direct_only"  # Route C: strictest mode
         elif self.allow_virtual and self.allow_real:
             self.edge_policy_used = "all_edges_allowed"
+        elif self.allow_real:
+            self.edge_policy_used = "family_frontload"  # allow_virtual means family edge
         else:
             self.edge_policy_used = "virtual_only"
 
@@ -192,10 +200,14 @@ class _StrictTemplateGraph:
             cost = _template_total_cost(dict(row), cfg.score)
             bridge_count = int(row.get("bridge_count", 0) or 0)
             edge_type = str(row.get("edge_type", "DIRECT_EDGE") or "DIRECT_EDGE")
-            is_virtual = edge_type == "VIRTUAL_BRIDGE_EDGE"
+            is_virtual_family = (edge_type == "VIRTUAL_BRIDGE_FAMILY_EDGE")
+            is_virtual_legacy = (edge_type == "VIRTUAL_BRIDGE_EDGE")
 
-            # ---- Bridge edge type filtering (Route B/C) ----
-            if edge_type == "VIRTUAL_BRIDGE_EDGE" and not self.allow_virtual:
+            # ---- Bridge edge type filtering (Route B/C/Family) ----
+            # VIRTUAL_BRIDGE_EDGE and VIRTUAL_BRIDGE_FAMILY_EDGE are both
+            # controlled by allow_virtual flag (consistent with constructive builder)
+            is_virtual = is_virtual_legacy or is_virtual_family
+            if is_virtual and not self.allow_virtual:
                 self.virtual_bridge_arcs_blocked += 1
                 continue  # Skip virtual bridge edge - do not create arc
             if edge_type == "REAL_BRIDGE_EDGE" and not self.allow_real:
@@ -206,6 +218,8 @@ class _StrictTemplateGraph:
                 self.direct_arcs_allowed += 1
             elif edge_type == "REAL_BRIDGE_EDGE" and self.allow_real:
                 self.real_bridge_arcs_allowed += 1
+            elif is_virtual_family and self.allow_virtual:
+                self.virtual_bridge_family_arcs_allowed += 1
             # DIRECT_EDGE is always allowed
 
             edge_info = _SubproblemEdgeInfo(
@@ -237,6 +251,17 @@ class _StrictTemplateGraph:
             if e.from_idx == from_idx and e.to_idx == to_idx:
                 return e
         return None
+
+    def diagnostics(self) -> Dict:
+        """Return strict graph bridge-filter diagnostics for all exit paths."""
+        return {
+            "direct_arcs_allowed": int(self.direct_arcs_allowed),
+            "real_bridge_arcs_allowed": int(self.real_bridge_arcs_allowed),
+            "virtual_bridge_family_arcs_allowed": int(self.virtual_bridge_family_arcs_allowed),
+            "real_bridge_arcs_blocked": int(self.real_bridge_arcs_blocked),
+            "virtual_bridge_arcs_blocked": int(self.virtual_bridge_arcs_blocked),
+            "edge_policy_used": str(self.edge_policy_used),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +608,7 @@ def solve_local_insertion_subproblem(
         tpl_df = pd.DataFrame()
 
     graph = _StrictTemplateGraph(subproblem_ids, tpl_df, cfg, req.line)
+    graph_diag = graph.diagnostics()
 
     # Check feasibility: at minimum, need at least one edge from fixed backbone
     has_any_edge = len(graph.edges) > 0
@@ -602,6 +628,7 @@ def solve_local_insertion_subproblem(
                 "objective_mode": "lexicographic_approx",
                 "uses_true_addcircuit": True,
                 "depot_idx": -1,
+                **graph_diag,
             },
         )
 
@@ -744,8 +771,13 @@ def solve_local_insertion_subproblem(
                     "failure_reason": failure_reason,
                     "used_hint": False,
                     "objective_mode": "lexicographic_approx",
+                    "objective_accept_count": 0,
+                    "objective_accept_tons10": 0,
+                    "objective_template_cost": 0,
+                    "objective_virtual_bridge_edges": 0,
                     "uses_true_addcircuit": True,
                     "depot_idx": depot_idx,
+                    **graph_diag,
                 },
             )
 
@@ -886,8 +918,13 @@ def solve_local_insertion_subproblem(
                     "reason": "PATH_EXTRACTION_FAILED",
                     "extraction_diag": extract_diag,
                     "objective_mode": "lexicographic_approx",
+                    "objective_accept_count": 0,
+                    "objective_accept_tons10": 0,
+                    "objective_template_cost": 0,
+                    "objective_virtual_bridge_edges": 0,
                     "uses_true_addcircuit": True,
                     "depot_idx": depot_idx,
+                    **graph_diag,
                 },
             )
 
@@ -952,8 +989,13 @@ def solve_local_insertion_subproblem(
                     "validation_errors": validation_errors,
                     "extraction_diag": extract_diag,
                     "objective_mode": "lexicographic_approx",
+                    "objective_accept_count": 0,
+                    "objective_accept_tons10": 0,
+                    "objective_template_cost": 0,
+                    "objective_virtual_bridge_edges": 0,
                     "uses_true_addcircuit": True,
                     "depot_idx": depot_idx,
+                    **graph_diag,
                 },
             )
 
@@ -1049,6 +1091,7 @@ def solve_local_insertion_subproblem(
             "real_bridge_arcs_allowed": graph.real_bridge_arcs_allowed,
             "direct_arcs_allowed": graph.direct_arcs_allowed,
             "edge_policy_used": graph.edge_policy_used,
+            **graph_diag,
         }
 
         return LocalInsertResult(
@@ -1077,8 +1120,13 @@ def solve_local_insertion_subproblem(
                 "used_hint": hint_used,
                 "reason": "MODEL_INFEASIBLE",
                 "objective_mode": "lexicographic_approx",
+                "objective_accept_count": 0,
+                "objective_accept_tons10": 0,
+                "objective_template_cost": 0,
+                "objective_virtual_bridge_edges": 0,
                 "uses_true_addcircuit": True,
                 "depot_idx": depot_idx,
+                **graph_diag,
             },
         )
 
@@ -1102,6 +1150,7 @@ def solve_local_insertion_subproblem(
                 "objective_mode": "lexicographic_approx",
                 "uses_true_addcircuit": True,
                 "depot_idx": depot_idx,
+                **graph_diag,
             },
         )
 

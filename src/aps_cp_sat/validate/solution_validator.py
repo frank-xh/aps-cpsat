@@ -372,7 +372,7 @@ def validate_solution_summary(result: ColdRollingResult, rule: RuleConfig | None
         out["solver_path"] = "constructive_lns"
 
         # ---- Bridge expansion mode guard ----
-        # Get bridge_expansion_mode from multiple possible locations
+        # Top-level engine_meta is the stable source of truth after pipeline normalization.
         bridge_expand_mode = str(
             _engine_meta.get("bridge_expansion_mode", "disabled")
             or lns_diag.get("bridge_expansion_mode", "disabled")

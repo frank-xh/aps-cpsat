@@ -2286,6 +2286,58 @@ def _record_virtual_pilot_fail_stage(
     )
 
 
+def _record_virtual_pilot_execution_stage(
+    diag: dict,
+    *,
+    line: str,
+    block_id: int,
+    candidate_id: str,
+    family: str,
+    stage: str,
+    details: dict | None = None,
+) -> None:
+    stage_key = str(stage)
+    field_by_stage = {
+        "SELECTED": "virtual_pilot_selected_candidate_count",
+        "DEDUP_KEPT": "virtual_pilot_dedup_kept_count",
+        "DEDUP_SKIPPED": "virtual_pilot_dedup_skipped_count",
+        "ATTEMPT_STARTED": "virtual_pilot_attempt_started_count",
+        "SPEC_ENUM_DONE": "virtual_pilot_spec_enum_done_count",
+        "RECUT_ENTERED": "virtual_pilot_recut_entered_count",
+        "TON_FILL_ENTERED": "virtual_pilot_ton_fill_entered_count",
+        "APPLY_CHECK_ENTERED": "virtual_pilot_apply_check_entered_count",
+    }
+    field = field_by_stage.get(stage_key)
+    if field:
+        diag[field] = int(diag.get(field, 0) or 0) + 1
+    by_family = diag.setdefault("virtual_pilot_execution_stage_by_family", {})
+    fam = str(family or "OTHER")
+    fam_counts = by_family.setdefault(fam, {})
+    fam_counts[stage_key] = int(fam_counts.get(stage_key, 0) or 0) + 1
+    print(
+        f"[APS][VIRTUAL_BRIDGE_EXECUTION_STAGE] line={line}, block_id={block_id}, "
+        f"candidate_id={candidate_id}, family={fam}, stage={stage_key}, details={details or {}}"
+    )
+
+
+def _record_virtual_post_spec_fail(
+    diag: dict,
+    *,
+    line: str,
+    block_id: int,
+    candidate_id: str,
+    family: str,
+    fail_stage: str,
+    details: dict | None = None,
+) -> None:
+    counts = diag.setdefault("virtual_pilot_post_spec_fail_stage_count", {})
+    counts[str(fail_stage)] = int(counts.get(str(fail_stage), 0) or 0) + 1
+    print(
+        f"[APS][VIRTUAL_BRIDGE_POST_SPEC_FAIL] line={line}, block_id={block_id}, "
+        f"candidate_id={candidate_id}, family={family}, fail_stage={fail_stage}, details={details or {}}"
+    )
+
+
 def _classify_virtual_pilot_recut_fail(pilot_diag: dict, virtual_used: int, virtual_tons: float) -> tuple[str, str, dict]:
     details = {
         "candidate_cutpoints_total": int(pilot_diag.get("candidate_cutpoints_total", 0) or 0),
@@ -4342,6 +4394,20 @@ def _reconstruct_underfilled_segments(
         "virtual_pilot_family_prefilter_fail_count": 0,
         "virtual_pilot_width_group_family_attempt_count": 0,
         "virtual_pilot_thickness_family_attempt_count": 0,
+        "virtual_pilot_selected_candidate_count": 0,
+        "virtual_pilot_dedup_kept_count": 0,
+        "virtual_pilot_dedup_skipped_count": 0,
+        "virtual_pilot_attempt_started_count": 0,
+        "virtual_pilot_spec_enum_done_count": 0,
+        "virtual_pilot_recut_entered_count": 0,
+        "virtual_pilot_segment_valid_count": 0,
+        "virtual_pilot_ton_fill_entered_count": 0,
+        "virtual_pilot_apply_check_entered_count": 0,
+        "virtual_pilot_apply_success_count": 0,
+        "virtual_pilot_execution_stage_by_family": {},
+        "virtual_pilot_post_spec_fail_stage_count": {},
+        "virtual_pilot_family_execution_audit": {},
+        "virtual_pilot_width_group_guarantee_attempted": False,
         "conservative_apply_attempt_count": 0,
         "conservative_apply_success_count": 0,
         "conservative_apply_reject_count": 0,
@@ -5400,9 +5466,27 @@ def _reconstruct_underfilled_segments(
                         scheduler_family = _virtual_pilot_failure_family(target)
                         scheduler_bucket = scheduler_family
                         pilot_key = _virtual_pilot_key(str(line), target)
+                        _record_virtual_pilot_execution_stage(
+                            diag,
+                            line=str(line),
+                            block_id=int(block_id),
+                            candidate_id=str(target.get("candidate_id", "")),
+                            family=scheduler_family,
+                            stage="SELECTED",
+                            details={"pilot_key": pilot_key},
+                        )
                         if pilot_key in virtual_pilot_seen_keys:
                             diag["virtual_pilot_skipped_block_count"] += 1
                             diag["virtual_pilot_duplicate_candidate_skipped_count"] += 1
+                            _record_virtual_pilot_execution_stage(
+                                diag,
+                                line=str(line),
+                                block_id=int(block_id),
+                                candidate_id=str(target.get("candidate_id", "")),
+                                family=scheduler_family,
+                                stage="DEDUP_SKIPPED",
+                                details={"pilot_key": pilot_key, "reason": "DUPLICATE_PILOT_KEY"},
+                            )
                             reject_by_reason = diag.setdefault("virtual_pilot_reject_by_reason_count", {})
                             reject_by_reason["DUPLICATE_PILOT_KEY"] = int(reject_by_reason.get("DUPLICATE_PILOT_KEY", 0) or 0) + 1
                             print(
@@ -5412,6 +5496,15 @@ def _reconstruct_underfilled_segments(
                             continue
                         virtual_pilot_seen_keys.add(pilot_key)
                         diag["virtual_pilot_dedup_group_count"] += 1
+                        _record_virtual_pilot_execution_stage(
+                            diag,
+                            line=str(line),
+                            block_id=int(block_id),
+                            candidate_id=str(target.get("candidate_id", "")),
+                            family=scheduler_family,
+                            stage="DEDUP_KEPT",
+                            details={"pilot_key": pilot_key},
+                        )
                         print(
                             f"[APS][VIRTUAL_BRIDGE_PILOT_DEDUP] candidate_id={target.get('candidate_id')}, "
                             f"pilot_key={pilot_key}, kept=True, reason=BEST_OF_DUP_GROUP"
@@ -5467,6 +5560,15 @@ def _reconstruct_underfilled_segments(
                         )
                         diag["virtual_pilot_spec_enum_total"] += int(spec_diag.get("specs_tested", 0) or 0)
                         diag["virtual_pilot_spec_enum_both_valid_count"] += int(spec_diag.get("both_valid_count", 0) or 0)
+                        _record_virtual_pilot_execution_stage(
+                            diag,
+                            line=str(line),
+                            block_id=int(block_id),
+                            candidate_id=str(target.get("candidate_id", "")),
+                            family=scheduler_family,
+                            stage="SPEC_ENUM_DONE",
+                            details=dict(spec_diag),
+                        )
                         print(
                             f"[APS][VIRTUAL_BRIDGE_SPEC_ENUM] line={line}, block_id={block_id}, "
                             f"candidate_id={target.get('candidate_id')}, family={scheduler_family}, "
@@ -5476,10 +5578,25 @@ def _reconstruct_underfilled_segments(
                             f"both_valid_count={int(spec_diag.get('both_valid_count', 0) or 0)}"
                         )
                         family_prefilter_ok, family_prefilter_reason = _virtual_pilot_family_prefilter(scheduler_family, selected_spec)
+                        width_group_guaranteed = False
+                        if (
+                            scheduler_family == "WIDTH_GROUP"
+                            and selected_spec is not None
+                            and not bool(family_prefilter_ok)
+                        ):
+                            family_prefilter_ok = True
+                            width_group_guaranteed = True
+                            diag["virtual_pilot_width_group_guarantee_attempted"] = True
                         print(
                             f"[APS][VIRTUAL_BRIDGE_FAMILY_PREFILTER] candidate_id={target.get('candidate_id')}, "
                             f"family={scheduler_family}, pass={bool(family_prefilter_ok)}, reason={family_prefilter_reason}"
                         )
+                        if scheduler_family == "WIDTH_GROUP":
+                            print(
+                                f"[APS][VIRTUAL_BRIDGE_FAMILY_GUARANTEE] family=WIDTH_GROUP, "
+                                f"guaranteed_attempt={bool(width_group_guaranteed)}, "
+                                f"reason={'WIDTH_GROUP_PREFILTER_BYPASS' if width_group_guaranteed else family_prefilter_reason}"
+                            )
                         if selected_spec is None:
                             diag["virtual_pilot_reject_count"] += 1
                             fail_stage, fail_reason, fail_details = _classify_virtual_transition_spec_failure(specs, spec_diag)
@@ -5495,6 +5612,15 @@ def _reconstruct_underfilled_segments(
                             print(
                                 f"[APS][VIRTUAL_BRIDGE_PILOT_FAIL] line={line}, block_id={block_id}, "
                                 f"reason={fail_reason}"
+                            )
+                            _record_virtual_pilot_execution_stage(
+                                diag,
+                                line=str(line),
+                                block_id=int(block_id),
+                                candidate_id=str(target.get("candidate_id", "")),
+                                family=scheduler_family,
+                                stage="FAIL",
+                                details={"reason": str(fail_reason), "fail_stage": str(fail_stage)},
                             )
                             continue
                         if not family_prefilter_ok:
@@ -5513,6 +5639,15 @@ def _reconstruct_underfilled_segments(
                                 f"[APS][VIRTUAL_BRIDGE_PILOT_FAIL] line={line}, block_id={block_id}, "
                                 f"reason=FAMILY_PREFILTER_FAIL"
                             )
+                            _record_virtual_pilot_execution_stage(
+                                diag,
+                                line=str(line),
+                                block_id=int(block_id),
+                                candidate_id=str(target.get("candidate_id", "")),
+                                family=scheduler_family,
+                                stage="FAIL",
+                                details={"reason": "FAMILY_PREFILTER_FAIL"},
+                            )
                             continue
                         print(
                             f"[APS][VIRTUAL_BRIDGE_SPEC_SELECTED] line={line}, block_id={block_id}, "
@@ -5521,6 +5656,15 @@ def _reconstruct_underfilled_segments(
                             f"temp_low:{selected_spec.get('temp_low')}, temp_high:{selected_spec.get('temp_high')}}}"
                         )
                         diag["virtual_pilot_attempt_count"] += 1
+                        _record_virtual_pilot_execution_stage(
+                            diag,
+                            line=str(line),
+                            block_id=int(block_id),
+                            candidate_id=str(target.get("candidate_id", "")),
+                            family=scheduler_family,
+                            stage="ATTEMPT_STARTED",
+                            details={"pair": pair, "virtual_tons": float(pilot_virtual_tons)},
+                        )
                         if scheduler_family == "WIDTH_GROUP":
                             diag["virtual_pilot_width_group_family_attempt_count"] += 1
                         elif scheduler_family == "THICKNESS":
@@ -5546,7 +5690,29 @@ def _reconstruct_underfilled_segments(
                                 f"[APS][VIRTUAL_BRIDGE_PILOT_FAIL] line={line}, block_id={block_id}, "
                                 f"reason=VIRTUAL_TON_LIMIT_EXCEEDED"
                             )
+                            _record_virtual_pilot_execution_stage(
+                                diag,
+                                line=str(line),
+                                block_id=int(block_id),
+                                candidate_id=str(target.get("candidate_id", "")),
+                                family=scheduler_family,
+                                stage="FAIL",
+                                details={"reason": "VIRTUAL_TON_LIMIT_EXCEEDED"},
+                            )
                         else:
+                            _record_virtual_pilot_execution_stage(
+                                diag,
+                                line=str(line),
+                                block_id=int(block_id),
+                                candidate_id=str(target.get("candidate_id", "")),
+                                family=scheduler_family,
+                                stage="RECUT_ENTERED",
+                                details={"block_size": int(block_size)},
+                            )
+                            print(
+                                f"[APS][VIRTUAL_BRIDGE_RECUT_ENTER] line={line}, block_id={block_id}, "
+                                f"candidate_id={target.get('candidate_id')}, family={scheduler_family}"
+                            )
                             pilot_valid, pilot_under, pilot_diag = _solve_underfilled_reconstruction_block(
                                 block,
                                 direct_edges=direct_edges,
@@ -5569,8 +5735,29 @@ def _reconstruct_underfilled_segments(
                             )
                             pilot_virtual_used = int(pilot_diag.get("virtual_bridge_used", 0) or 0)
                             pilot_virtual_used_tons = float(pilot_diag.get("virtual_bridge_tons", 0.0) or 0.0)
+                            print(
+                                f"[APS][VIRTUAL_BRIDGE_SEGMENT_VALIDATE] line={line}, block_id={block_id}, "
+                                f"candidate_id={target.get('candidate_id')}, family={scheduler_family}, "
+                                f"pilot_valid={bool(pilot_valid)}, virtual_used={pilot_virtual_used}, "
+                                f"virtual_tons={pilot_virtual_used_tons:.1f}"
+                            )
+                            if pilot_valid:
+                                diag["virtual_pilot_segment_valid_count"] += 1
                             if (not pilot_valid) and int(pilot_diag.get("candidate_cutpoints_ton_window_valid", 0) or 0) <= 0:
                                 diag["virtual_pilot_ton_fill_attempt_count"] += 1
+                                _record_virtual_pilot_execution_stage(
+                                    diag,
+                                    line=str(line),
+                                    block_id=int(block_id),
+                                    candidate_id=str(target.get("candidate_id", "")),
+                                    family=scheduler_family,
+                                    stage="TON_FILL_ENTERED",
+                                    details={"reason": "NO_TON_WINDOW_VALID_CUTPOINT"},
+                                )
+                                print(
+                                    f"[APS][VIRTUAL_BRIDGE_TON_FILL_ENTER] line={line}, block_id={block_id}, "
+                                    f"candidate_id={target.get('candidate_id')}, family={scheduler_family}"
+                                )
                                 fill_block = list(block)
                                 fill_success = False
                                 fill_after_tons = float(block_tons)
@@ -5624,12 +5811,25 @@ def _reconstruct_underfilled_segments(
                             if pilot_valid and 0 < pilot_virtual_used <= int(virtual_pilot_max_per_block) and pilot_virtual_used_tons <= float(virtual_pilot_max_tons) + 1e-6:
                                 diag["virtual_pilot_success_count"] += 1
                                 pilot_diag["candidate_id"] = str(target.get("candidate_id", ""))
+                                pilot_diag["family"] = str(scheduler_family)
                                 best = (pilot_valid, pilot_under, pilot_diag, "VIRTUAL_PILOT", block)
                                 best_size = block_size
                                 print(
                                     f"[APS][VIRTUAL_BRIDGE_PILOT_SUCCESS] line={line}, block_id={block_id}, "
                                     f"salvaged_segments={len(pilot_valid)}, "
                                     f"salvaged_orders={int(pilot_diag.get('salvaged_orders', 0) or 0)}"
+                                )
+                                _record_virtual_pilot_execution_stage(
+                                    diag,
+                                    line=str(line),
+                                    block_id=int(block_id),
+                                    candidate_id=str(target.get("candidate_id", "")),
+                                    family=scheduler_family,
+                                    stage="SUCCESS",
+                                    details={
+                                        "salvaged_segments": int(len(pilot_valid)),
+                                        "salvaged_orders": int(pilot_diag.get("salvaged_orders", 0) or 0),
+                                    },
                                 )
                                 break
                             diag["virtual_pilot_reject_count"] += 1
@@ -5648,9 +5848,36 @@ def _reconstruct_underfilled_segments(
                                 reason=str(fail_reason),
                                 details=dict(fail_details),
                             )
+                            if int(spec_diag.get("both_valid_count", 0) or 0) > 0:
+                                if fail_stage == "VIRTUAL_LOCAL_RECUT_FAIL":
+                                    post_stage = "VIRTUAL_LOCAL_RECUT_FAIL"
+                                elif fail_stage in {"VIRTUAL_BOTH_TRANSITIONS_INVALID", "VIRTUAL_TRANSITION_INVALID"}:
+                                    post_stage = "VIRTUAL_SEGMENT_INVALID_AFTER_RECUT"
+                                elif fail_stage == "VIRTUAL_TON_BELOW_MIN":
+                                    post_stage = "VIRTUAL_TON_FILL_FAIL"
+                                else:
+                                    post_stage = "VIRTUAL_POST_SPEC_UNKNOWN_FAIL"
+                                _record_virtual_post_spec_fail(
+                                    diag,
+                                    line=str(line),
+                                    block_id=int(block_id),
+                                    candidate_id=str(target.get("candidate_id", "")),
+                                    family=scheduler_family,
+                                    fail_stage=post_stage,
+                                    details=dict(fail_details),
+                                )
                             print(
                                 f"[APS][VIRTUAL_BRIDGE_PILOT_FAIL] line={line}, block_id={block_id}, "
                                 f"reason={fail_reason}"
+                            )
+                            _record_virtual_pilot_execution_stage(
+                                diag,
+                                line=str(line),
+                                block_id=int(block_id),
+                                candidate_id=str(target.get("candidate_id", "")),
+                                family=scheduler_family,
+                                stage="FAIL",
+                                details={"reason": str(fail_reason), "fail_stage": str(fail_stage)},
                             )
             if best is None:
                 diag["underfilled_reconstruction_blocks_skipped"] += 1
@@ -5778,6 +6005,23 @@ def _reconstruct_underfilled_segments(
                 f"integrity_ok={bool(pair_integrity_ok)}, apply={bool(apply_ok)}, reject_reason={apply_reject_reason}"
             )
             if mode == "VIRTUAL_PILOT":
+                _record_virtual_pilot_execution_stage(
+                    diag,
+                    line=str(line),
+                    block_id=int(block_id),
+                    candidate_id=str(block_diag.get("candidate_id", "")),
+                    family=str(block_diag.get("family", "")),
+                    stage="APPLY_CHECK_ENTERED",
+                    details={
+                        "gain": bool(recon_gain),
+                        "pair_integrity_ok": bool(pair_integrity_ok),
+                        "virtual_pilot_limit_ok": bool(virtual_pilot_limit_ok),
+                    },
+                )
+                print(
+                    f"[APS][VIRTUAL_BRIDGE_APPLY_CHECK_ENTER] line={line}, block_id={block_id}, "
+                    f"candidate_id={block_diag.get('candidate_id', '')}"
+                )
                 print(
                     f"[APS][VIRTUAL_BRIDGE_PILOT_APPLY_CHECK] line={line}, block_id={block_id}, "
                     f"gain={bool(recon_gain)}, integrity_ok={bool(pair_integrity_ok and virtual_pilot_limit_ok)}, "
@@ -5835,6 +6079,29 @@ def _reconstruct_underfilled_segments(
                             "virtual_pilot_limit_ok": bool(virtual_pilot_limit_ok),
                         },
                     )
+                    _record_virtual_post_spec_fail(
+                        diag,
+                        line=str(line),
+                        block_id=int(block_id),
+                        candidate_id=str(block_diag.get("candidate_id", "")),
+                        family=str(block_diag.get("family", "")),
+                        fail_stage="VIRTUAL_APPLY_GATE_REJECT",
+                        details={
+                            "gain": bool(recon_gain),
+                            "pair_integrity_ok": bool(pair_integrity_ok),
+                            "virtual_pilot_limit_ok": bool(virtual_pilot_limit_ok),
+                            "apply_reject_reason": str(apply_reject_reason or ""),
+                        },
+                    )
+                    _record_virtual_pilot_execution_stage(
+                        diag,
+                        line=str(line),
+                        block_id=int(block_id),
+                        candidate_id=str(block_diag.get("candidate_id", "")),
+                        family=str(block_diag.get("family", "")),
+                        stage="FAIL",
+                        details={"reason": str(apply_reject_reason or "VIRTUAL_APPLY_GATE_REJECT")},
+                    )
                 if recon_gain:
                     diag["underfilled_reconstruction_improvement_recorded_count"] += 1
                 final_decision = "IMPROVEMENT_RECORDED_BUT_NOT_APPLIED" if recon_gain else "NO_GAIN"
@@ -5856,6 +6123,16 @@ def _reconstruct_underfilled_segments(
             diag["underfilled_reconstruction_improvement_applied_count"] += 1
             if mode == "VIRTUAL_PILOT":
                 diag["virtual_pilot_apply_count"] += 1
+                diag["virtual_pilot_apply_success_count"] += 1
+                _record_virtual_pilot_execution_stage(
+                    diag,
+                    line=str(line),
+                    block_id=int(block_id),
+                    candidate_id=str(block_diag.get("candidate_id", "")),
+                    family=str(block_diag.get("family", "")),
+                    stage="SUCCESS",
+                    details={"reason": "IMPROVEMENT_APPLIED"},
+                )
             if mode != "VIRTUAL_PILOT":
                 _update_bridgeability_census_final_decision(
                     bridgeability_census,
@@ -5921,6 +6198,38 @@ def _reconstruct_underfilled_segments(
     diag["virtual_pilot_selected_by_family_count"] = dict(virtual_pilot_selected_by_family)
     diag["virtual_pilot_scheduler_selected_blocks"] = list(virtual_pilot_scheduler_selected_blocks)
     diag["virtual_pilot_scheduler_skipped_due_to_limit"] = list(virtual_pilot_scheduler_skipped_due_to_limit)
+    family_audit: dict[str, dict] = {}
+    stage_by_family = dict(diag.get("virtual_pilot_execution_stage_by_family", {}) or {})
+    for family in sorted(set(list(dict(virtual_pilot_selected_by_family).keys()) + list(stage_by_family.keys()) + ["WIDTH_GROUP", "THICKNESS", "OTHER"])):
+        fam_counts = dict(stage_by_family.get(family, {}) or {})
+        selected_count = int(dict(virtual_pilot_selected_by_family).get(family, 0) or 0)
+        dedup_kept_count = int(fam_counts.get("DEDUP_KEPT", 0) or 0)
+        attempt_started_count = int(fam_counts.get("ATTEMPT_STARTED", 0) or 0)
+        if selected_count > 0 and dedup_kept_count <= 0:
+            missing_reason = "ALL_DEDUP_SKIPPED"
+        elif dedup_kept_count > 0 and attempt_started_count <= 0:
+            missing_reason = "INTERNAL_FLOW_BROKEN"
+        else:
+            missing_reason = ""
+        family_audit[family] = {
+            "selected_count": selected_count,
+            "dedup_kept_count": dedup_kept_count,
+            "attempt_started_count": attempt_started_count,
+            "missing_execution_reason": missing_reason,
+        }
+        print(
+            f"[APS][VIRTUAL_BRIDGE_FAMILY_EXECUTION_AUDIT] family={family}, "
+            f"selected_count={selected_count}, dedup_kept_count={dedup_kept_count}, "
+            f"attempt_started_count={attempt_started_count}, "
+            f"missing_execution_reason={missing_reason or 'OK'}"
+        )
+        if family == "WIDTH_GROUP":
+            print(
+                f"[APS][VIRTUAL_BRIDGE_FAMILY_GUARANTEE] family=WIDTH_GROUP, "
+                f"guaranteed_attempt={bool(diag.get('virtual_pilot_width_group_guarantee_attempted', False))}, "
+                f"reason={'WIDTH_GROUP_ATTEMPT_PATH_ENTERED' if attempt_started_count > 0 else (missing_reason or 'NO_WIDTH_GROUP_SELECTED')}"
+            )
+    diag["virtual_pilot_family_execution_audit"] = family_audit
     if int(diag.get("repair_only_real_bridge_attempts", 0) or 0) <= 0:
         diag["repair_only_real_bridge_not_entered_reason"] = "DIRECT_ONLY_OR_NO_BRIDGE_STAGE"
     print(
@@ -5990,6 +6299,17 @@ def _reconstruct_underfilled_segments(
         f"spec_enum_both_valid_count={int(diag.get('virtual_pilot_spec_enum_both_valid_count', 0) or 0)}, "
         f"ton_fill_attempt_count={int(diag.get('virtual_pilot_ton_fill_attempt_count', 0) or 0)}, "
         f"ton_fill_success_count={int(diag.get('virtual_pilot_ton_fill_success_count', 0) or 0)}, "
+        f"selected_candidate_count={int(diag.get('virtual_pilot_selected_candidate_count', 0) or 0)}, "
+        f"dedup_kept_count={int(diag.get('virtual_pilot_dedup_kept_count', 0) or 0)}, "
+        f"dedup_skipped_count={int(diag.get('virtual_pilot_dedup_skipped_count', 0) or 0)}, "
+        f"attempt_started_count={int(diag.get('virtual_pilot_attempt_started_count', 0) or 0)}, "
+        f"spec_enum_done_count={int(diag.get('virtual_pilot_spec_enum_done_count', 0) or 0)}, "
+        f"recut_entered_count={int(diag.get('virtual_pilot_recut_entered_count', 0) or 0)}, "
+        f"segment_valid_count={int(diag.get('virtual_pilot_segment_valid_count', 0) or 0)}, "
+        f"ton_fill_entered_count={int(diag.get('virtual_pilot_ton_fill_entered_count', 0) or 0)}, "
+        f"apply_check_entered_count={int(diag.get('virtual_pilot_apply_check_entered_count', 0) or 0)}, "
+        f"apply_success_count={int(diag.get('virtual_pilot_apply_success_count', 0) or 0)}, "
+        f"post_spec_fail_stage_count={dict(diag.get('virtual_pilot_post_spec_fail_stage_count', {}) or {})}, "
         f"fail_stage_count={dict(diag.get('virtual_pilot_fail_stage_count', {}) or {})}, "
         f"reject_by_reason={dict(diag.get('virtual_pilot_reject_by_reason_count', {}) or {})}"
     )

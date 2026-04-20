@@ -32,8 +32,9 @@ def _get_bridge_expansion_mode(meta: dict) -> str:
     Returns:
         "disabled" (default), "virtual_expand", or other future modes.
     """
-    # Check multiple possible locations for bridge_expansion_mode
-    if "bridge_expansion_mode" in meta:
+    # Check multiple possible locations for bridge_expansion_mode. Top-level
+    # engine_meta is the stable source of truth after pipeline normalization.
+    if str(meta.get("bridge_expansion_mode", "") or "").strip():
         return str(meta["bridge_expansion_mode"])
     if "lns_engine_meta" in meta and isinstance(meta["lns_engine_meta"], dict):
         return str(meta["lns_engine_meta"].get("bridge_expansion_mode", "disabled"))
@@ -446,6 +447,7 @@ def decode_solution(result: ColdRollingResult) -> ColdRollingResult:
         selected_direct_edge_count = int((df["selected_edge_type"].astype(str) == "DIRECT_EDGE").sum())
         selected_real_bridge_edge_count = int((df["selected_edge_type"].astype(str) == "REAL_BRIDGE_EDGE").sum())
         selected_virtual_bridge_edge_count = int((df["selected_edge_type"].astype(str) == "VIRTUAL_BRIDGE_EDGE").sum())
+        selected_virtual_bridge_family_edge_count = int((df["selected_edge_type"].astype(str) == "VIRTUAL_BRIDGE_FAMILY_EDGE").sum())
     final_df, rounds_df, dropped_df = materialize_master_plan(
         df,
         cfg,
@@ -463,10 +465,11 @@ def decode_solution(result: ColdRollingResult) -> ColdRollingResult:
     meta["selected_direct_edge_count"] = int(selected_direct_edge_count)
     meta["selected_real_bridge_edge_count"] = int(selected_real_bridge_edge_count)
     meta["selected_virtual_bridge_edge_count"] = int(selected_virtual_bridge_edge_count)
-    total_selected_edges = max(1, selected_direct_edge_count + selected_real_bridge_edge_count + selected_virtual_bridge_edge_count)
+    total_selected_edges = max(1, selected_direct_edge_count + selected_real_bridge_edge_count + selected_virtual_bridge_edge_count + selected_virtual_bridge_family_edge_count)
     meta["direct_edge_ratio"] = float(selected_direct_edge_count / total_selected_edges)
     meta["real_bridge_ratio"] = float(selected_real_bridge_edge_count / total_selected_edges)
     meta["virtual_bridge_ratio"] = float(selected_virtual_bridge_edge_count / total_selected_edges)
+    meta["virtual_bridge_family_ratio"] = float(selected_virtual_bridge_family_edge_count / total_selected_edges)
     joint_estimates.update(
         {
             "bridgeTemplateSelectedPairCount": int(selected_pair_count),
@@ -479,9 +482,11 @@ def decode_solution(result: ColdRollingResult) -> ColdRollingResult:
             "selected_direct_edge_count": int(selected_direct_edge_count),
             "selected_real_bridge_edge_count": int(selected_real_bridge_edge_count),
             "selected_virtual_bridge_edge_count": int(selected_virtual_bridge_edge_count),
+            "selected_virtual_bridge_family_edge_count": int(selected_virtual_bridge_family_edge_count),
             "direct_edge_ratio": float(selected_direct_edge_count / total_selected_edges),
             "real_bridge_ratio": float(selected_real_bridge_edge_count / total_selected_edges),
             "virtual_bridge_ratio": float(selected_virtual_bridge_edge_count / total_selected_edges),
+            "virtual_bridge_family_ratio": float(selected_virtual_bridge_family_edge_count / total_selected_edges),
         }
     )
     meta["joint_estimates"] = joint_estimates

@@ -666,8 +666,8 @@ def export_schedule_results(
 
         # Route C: Read bridge expansion mode for summary
         bridge_expansion_mode = str(em.get("bridge_expansion_mode", lns_engine_meta.get("bridge_expansion_mode", "disabled")))
-        virtual_bridge_enabled = bool(em.get("virtual_bridge_edge_enabled_in_constructive", lns_engine_meta.get("virtual_bridge_edge_enabled_in_constructive", False)))
-        real_bridge_enabled = bool(em.get("real_bridge_edge_enabled_in_constructive", lns_engine_meta.get("real_bridge_edge_enabled_in_constructive", False)))
+        virtual_bridge_enabled = bool(em.get("allow_virtual_bridge_edge_in_constructive", em.get("virtual_bridge_edge_enabled_in_constructive", lns_engine_meta.get("allow_virtual_bridge_edge_in_constructive", lns_engine_meta.get("virtual_bridge_edge_enabled_in_constructive", False)))))
+        real_bridge_enabled = bool(em.get("allow_real_bridge_edge_in_constructive", em.get("real_bridge_edge_enabled_in_constructive", lns_engine_meta.get("allow_real_bridge_edge_in_constructive", lns_engine_meta.get("real_bridge_edge_enabled_in_constructive", False)))))
         constructive_edge_policy = str(em.get("constructive_edge_policy", lns_engine_meta.get("constructive_edge_policy", "direct_only")))
         bridge_edge_leak_detected = bool(em.get("bridge_edge_leak_detected", False))
 
@@ -704,6 +704,51 @@ def export_schedule_results(
             ("LNS路径.实物桥接边启用", "是" if real_bridge_enabled else "否"),
             ("LNS路径.求解路线", route_label),
             ("LNS路径.桥接边泄漏", "泄漏!" if bridge_edge_leak_detected else "无泄漏"),
+            ("统一指标.profile_name", str(em.get("profile_name", ""))),
+            ("统一指标.solver_path", str(em.get("solver_path", ""))),
+            ("统一指标.constructive_edge_policy", str(em.get("constructive_edge_policy", ""))),
+            ("统一指标.bridge_expansion_mode", bridge_expansion_mode),
+            ("统一指标.allow_virtual_bridge_edge_in_constructive", bool(virtual_bridge_enabled)),
+            ("统一指标.allow_real_bridge_edge_in_constructive", bool(real_bridge_enabled)),
+            ("统一指标.repair_only_real_bridge_enabled", bool(em.get("repair_only_real_bridge_enabled", False))),
+            ("统一指标.repair_only_virtual_bridge_enabled", bool(em.get("repair_only_virtual_bridge_enabled", False))),
+            ("统一指标.repair_only_virtual_bridge_pilot_enabled", bool(em.get("repair_only_virtual_bridge_pilot_enabled", False))),
+            ("统一指标.scheduled_real_orders", int(em.get("scheduled_real_orders", 0) or 0)),
+            ("统一指标.scheduled_virtual_orders", int(em.get("scheduled_virtual_orders", 0) or 0)),
+            ("统一指标.dropped_count", int(em.get("dropped_count", 0) or 0)),
+            ("统一指标.campaign_count", int(em.get("campaign_count", 0) or 0)),
+            ("统一指标.low_slots", int(em.get("low_slots", 0) or 0)),
+            ("统一指标.tail_underfilled_count", int(em.get("tail_underfilled_count", 0) or 0)),
+            ("统一指标.selected_real_bridge_edge_count", int(em.get("selected_real_bridge_edge_count", 0) or 0)),
+            ("统一指标.selected_virtual_bridge_edge_count", int(em.get("selected_virtual_bridge_edge_count", 0) or 0)),
+            ("统一指标.max_bridge_count_used", int(em.get("max_bridge_count_used", 0) or 0)),
+            ("统一指标.lns_accepted_rounds", int(em.get("lns_accepted_rounds", 0) or 0)),
+            ("统一指标.lns_drop_delta", int(em.get("lns_drop_delta", 0) or 0)),
+            ("统一指标.reconstruction_no_gain", bool(em.get("reconstruction_no_gain", False))),
+            ("统一指标.virtual_pilot_attempt_count", int(em.get("virtual_pilot_attempt_count", 0) or 0)),
+            ("统一指标.virtual_pilot_success_count", int(em.get("virtual_pilot_success_count", 0) or 0)),
+            ("统一指标.virtual_pilot_apply_count", int(em.get("virtual_pilot_apply_count", 0) or 0)),
+            ("统一指标.acceptance", str(em.get("acceptance", em.get("result_acceptance_status", "")))),
+            ("统一指标.acceptance_gate_reason", str(em.get("acceptance_gate_reason", ""))),
+            ("统一指标.validation_gate_reason", str(em.get("validation_gate_reason", ""))),
+            ("CandidateGraph.边总数", int(em.get("candidate_graph_edge_count", 0) or 0)),
+            ("CandidateGraph.直接边数", int(em.get("candidate_graph_direct_edge_count", 0) or 0)),
+            ("CandidateGraph.实物桥边数", int(em.get("candidate_graph_real_bridge_edge_count", 0) or 0)),
+            ("CandidateGraph.虚拟桥family边数", int(em.get("candidate_graph_virtual_bridge_family_edge_count", 0) or 0)),
+            ("CandidateGraph.宽度过滤数", int(em.get("candidate_graph_filtered_by_width_count", 0) or 0)),
+            ("CandidateGraph.厚度过滤数", int(em.get("candidate_graph_filtered_by_thickness_count", 0) or 0)),
+            ("CandidateGraph.温度过滤数", int(em.get("candidate_graph_filtered_by_temp_count", 0) or 0)),
+            ("CandidateGraph.钢种组过滤数", int(em.get("candidate_graph_filtered_by_group_count", 0) or 0)),
+            ("CandidateGraph.虚拟链长过滤数", int(em.get("candidate_graph_filtered_by_max_virtual_chain_count", 0) or 0)),
+            ("Constructive图.接受直接边数", int(_summary_cut_or_em("accepted_direct_edge_count", em.get("accepted_direct_edge_count", 0)) or 0)),
+            ("Constructive图.接受实物桥边数", int(_summary_cut_or_em("accepted_real_bridge_edge_count", em.get("accepted_real_bridge_edge_count", 0)) or 0)),
+            ("Constructive图.过滤虚拟桥边数", int(_summary_cut_or_em("filtered_virtual_bridge_edge_count", em.get("filtered_virtual_bridge_edge_count", 0)) or 0)),
+            ("Constructive图.过滤实物桥边数", int(_summary_cut_or_em("filtered_real_bridge_edge_count", em.get("filtered_real_bridge_edge_count", 0)) or 0)),
+            ("LocalInserter.允许直接弧数", int(em.get("local_inserter_direct_arcs_allowed", 0) or 0)),
+            ("LocalInserter.允许实物桥弧数", int(em.get("local_inserter_real_bridge_arcs_allowed", 0) or 0)),
+            ("LocalInserter.阻断实物桥弧数", int(em.get("local_inserter_real_bridge_arcs_blocked", 0) or 0)),
+            ("LocalInserter.阻断虚拟桥弧数", int(em.get("local_inserter_virtual_bridge_arcs_blocked", 0) or 0)),
+            ("LocalInserter.边策略", str(em.get("local_inserter_edge_policy_used", ""))),
             ("Underfilled重构.尝试", int(_summary_cut_or_em("underfilled_reconstruction_attempts", 0) or 0)),
             ("Underfilled重构.成功", int(_summary_cut_or_em("underfilled_reconstruction_success", 0) or 0)),
             ("Underfilled重构.valid增量", int(_summary_cut_or_em("underfilled_reconstruction_valid_delta", 0) or 0)),
@@ -745,6 +790,18 @@ def export_schedule_results(
             ("Repair实物桥.吨位救援valid增量", int(_summary_cut_or_em("repair_bridge_ton_rescue_valid_delta", 0) or 0)),
             ("Repair实物桥.吨位救援underfilled增量", int(_summary_cut_or_em("repair_bridge_ton_rescue_underfilled_delta", 0) or 0)),
             ("Repair实物桥.吨位救援订单增量", int(_summary_cut_or_em("repair_bridge_ton_rescue_scheduled_orders_delta", 0) or 0)),
+            ("虚拟桥pilot.选中候选数", int(_summary_cut_or_em("virtual_pilot_selected_candidate_count", 0) or 0)),
+            ("虚拟桥pilot.dedup保留数", int(_summary_cut_or_em("virtual_pilot_dedup_kept_count", 0) or 0)),
+            ("虚拟桥pilot.dedup跳过数", int(_summary_cut_or_em("virtual_pilot_dedup_skipped_count", 0) or 0)),
+            ("虚拟桥pilot.attempt开始数", int(_summary_cut_or_em("virtual_pilot_attempt_started_count", 0) or 0)),
+            ("虚拟桥pilot.spec枚举完成数", int(_summary_cut_or_em("virtual_pilot_spec_enum_done_count", 0) or 0)),
+            ("虚拟桥pilot.recut进入数", int(_summary_cut_or_em("virtual_pilot_recut_entered_count", 0) or 0)),
+            ("虚拟桥pilot.segment有效数", int(_summary_cut_or_em("virtual_pilot_segment_valid_count", 0) or 0)),
+            ("虚拟桥pilot.补吨进入数", int(_summary_cut_or_em("virtual_pilot_ton_fill_entered_count", 0) or 0)),
+            ("虚拟桥pilot.apply检查进入数", int(_summary_cut_or_em("virtual_pilot_apply_check_entered_count", 0) or 0)),
+            ("虚拟桥pilot.apply成功数", int(_summary_cut_or_em("virtual_pilot_apply_success_count", 0) or 0)),
+            ("虚拟桥pilot.WIDTH_GROUP保底attempt", "是" if bool(_summary_cut_or_em("virtual_pilot_width_group_guarantee_attempted", False)) else "否"),
+            ("虚拟桥pilot.post-spec失败分布", str(_summary_cut_or_em("virtual_pilot_post_spec_fail_stage_count", {}) or {})),
             ("Repair实物桥.当前块吨位不足", int(_summary_cut_or_em("repair_bridge_filtered_ton_below_min_current_block", 0) or 0)),
             ("Repair实物桥.吨位救援不可能", int(_summary_cut_or_em("repair_bridge_filtered_ton_rescue_impossible", 0) or 0)),
             ("Repair实物桥.扩邻后仍吨位不足", int(_summary_cut_or_em("repair_bridge_filtered_ton_below_min_even_after_neighbor_expansion", 0) or 0)),
@@ -812,8 +869,8 @@ def export_schedule_results(
     # -------------------------------------------------------------------------
     # Route C: Read bridge expansion mode for runtime summary
     bridge_expansion_mode = str(em.get("bridge_expansion_mode", em.get("lns_engine_meta", {}).get("bridge_expansion_mode", "disabled")))
-    virtual_bridge_enabled = bool(em.get("virtual_bridge_edge_enabled_in_constructive", em.get("lns_engine_meta", {}).get("virtual_bridge_edge_enabled_in_constructive", False)))
-    real_bridge_enabled = bool(em.get("real_bridge_edge_enabled_in_constructive", em.get("lns_engine_meta", {}).get("real_bridge_edge_enabled_in_constructive", False)))
+    virtual_bridge_enabled = bool(em.get("allow_virtual_bridge_edge_in_constructive", em.get("virtual_bridge_edge_enabled_in_constructive", em.get("lns_engine_meta", {}).get("allow_virtual_bridge_edge_in_constructive", em.get("lns_engine_meta", {}).get("virtual_bridge_edge_enabled_in_constructive", False)))))
+    real_bridge_enabled = bool(em.get("allow_real_bridge_edge_in_constructive", em.get("real_bridge_edge_enabled_in_constructive", em.get("lns_engine_meta", {}).get("allow_real_bridge_edge_in_constructive", em.get("lns_engine_meta", {}).get("real_bridge_edge_enabled_in_constructive", False)))))
     constructive_edge_policy = str(em.get("constructive_edge_policy", em.get("lns_engine_meta", {}).get("constructive_edge_policy", "direct_only")))
     bridge_edge_leak_detected = bool(em.get("bridge_edge_leak_detected", False))
 
@@ -852,6 +909,42 @@ def export_schedule_results(
             ("LNS.实物桥接边启用", "是" if real_bridge_enabled else "否"),
             ("LNS.求解路线", route_label),
             ("LNS.桥接边泄漏", "泄漏!" if bridge_edge_leak_detected else "无泄漏"),
+            ("统一指标.profile_name", str(em.get("profile_name", ""))),
+            ("统一指标.solver_path", str(em.get("solver_path", ""))),
+            ("统一指标.constructive_edge_policy", str(em.get("constructive_edge_policy", ""))),
+            ("统一指标.bridge_expansion_mode", bridge_expansion_mode),
+            ("统一指标.allow_virtual_bridge_edge_in_constructive", bool(virtual_bridge_enabled)),
+            ("统一指标.allow_real_bridge_edge_in_constructive", bool(real_bridge_enabled)),
+            ("统一指标.repair_only_real_bridge_enabled", bool(em.get("repair_only_real_bridge_enabled", False))),
+            ("统一指标.repair_only_virtual_bridge_enabled", bool(em.get("repair_only_virtual_bridge_enabled", False))),
+            ("统一指标.repair_only_virtual_bridge_pilot_enabled", bool(em.get("repair_only_virtual_bridge_pilot_enabled", False))),
+            ("统一指标.scheduled_real_orders", int(em.get("scheduled_real_orders", 0) or 0)),
+            ("统一指标.scheduled_virtual_orders", int(em.get("scheduled_virtual_orders", 0) or 0)),
+            ("统一指标.dropped_count", int(em.get("dropped_count", 0) or 0)),
+            ("统一指标.campaign_count", int(em.get("campaign_count", 0) or 0)),
+            ("统一指标.low_slots", int(em.get("low_slots", 0) or 0)),
+            ("统一指标.tail_underfilled_count", int(em.get("tail_underfilled_count", 0) or 0)),
+            ("统一指标.selected_real_bridge_edge_count", int(em.get("selected_real_bridge_edge_count", 0) or 0)),
+            ("统一指标.selected_virtual_bridge_edge_count", int(em.get("selected_virtual_bridge_edge_count", 0) or 0)),
+            ("统一指标.max_bridge_count_used", int(em.get("max_bridge_count_used", 0) or 0)),
+            ("统一指标.lns_accepted_rounds", int(em.get("lns_accepted_rounds", 0) or 0)),
+            ("统一指标.lns_drop_delta", int(em.get("lns_drop_delta", 0) or 0)),
+            ("统一指标.reconstruction_no_gain", bool(em.get("reconstruction_no_gain", False))),
+            ("统一指标.virtual_pilot_attempt_count", int(em.get("virtual_pilot_attempt_count", 0) or 0)),
+            ("统一指标.virtual_pilot_success_count", int(em.get("virtual_pilot_success_count", 0) or 0)),
+            ("统一指标.virtual_pilot_apply_count", int(em.get("virtual_pilot_apply_count", 0) or 0)),
+            ("统一指标.acceptance", str(em.get("acceptance", em.get("result_acceptance_status", "")))),
+            ("统一指标.acceptance_gate_reason", str(em.get("acceptance_gate_reason", ""))),
+            ("统一指标.validation_gate_reason", str(em.get("validation_gate_reason", ""))),
+            ("CandidateGraph.边总数", int(em.get("candidate_graph_edge_count", 0) or 0)),
+            ("CandidateGraph.直接边数", int(em.get("candidate_graph_direct_edge_count", 0) or 0)),
+            ("CandidateGraph.实物桥边数", int(em.get("candidate_graph_real_bridge_edge_count", 0) or 0)),
+            ("CandidateGraph.虚拟桥family边数", int(em.get("candidate_graph_virtual_bridge_family_edge_count", 0) or 0)),
+            ("CandidateGraph.宽度过滤数", int(em.get("candidate_graph_filtered_by_width_count", 0) or 0)),
+            ("CandidateGraph.厚度过滤数", int(em.get("candidate_graph_filtered_by_thickness_count", 0) or 0)),
+            ("CandidateGraph.温度过滤数", int(em.get("candidate_graph_filtered_by_temp_count", 0) or 0)),
+            ("CandidateGraph.钢种组过滤数", int(em.get("candidate_graph_filtered_by_group_count", 0) or 0)),
+            ("CandidateGraph.虚拟链长过滤数", int(em.get("candidate_graph_filtered_by_max_virtual_chain_count", 0) or 0)),
             # ---- Decode order integrity gate (fail-fast from constructive_lns decode path) ----
             ("LNS.decode_order_integrity_ok", bool(em.get("decode_order_integrity_ok", True))),
             ("LNS.decode_order_mismatch_count", int(em.get("decode_order_mismatch_count", 0))),
@@ -921,6 +1014,20 @@ def export_schedule_results(
             ("Repair实物桥.吨位救援valid增量", int(_cut_or_em("repair_bridge_ton_rescue_valid_delta", 0) or 0)),
             ("Repair实物桥.吨位救援underfilled增量", int(_cut_or_em("repair_bridge_ton_rescue_underfilled_delta", 0) or 0)),
             ("Repair实物桥.吨位救援订单增量", int(_cut_or_em("repair_bridge_ton_rescue_scheduled_orders_delta", 0) or 0)),
+            ("虚拟桥pilot.选中候选数", int(_cut_or_em("virtual_pilot_selected_candidate_count", 0) or 0)),
+            ("虚拟桥pilot.dedup保留数", int(_cut_or_em("virtual_pilot_dedup_kept_count", 0) or 0)),
+            ("虚拟桥pilot.dedup跳过数", int(_cut_or_em("virtual_pilot_dedup_skipped_count", 0) or 0)),
+            ("虚拟桥pilot.attempt开始数", int(_cut_or_em("virtual_pilot_attempt_started_count", 0) or 0)),
+            ("虚拟桥pilot.spec枚举完成数", int(_cut_or_em("virtual_pilot_spec_enum_done_count", 0) or 0)),
+            ("虚拟桥pilot.recut进入数", int(_cut_or_em("virtual_pilot_recut_entered_count", 0) or 0)),
+            ("虚拟桥pilot.segment有效数", int(_cut_or_em("virtual_pilot_segment_valid_count", 0) or 0)),
+            ("虚拟桥pilot.补吨进入数", int(_cut_or_em("virtual_pilot_ton_fill_entered_count", 0) or 0)),
+            ("虚拟桥pilot.apply检查进入数", int(_cut_or_em("virtual_pilot_apply_check_entered_count", 0) or 0)),
+            ("虚拟桥pilot.apply成功数", int(_cut_or_em("virtual_pilot_apply_success_count", 0) or 0)),
+            ("虚拟桥pilot.WIDTH_GROUP保底attempt", "是" if bool(_cut_or_em("virtual_pilot_width_group_guarantee_attempted", False)) else "否"),
+            ("虚拟桥pilot.family执行阶段", str(_cut_or_em("virtual_pilot_execution_stage_by_family", {}) or {})),
+            ("虚拟桥pilot.post-spec失败分布", str(_cut_or_em("virtual_pilot_post_spec_fail_stage_count", {}) or {})),
+            ("虚拟桥pilot.family执行审计", str(_cut_or_em("virtual_pilot_family_execution_audit", {}) or {})),
             ("Repair实物桥.当前块吨位不足", int(_cut_or_em("repair_bridge_filtered_ton_below_min_current_block", 0) or 0)),
             ("Repair实物桥.吨位救援不可能", int(_cut_or_em("repair_bridge_filtered_ton_rescue_impossible", 0) or 0)),
             ("Repair实物桥.扩邻后仍吨位不足", int(_cut_or_em("repair_bridge_filtered_ton_below_min_even_after_neighbor_expansion", 0) or 0)),
@@ -1997,7 +2104,7 @@ def export_schedule_results(
 
     # Route B: Detect and warn about virtual bridge edge leakage in disabled mode
     if bridge_expansion_mode == "disabled" and virtual_bridge_enabled is False:
-        # Route C (direct_only): Check if any bridge edge appears in the result (leak detection)
+        # Check only edge types forbidden by the current constructive edge policy.
         virtual_edge_leak_count = selected_virtual_bridge_edge_count
         real_edge_leak_count = selected_real_bridge_edge_count
         is_direct_only = not virtual_bridge_enabled and not real_bridge_enabled
@@ -2020,15 +2127,15 @@ def export_schedule_results(
                 )
         elif virtual_edge_leak_count > 0:
             print(
-                f"[APS][WARNING] 路线B桥接泄漏检测: bridge_expansion_mode=disabled, "
+                f"[APS][WARNING] 路线RB(direct_plus_real_bridge)桥接泄漏检测: bridge_expansion_mode=disabled, "
                 f"但结果中包含 {virtual_edge_leak_count} 条 VIRTUAL_BRIDGE_EDGE 边！"
-                f"这是不期望的行为，结果可能不符合禁用展开的语义。"
+                f"这是不期望的行为，结果可能不符合禁用虚拟桥接的语义。"
                 f"请检查 constructive_lns_master 中的 allow_virtual_bridge_edge_in_constructive 设置。"
             )
         else:
             print(
-                f"[APS][路线B确认] bridge_expansion_mode=disabled, "
-                f"虚拟桥接边启用=false, 结果中无 VIRTUAL_BRIDGE_EDGE 泄漏, 路线B语义正确"
+                f"[APS][路线RB确认] constructive_edge_policy=direct_plus_real_bridge, "
+                f"bridge_expansion_mode=disabled, 结果中无 VIRTUAL_BRIDGE_EDGE 泄漏"
             )
 
     return final_df, rounds_df

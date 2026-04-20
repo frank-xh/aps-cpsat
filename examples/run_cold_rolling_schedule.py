@@ -46,6 +46,8 @@ def main() -> None:
         "--profile",
         choices=[
             "constructive_lns_search",
+            "constructive_lns_direct_only_baseline",
+            "constructive_lns_real_bridge_frontload",
         ],
         default="constructive_lns_search",
         help="Solver tuning profile",
@@ -61,9 +63,7 @@ def main() -> None:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     output = os.path.join(output_dir, f"SAT排程结果_{ts}.xlsx")
 
-    # 强制使用 constructive_lns_search，忽略命令行参数中的旧值
-    enforced_profile = "constructive_lns_search"
-    cfg = build_example_config(profile=enforced_profile, strict=bool(args.strict))
+    cfg = build_example_config(profile=args.profile, strict=bool(args.strict))
 
     print("[APS] 冷轧排程任务开始")
     print(f"[APS] 订单文件: {orders}")

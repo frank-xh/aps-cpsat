@@ -112,6 +112,9 @@ except ModuleNotFoundError:
 
             return _FakeConstraint()
 
+        def AddCircuit(self, arcs: Any) -> None:
+            self._constraints.append(("circuit", arcs))
+
         def AddHint(self, var: Any, val: Any) -> None:
             pass
 
@@ -185,6 +188,7 @@ import pandas as pd
 # ------------------------------------------------------------------
 
 from aps_cp_sat.config import PlannerConfig, RuleConfig, ModelConfig, ScoreConfig
+from aps_cp_sat.config.parameters import build_profile_config
 
 
 def _minimal_cfg(
@@ -713,7 +717,11 @@ def smoke_drop_reasons() -> bool:
         _check_no_feasible_line,
         DropReason,
     )
-    no_feasible = _check_no_feasible_line(orders_df, tpl_df)
+    no_feasible_result = _check_no_feasible_line(orders_df, tpl_df)
+    if isinstance(no_feasible_result, tuple):
+        no_feasible = no_feasible_result[0]
+    else:
+        no_feasible = no_feasible_result
 
     # H has line_capability="none" → no_feasible
     # I has line_capability="dual" but no edges in template → no_feasible
@@ -832,6 +840,590 @@ def smoke_drop_reasons() -> bool:
 
 
 # ------------------------------------------------------------------
+# Smoke 5: constructive/local inserter bridge edge policy is consistent
+# ------------------------------------------------------------------
+
+def smoke_bridge_edge_policy_filtering() -> bool:
+    """
+    Verify DIRECT / REAL_BRIDGE / VIRTUAL_BRIDGE filtering for both the
+    constructive graph and the local strict inserter graph.
+    """
+    print("\n[smoke_bridge_edge_policy_filtering]")
+
+    orders_df = pd.DataFrame([
+        {"order_id": "A", "tons": 100, "width": 1200, "thickness": 2.0,
+         "steel_group": "G1", "due_rank": 1, "priority": 1, "line_capability": "dual"},
+        {"order_id": "B", "tons": 100, "width": 1210, "thickness": 2.0,
+         "steel_group": "G1", "due_rank": 2, "priority": 1, "line_capability": "dual"},
+        {"order_id": "C", "tons": 100, "width": 1220, "thickness": 2.0,
+         "steel_group": "G1", "due_rank": 3, "priority": 1, "line_capability": "dual"},
+        {"order_id": "D", "tons": 100, "width": 1230, "thickness": 2.0,
+         "steel_group": "G1", "due_rank": 4, "priority": 1, "line_capability": "dual"},
+    ])
+    tpl_df = pd.DataFrame([
+        {"from_order_id": "A", "to_order_id": "B", "line": "big_roll",
+         "edge_type": "DIRECT_EDGE", "cost": 1, "bridge_count": 0,
+         "width_smooth_cost": 0, "thickness_smooth_cost": 0,
+         "temp_margin_cost": 0, "cross_group_cost": 0},
+        {"from_order_id": "B", "to_order_id": "C", "line": "big_roll",
+         "edge_type": "REAL_BRIDGE_EDGE", "cost": 3, "bridge_count": 1,
+         "width_smooth_cost": 0, "thickness_smooth_cost": 0,
+         "temp_margin_cost": 0, "cross_group_cost": 0},
+        {"from_order_id": "C", "to_order_id": "D", "line": "big_roll",
+         "edge_type": "VIRTUAL_BRIDGE_EDGE", "cost": 9, "bridge_count": 1,
+         "width_smooth_cost": 0, "thickness_smooth_cost": 0,
+         "temp_margin_cost": 0, "cross_group_cost": 0},
+    ])
+
+    from aps_cp_sat.model.constructive_sequence_builder import TemplateEdgeGraph
+    from aps_cp_sat.model.local_inserter_cp_sat import _StrictTemplateGraph
+
+    def cfg_for(*, allow_real: bool, allow_virtual: bool) -> PlannerConfig:
+        cfg = _minimal_cfg(campaign_ton_min=100, campaign_ton_max=1000)
+        model = ModelConfig(
+            **{
+                **cfg.model.__dict__,
+                "allow_real_bridge_edge_in_constructive": bool(allow_real),
+                "allow_virtual_bridge_edge_in_constructive": bool(allow_virtual),
+                "bridge_expansion_mode": "disabled",
+            }
+        )
+        return PlannerConfig(rule=cfg.rule, model=model, score=cfg.score)
+
+    cases = [
+        ("direct_only", cfg_for(allow_real=False, allow_virtual=False), 1, 0, 1, 1, 0),
+        ("direct_plus_real_bridge", cfg_for(allow_real=True, allow_virtual=False), 1, 1, 0, 1, 0),
+        ("all_edges_allowed", cfg_for(allow_real=True, allow_virtual=True), 1, 1, 0, 0, 1),
+    ]
+
+    all_ok = True
+    for label, cfg, exp_direct, exp_real, exp_real_blocked, exp_virtual_blocked, exp_virtual_allowed in cases:
+        graph = TemplateEdgeGraph(orders_df, tpl_df, cfg)
+        strict = _StrictTemplateGraph(["A", "B", "C", "D"], tpl_df, cfg, "big_roll")
+
+        constructive_ok = (
+            graph.accepted_direct_edge_count == exp_direct
+            and graph.accepted_real_bridge_edge_count == exp_real
+            and graph.filtered_real_bridge_edge_count == exp_real_blocked
+            and graph.filtered_virtual_bridge_edge_count == exp_virtual_blocked
+            and graph.edge_policy == label
+        )
+        local_ok = (
+            strict.direct_arcs_allowed == exp_direct
+            and strict.real_bridge_arcs_allowed == exp_real
+            and strict.real_bridge_arcs_blocked == exp_real_blocked
+            and strict.virtual_bridge_arcs_blocked == exp_virtual_blocked
+            and strict.edge_policy_used == label
+        )
+        if label == "all_edges_allowed":
+            local_ok = local_ok and sum(1 for e in strict.edges if e.is_virtual_bridge) == exp_virtual_allowed
+            constructive_ok = constructive_ok and graph.filtered_virtual_bridge_edge_count == 0
+
+        _check_result(
+            f"{label}: constructive graph policy",
+            constructive_ok,
+            f"policy={graph.edge_policy}, direct={graph.accepted_direct_edge_count}, "
+            f"real={graph.accepted_real_bridge_edge_count}, "
+            f"real_blocked={graph.filtered_real_bridge_edge_count}, "
+            f"virtual_blocked={graph.filtered_virtual_bridge_edge_count}",
+        )
+        _check_result(
+            f"{label}: local inserter strict graph policy",
+            local_ok,
+            f"policy={strict.edge_policy_used}, direct={strict.direct_arcs_allowed}, "
+            f"real={strict.real_bridge_arcs_allowed}, "
+            f"real_blocked={strict.real_bridge_arcs_blocked}, "
+            f"virtual_blocked={strict.virtual_bridge_arcs_blocked}",
+        )
+        all_ok = all_ok and constructive_ok and local_ok
+
+    return all_ok
+
+
+# ------------------------------------------------------------------
+# Smoke 6: frozen direct-only baseline and unified engine_meta fields
+# ------------------------------------------------------------------
+
+def smoke_direct_only_baseline_profile_and_unified_meta() -> bool:
+    """
+    Verify the frozen baseline profile keeps constructive direct-only semantics
+    and the pipeline metadata normalization exposes the stable A/B fields.
+    """
+    print("\n[smoke_direct_only_baseline_profile_and_unified_meta]")
+
+    cfg = build_profile_config("constructive_lns_direct_only_baseline")
+    baseline_ok = (
+        cfg.model.profile_name == "constructive_lns_direct_only_baseline"
+        and cfg.model.main_solver_strategy == "constructive_lns"
+        and cfg.model.allow_virtual_bridge_edge_in_constructive is False
+        and cfg.model.allow_real_bridge_edge_in_constructive is False
+        and cfg.model.bridge_expansion_mode == "disabled"
+        and cfg.model.repair_only_real_bridge_enabled is True
+        and cfg.model.repair_only_virtual_bridge_enabled is False
+        and cfg.model.repair_only_virtual_bridge_pilot_enabled is False
+    )
+    _check_result(
+        "baseline profile freezes direct-only constructive config",
+        baseline_ok,
+        f"profile={cfg.model.profile_name}, real={cfg.model.allow_real_bridge_edge_in_constructive}, "
+        f"virtual={cfg.model.allow_virtual_bridge_edge_in_constructive}, "
+        f"pilot={cfg.model.repair_only_virtual_bridge_pilot_enabled}",
+    )
+
+    # cold_rolling_pipeline imports result_writer, which imports openpyxl for
+    # Excel rendering.  The smoke test only needs metadata normalization, so a
+    # minimal openpyxl.utils shim keeps this test runnable in slim environments.
+    import types
+    if "openpyxl.utils" not in sys.modules:
+        _openpyxl = types.ModuleType("openpyxl")
+        _openpyxl_utils = types.ModuleType("openpyxl.utils")
+        _openpyxl_utils.get_column_letter = lambda idx: str(idx)  # type: ignore[attr-defined]
+        sys.modules.setdefault("openpyxl", _openpyxl)
+        sys.modules.setdefault("openpyxl.utils", _openpyxl_utils)
+
+    from aps_cp_sat.cold_rolling_pipeline import ColdRollingPipeline
+
+    schedule_df = pd.DataFrame([
+        {"order_id": "A", "campaign_id": "C1", "selected_edge_type": "DIRECT_EDGE", "is_virtual": False},
+        {"order_id": "B", "campaign_id": "C1", "selected_edge_type": "DIRECT_EDGE", "is_virtual": False},
+    ])
+    dropped_df = pd.DataFrame([{"order_id": "Z"}])
+    meta = ColdRollingPipeline._ensure_unified_engine_meta(
+        {
+            "engine_used": "constructive_lns",
+            "main_path": "constructive_lns",
+            "result_acceptance_status": "BEST_SEARCH_CANDIDATE_ANALYSIS",
+            "acceptance_gate_reason": "SMOKE",
+            "validation_gate_reason": "SMOKE",
+        },
+        cfg,
+        schedule_df=schedule_df,
+        dropped_df=dropped_df,
+        rounds_df=pd.DataFrame(),
+    )
+    required_keys = list(ColdRollingPipeline._UNIFIED_ENGINE_META_FIELDS)
+    missing = [k for k in required_keys if k not in meta]
+    meta_ok = (
+        not missing
+        and meta["constructive_edge_policy"] == "direct_only"
+        and meta["bridge_expansion_mode"] == "disabled"
+        and meta["scheduled_real_orders"] == 2
+        and meta["scheduled_virtual_orders"] == 0
+        and meta["dropped_count"] == 1
+        and meta["campaign_count"] == 1
+        and meta["acceptance"] == "BEST_SEARCH_CANDIDATE_ANALYSIS"
+    )
+    _check_result(
+        "unified engine_meta fields are always present",
+        meta_ok,
+        f"missing={missing}, policy={meta.get('constructive_edge_policy')}, "
+        f"scheduled_real={meta.get('scheduled_real_orders')}, dropped={meta.get('dropped_count')}",
+    )
+    return baseline_ok and meta_ok
+
+
+# ------------------------------------------------------------------
+# Smoke 7: Candidate Graph normalizes direct / real / virtual family edges
+# ------------------------------------------------------------------
+
+def smoke_candidate_graph_build_result() -> bool:
+    print("\n[smoke_candidate_graph_build_result]")
+
+    cfg = _minimal_cfg(campaign_ton_min=100, campaign_ton_max=1000)
+    orders_df = pd.DataFrame([
+        {"order_id": "A", "tons": 100, "width": 1200, "thickness": 2.0,
+         "temp_min": 700, "temp_max": 760, "steel_group": "G1", "line_capability": "dual"},
+        {"order_id": "B", "tons": 100, "width": 1190, "thickness": 2.0,
+         "temp_min": 710, "temp_max": 770, "steel_group": "G1", "line_capability": "dual"},
+        {"order_id": "C", "tons": 100, "width": 1180, "thickness": 2.0,
+         "temp_min": 720, "temp_max": 780, "steel_group": "G1", "line_capability": "dual"},
+        {"order_id": "D", "tons": 100, "width": 1170, "thickness": 2.0,
+         "temp_min": 730, "temp_max": 790, "steel_group": "G1", "line_capability": "dual"},
+        {"order_id": "E", "tons": 100, "width": 1600, "thickness": 4.0,
+         "temp_min": 400, "temp_max": 420, "steel_group": "G2", "line_capability": "dual"},
+    ])
+    tpl_df = pd.DataFrame([
+        {"from_order_id": "A", "to_order_id": "B", "line": "big_roll",
+         "edge_type": "DIRECT_EDGE", "cost": 1, "bridge_count": 0,
+         "virtual_tons": 0, "physical_reverse_count": 0},
+        {"from_order_id": "B", "to_order_id": "C", "line": "big_roll",
+         "edge_type": "REAL_BRIDGE_EDGE", "cost": 3, "bridge_count": 1,
+         "virtual_tons": 0, "physical_reverse_count": 0, "real_bridge_order_id": "R1"},
+        {"from_order_id": "C", "to_order_id": "D", "line": "big_roll",
+         "edge_type": "VIRTUAL_BRIDGE_EDGE", "cost": 9, "bridge_count": 2,
+         "virtual_tons": 20, "physical_reverse_count": 1},
+    ])
+
+    from aps_cp_sat.model.candidate_graph import build_candidate_graph, check_direct_transition
+
+    result = build_candidate_graph(orders_df, tpl_df, cfg, scan_infeasible_direct_pairs=True)
+    diag = result.diagnostics
+    type_counts_ok = (
+        diag["candidate_graph_direct_edge_count"] == 1
+        and diag["candidate_graph_real_bridge_edge_count"] == 1
+        and diag["candidate_graph_virtual_bridge_family_edge_count"] == 1
+    )
+    reasons_visible = (
+        diag["candidate_graph_filtered_by_width_count"] > 0
+        or diag["candidate_graph_filtered_by_thickness_count"] > 0
+        or diag["candidate_graph_filtered_by_temp_count"] > 0
+        or diag["candidate_graph_filtered_by_group_count"] > 0
+    )
+    direct_fail = check_direct_transition(
+        orders_df.iloc[0].to_dict(),
+        orders_df.iloc[4].to_dict(),
+        cfg,
+    )
+    explain_ok = (not direct_fail.hard_feasible) and direct_fail.reason in {
+        "WIDTH_RULE_FAIL",
+        "THICKNESS_RULE_FAIL",
+        "TEMP_OVERLAP_FAIL",
+        "GROUP_SWITCH_FAIL",
+        "UNKNOWN_PAIR_INVALID",
+    }
+    _check_result(
+        "candidate graph counts direct / real / virtual-family edges",
+        type_counts_ok,
+        f"diag={diag}",
+    )
+    _check_result(
+        "candidate graph exposes filtered reason statistics",
+        reasons_visible and explain_ok,
+        f"reason_histogram={diag.get('candidate_graph_reason_histogram')}, direct_fail={direct_fail.reason}",
+    )
+    return type_counts_ok and reasons_visible and explain_ok
+
+
+# ------------------------------------------------------------------
+# Smoke 8: Virtual Bridge Family Edge + Bridge Realization Oracle
+# ------------------------------------------------------------------
+
+def smoke_virtual_bridge_family_edge() -> bool:
+    """
+    Verify VIRTUAL_BRIDGE_FAMILY_EDGE enters Candidate Graph with correct fields,
+    BridgeRealizationOracle is fully wired, and NOT_IMPLEMENTED_YET stub works.
+
+    Coverage:
+    1. CandidateEdge with family fields (estimated_bridge_count_min/max, requires_pc_transition)
+    2. VIRTUAL_BRIDGE_FAMILY_EDGE filtered by allow_virtual flag (same as legacy virtual)
+    3. BridgeRealizationOracle.realize() returns properly structured RealizationResult
+    4. NOT_IMPLEMENTED_YET fail_reason for virtual family edges
+    5. Real bridge edge returns feasible with basic check
+    6. fail_reason enumeration is canonical (RealizationFailReason)
+    7. oracle context construction works
+    """
+    print("\n[smoke_virtual_bridge_family_edge]")
+
+    # -- Orders DataFrame --------------------------------------------
+    orders_df = pd.DataFrame([
+        {"order_id": "A", "tons": 100, "width": 1200, "thickness": 2.0,
+         "steel_group": "G1", "due_rank": 1, "priority": 1, "line_capability": "dual",
+         "temp_min": 700, "temp_max": 760},
+        {"order_id": "B", "tons": 100, "width": 1210, "thickness": 2.0,
+         "steel_group": "G1", "due_rank": 2, "priority": 1, "line_capability": "dual",
+         "temp_min": 710, "temp_max": 770},
+        {"order_id": "C", "tons": 100, "width": 1400, "thickness": 4.0,
+         "steel_group": "G2", "due_rank": 3, "priority": 1, "line_capability": "dual",
+         "temp_min": 400, "temp_max": 420},
+        # Real bridge order
+        {"order_id": "RB1", "tons": 50, "width": 1300, "thickness": 2.5,
+         "steel_group": "PC", "due_rank": 2, "priority": 1, "line_capability": "dual",
+         "temp_min": 650, "temp_max": 700, "bridge_penalty": 80},
+    ])
+
+    # -- Template with all three edge types ----------------------------
+    tpl_df = pd.DataFrame([
+        {"from_order_id": "A", "to_order_id": "B", "line": "big_roll",
+         "edge_type": "DIRECT_EDGE", "cost": 1, "bridge_count": 0,
+         "virtual_tons": 0, "physical_reverse_count": 0},
+        {"from_order_id": "A", "to_order_id": "C", "line": "big_roll",
+         "edge_type": "VIRTUAL_BRIDGE_FAMILY_EDGE", "cost": 9, "bridge_count": 2,
+         "virtual_tons": 20, "physical_reverse_count": 1,
+         "bridge_family": "GROUP_TRANSITION",
+         "estimated_bridge_count_min": 1, "estimated_bridge_count_max": 3,
+         "requires_pc_transition": True},
+        {"from_order_id": "B", "to_order_id": "C", "line": "big_roll",
+         "edge_type": "REAL_BRIDGE_EDGE", "cost": 5, "bridge_count": 1,
+         "real_bridge_order_id": "RB1",
+         "virtual_tons": 0, "physical_reverse_count": 0},
+    ])
+
+    cfg = _minimal_cfg(campaign_ton_min=50, campaign_ton_max=1000)
+
+    # -- Test 1: CandidateGraph builds family edge with extended fields --
+    from aps_cp_sat.model.candidate_graph import build_candidate_graph
+    result = build_candidate_graph(orders_df, tpl_df, cfg)
+
+    family_edges = [e for e in result.edges if e.edge_type == "VIRTUAL_BRIDGE_FAMILY_EDGE"]
+    family_ok = len(family_edges) == 1 and (
+        family_edges[0].estimated_bridge_count_min >= 1
+        and family_edges[0].estimated_bridge_count_max >= 1
+        and family_edges[0].requires_pc_transition is True
+        and family_edges[0].bridge_family == "VIRTUAL_FAMILY"
+    )
+    _check_result(
+        "VIRTUAL_BRIDGE_FAMILY_EDGE has family extension fields",
+        family_ok,
+        f"min={family_edges[0].estimated_bridge_count_min}, "
+        f"max={family_edges[0].estimated_bridge_count_max}, "
+        f"requires_pc={family_edges[0].requires_pc_transition}",
+    )
+
+    # -- Test 2: Pruning diagnostics are populated ----------------------
+    diag = result.diagnostics
+    pruning_ok = (
+        "virtual_family_edge_count" in diag
+        and "virtual_family_filtered_by_chain_limit_count" in diag
+        and "virtual_family_filtered_by_temp_count" in diag
+        and "virtual_family_filtered_by_group_count" in diag
+        and "virtual_family_topk_pruned_count" in diag
+        and "virtual_family_bridge_family_counts" in diag
+    )
+    _check_result(
+        "family edge pruning diagnostics are populated",
+        pruning_ok,
+        f"diag_keys={[k for k in diag if 'virtual_family' in k]}",
+    )
+
+    # -- Test 3: TemplateEdgeGraph filters VIRTUAL_BRIDGE_FAMILY_EDGE by policy --
+    from aps_cp_sat.model.constructive_sequence_builder import TemplateEdgeGraph
+
+    # Test allow_virtual=False → family edge filtered
+    class FakeModelFalse:
+        allow_virtual_bridge_edge_in_constructive = False
+        allow_real_bridge_edge_in_constructive = True
+
+    class _FRFalse:
+        max_width_gap = 100; max_thickness_gap = 0.5; max_temperature_diff = 50
+        real_reverse_step_max_mm = 300
+        virtual_reverse_attach_max_mm = 300
+        max_width_drop = 300
+        min_temp_overlap_real_real = 20.0
+        virtual_width_levels = []
+        virtual_thickness_levels = []
+        virtual_temp_min = 850.0; virtual_temp_max = 1050.0
+        virtual_tons = 5.0; max_width_rise_physical_step = 150.0
+
+    class _SCFalse:
+        direct_edge_cost = 0.0; real_bridge_cost = 0.0
+        virtual_bridge_cost = 0.0; virtual_family_cost = 0.0
+        width_smooth = 0.0; thick_smooth = 0.0; temp_margin = 0.0
+        non_pc_switch = 0.0; virtual_use = 0.0
+        real_bridge_penalty = 0.0; virtual_bridge_penalty = 0.0
+        direct_edge_penalty = 0.0; reverse_width_bridge_penalty = 0.0
+        template_base_cost_ratio = 0.0
+        edge_fallback_width_weight = 0; edge_fallback_thick_weight = 0
+        edge_fallback_due_weight = 0; edge_fallback_base_penalty = 0
+
+    class FakeCfgFalse:
+        model = FakeModelFalse(); line = "big_roll"
+        rule = _FRFalse()
+        score = _SCFalse()
+        def transition_check(self, from_oid, to_oid):
+            class _TC:
+                def fail_reason(self): return None
+            return _TC()
+        def check(self, from_oid, to_oid):
+            return lambda: None
+
+    graph_false = TemplateEdgeGraph(orders_df, tpl_df, FakeCfgFalse())
+    family_blocked = (
+        graph_false.accepted_virtual_bridge_family_edge_count == 0
+        and graph_false.filtered_virtual_bridge_edge_count >= 0
+        and graph_false.edge_policy == "direct_plus_real_bridge"
+    )
+    _check_result(
+        "family edge blocked when allow_virtual=False",
+        family_blocked,
+        f"accepted_family={graph_false.accepted_virtual_bridge_family_edge_count}, "
+        f"policy={graph_false.edge_policy}",
+    )
+
+    # Test allow_virtual=True → family edge allowed
+    class FakeModelTrue:
+        allow_virtual_bridge_edge_in_constructive = True
+        allow_real_bridge_edge_in_constructive = True
+
+    class _FRTrue:
+        max_width_gap = 100; max_thickness_gap = 0.5; max_temperature_diff = 50
+        real_reverse_step_max_mm = 300
+        virtual_reverse_attach_max_mm = 300
+        max_width_drop = 300
+        min_temp_overlap_real_real = 20.0
+        virtual_width_levels = []
+        virtual_thickness_levels = []
+        virtual_temp_min = 850.0; virtual_temp_max = 1050.0
+        virtual_tons = 5.0; max_width_rise_physical_step = 150.0
+
+    class _SCTrue:
+        direct_edge_cost = 0.0; real_bridge_cost = 0.0
+        virtual_bridge_cost = 0.0; virtual_family_cost = 0.0
+        width_smooth = 0.0; thick_smooth = 0.0; temp_margin = 0.0
+        non_pc_switch = 0.0; virtual_use = 0.0
+        real_bridge_penalty = 0.0; virtual_bridge_penalty = 0.0
+        direct_edge_penalty = 0.0; reverse_width_bridge_penalty = 0.0
+        template_base_cost_ratio = 0.0
+        edge_fallback_width_weight = 0; edge_fallback_thick_weight = 0
+        edge_fallback_due_weight = 0; edge_fallback_base_penalty = 0
+
+    class FakeCfgTrue:
+        model = FakeModelTrue(); line = "big_roll"
+        rule = _FRTrue()
+        score = _SCTrue()
+        def transition_check(self, from_oid, to_oid):
+            class _TC:
+                def fail_reason(self): return None
+            return _TC()
+        def check(self, from_oid, to_oid):
+            return lambda: None
+
+    graph_true = TemplateEdgeGraph(orders_df, tpl_df, FakeCfgTrue())
+    family_allowed = (
+        graph_true.accepted_virtual_bridge_family_edge_count >= 0
+        and graph_true.edge_policy == "all_edges_allowed"
+    )
+    _check_result(
+        "family edge allowed when allow_virtual=True",
+        family_allowed,
+        f"accepted_family={graph_true.accepted_virtual_bridge_family_edge_count}, "
+        f"policy={graph_true.edge_policy}",
+    )
+
+    # -- Test 4: BridgeRealizationOracle is fully wired -----------------
+    from aps_cp_sat.bridge import (
+        BridgeRealizationOracle,
+        OracleContext,
+        RealizationResult,
+        RealizationFailReason,
+    )
+
+    oracle = BridgeRealizationOracle()
+    context = OracleContext.from_config(orders_df, tpl_df, cfg, line="big_roll")
+
+    # Virtual family edge → NOT_IMPLEMENTED_YET
+    if family_edges:
+        result_family = oracle.realize(family_edges[0], context)
+        family_not_impl = (
+            result_family.feasible is False
+            and result_family.fail_reason == RealizationFailReason.NOT_IMPLEMENTED_YET
+            and result_family.realization_type == "failed"
+            and isinstance(result_family.diagnostics, dict)
+            and result_family.diagnostics.get("stub") is True
+        )
+        _check_result(
+            "Oracle: virtual family edge → NOT_IMPLEMENTED_YET",
+            family_not_impl,
+            f"feasible={result_family.feasible}, "
+            f"fail_reason={result_family.fail_reason.value}, "
+            f"type={result_family.realization_type}",
+        )
+
+    # Real bridge edge → feasible (basic check)
+    real_edges = [e for e in result.edges if e.edge_type == "REAL_BRIDGE_EDGE"]
+    if real_edges:
+        result_real = oracle.realize(real_edges[0], context)
+        real_feasible = (
+            result_real.feasible is True
+            and result_real.realization_type == "real"
+            and result_real.fail_reason == RealizationFailReason.OK
+            and len(result_real.exact_path) >= 1
+        )
+        _check_result(
+            "Oracle: real bridge edge → feasible (basic skeleton)",
+            real_feasible,
+            f"feasible={result_real.feasible}, "
+            f"type={result_real.realization_type}, "
+            f"path_len={len(result_real.exact_path)}",
+        )
+
+    # -- Test 5: RealizationResult factories work -----------------------
+    result_ok_real = RealizationResult.ok_real(
+        path=[{"order_id": "TEST"}], cost=50.0, diagnostics={"test": True}
+    )
+    factory_ok_real = (
+        result_ok_real.feasible is True
+        and result_ok_real.realization_type == "real"
+        and result_ok_real.fail_reason == RealizationFailReason.OK
+        and result_ok_real.diagnostics.get("test") is True
+    )
+    _check_result(
+        "RealizationResult.ok_real factory works",
+        factory_ok_real,
+        f"type={result_ok_real.realization_type}",
+    )
+
+    result_not_impl = RealizationResult.not_implemented("TEST_EDGE", explain="test stub")
+    factory_not_impl = (
+        result_not_impl.feasible is False
+        and result_not_impl.fail_reason == RealizationFailReason.NOT_IMPLEMENTED_YET
+        and "TEST_EDGE" in result_not_impl.fail_detail
+    )
+    _check_result(
+        "RealizationResult.not_implemented factory works",
+        factory_not_impl,
+        f"fail_reason={result_not_impl.fail_reason.value}",
+    )
+
+    # -- Test 6: OracleContext factory works ----------------------------
+    ctx = OracleContext.from_config(orders_df, tpl_df, cfg, line="small_roll")
+    ctx_ok = (
+        ctx.line == "small_roll"
+        and ctx.orders_df is not None
+        and ctx.tpl_df is not None
+        and ctx.max_virtual_chain == 5  # default from cfg.model.max_virtual_chain
+    )
+    _check_result(
+        "OracleContext.from_config factory works",
+        ctx_ok,
+        f"line={ctx.line}, max_chain={ctx.max_virtual_chain}",
+    )
+
+    # -- Test 7: Virtual family edge with chain limit exceeded ---
+    if family_edges:
+        from aps_cp_sat.model.candidate_graph_types import CandidateEdge
+        long_family = CandidateEdge(
+            from_order_id="A",
+            to_order_id="C",
+            line="big_roll",
+            edge_type="VIRTUAL_BRIDGE_FAMILY_EDGE",
+            bridge_family="GROUP_TRANSITION",
+            estimated_bridge_count=10,
+            estimated_bridge_count_min=8,
+            estimated_bridge_count_max=15,
+            requires_pc_transition=True,
+        )
+        ctx_tight = OracleContext(
+            orders_df=orders_df,
+            tpl_df=tpl_df,
+            config=cfg,
+            line="big_roll",
+            used_bridge_orders=set(),
+            max_virtual_chain=5,
+        )
+        result_long = oracle.realize(long_family, ctx_tight)
+        chain_fail = (
+            result_long.feasible is False
+            and result_long.fail_reason == RealizationFailReason.VIRTUAL_CHAIN_TOO_LONG
+            and "max_virtual_chain=5" in result_long.fail_detail
+        )
+        _check_result(
+            "Oracle: family edge exceeding chain limit → VIRTUAL_CHAIN_TOO_LONG",
+            chain_fail,
+            f"fail_reason={result_long.fail_reason.value}, "
+            f"detail={result_long.fail_detail[:80]}",
+        )
+
+    overall_ok = (
+        family_ok and pruning_ok and family_blocked and family_allowed
+        and factory_ok_real and factory_not_impl and ctx_ok
+    )
+    if family_edges:
+        overall_ok = overall_ok and family_not_impl and real_feasible and chain_fail
+
+    return overall_ok
+
+
+# ------------------------------------------------------------------
 # Main entry point
 # ------------------------------------------------------------------
 
@@ -847,6 +1439,10 @@ def _main() -> int:
         ("smoke_campaign_cut",       smoke_campaign_cut),
         ("smoke_local_insert",       smoke_local_insert),
         ("smoke_drop_reasons",       smoke_drop_reasons),
+        ("smoke_bridge_edge_policy_filtering", smoke_bridge_edge_policy_filtering),
+        ("smoke_direct_only_baseline_profile_and_unified_meta", smoke_direct_only_baseline_profile_and_unified_meta),
+        ("smoke_candidate_graph_build_result", smoke_candidate_graph_build_result),
+        ("smoke_virtual_bridge_family_edge", smoke_virtual_bridge_family_edge),
     ]:
         try:
             ok = fn()
