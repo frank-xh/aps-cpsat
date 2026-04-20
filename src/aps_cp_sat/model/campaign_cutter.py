@@ -1746,6 +1746,8 @@ def _row_bridge_type(row: dict) -> str:
             return val
     if bool(row.get("is_real_bridge", False)):
         return "REAL_BRIDGE_EDGE"
+    if bool(row.get("is_virtual_bridge_family", False)):
+        return "VIRTUAL_BRIDGE_FAMILY_EDGE"
     if bool(row.get("is_virtual_bridge", False)):
         return "VIRTUAL_BRIDGE_EDGE"
     return ""
@@ -1757,8 +1759,15 @@ def _is_real_bridge_row(row: dict) -> bool:
 
 
 def _is_virtual_bridge_row(row: dict) -> bool:
+    """Check if row is a legacy virtual bridge edge (EXCLUDES family edges)."""
     kind = _row_bridge_type(row)
     return kind in {"VIRTUAL_BRIDGE_EDGE", "VIRTUAL_BRIDGE", "VIRTUAL"}
+
+
+def _is_virtual_bridge_family_row(row: dict) -> bool:
+    """Check if row is a VIRTUAL_BRIDGE_FAMILY_EDGE edge."""
+    kind = _row_bridge_type(row)
+    return kind == "VIRTUAL_BRIDGE_FAMILY_EDGE"
 
 
 def _extract_bridge_endpoint(row: dict, side: str) -> tuple[str, str]:
@@ -1807,6 +1816,20 @@ def _virtual_bridge_rows_for_line(tpl_df: pd.DataFrame, line: str | None = None)
         if line is not None and "line" in row and str(row.get("line", "")) != str(line):
             continue
         if _is_virtual_bridge_row(row):
+            out.append(row)
+    return out
+
+
+def _virtual_bridge_family_rows_for_line(tpl_df: pd.DataFrame, line: str | None = None) -> list[dict]:
+    """Get VIRTUAL_BRIDGE_FAMILY_EDGE rows for a given line (or all lines if line is None)."""
+    if tpl_df.empty:
+        return []
+    rows = tpl_df.to_dict("records")
+    out: list[dict] = []
+    for row in rows:
+        if line is not None and "line" in row and str(row.get("line", "")) != str(line):
+            continue
+        if _is_virtual_bridge_family_row(row):
             out.append(row)
     return out
 
@@ -4363,51 +4386,54 @@ def _reconstruct_underfilled_segments(
         "bridgeability_route_suggestion": "",
         "bridgeability_census": {},
         "bridgeability_census_items": [],
+        # ---- Legacy virtual pilot: 降级为单一布尔字段 ----
+        # 旧有细粒度 virtual_pilot 字段已从此处移除；
+        # 只保留一个总布尔字段，表明 virtual_pilot 在本运行中被禁用。
+        # 旧有字段仍在 internal virtual pilot 代码路径中兼容记录，
+        # 但不在此处输出（避免大量空值污染 engine_meta）。
+        "virtual_pilot_skipped_due_to_disabled": True,  # 主线始终 True（pilot disabled）
+        # ---- Internal compat counters: 内部代码路径会写入这些字段；
+        #     不暴露到 engine_meta/writer summary（避免大量空值污染）。
+        #     初始化为 0 / {} 以保证 +=1 操作安全。
         "virtual_pilot_attempt_count": 0,
         "virtual_pilot_success_count": 0,
         "virtual_pilot_apply_count": 0,
         "virtual_pilot_reject_count": 0,
-        "virtual_pilot_eligible_block_count": 0,
-        "virtual_pilot_structural_eligible_block_count": 0,
-        "virtual_pilot_runtime_enabled_block_count": 0,
-        "virtual_pilot_final_eligible_block_count": 0,
-        "virtual_pilot_selected_block_count": 0,
         "virtual_pilot_skipped_block_count": 0,
         "virtual_pilot_skipped_due_to_disabled_count": 0,
         "virtual_pilot_skipped_due_to_limit_count": 0,
         "virtual_pilot_skipped_due_to_no_pilotable_candidate_count": 0,
-        "virtual_pilot_reject_by_reason_count": {},
+        "virtual_pilot_selected_block_count": 0,
+        "virtual_pilot_selected_unique_pilot_key_count": 0,
+        "virtual_pilot_structural_eligible_block_count": 0,
+        "virtual_pilot_runtime_enabled_block_count": 0,
+        "virtual_pilot_final_eligible_block_count": 0,
+        "virtual_pilot_eligible_block_count": 0,
+        "virtual_pilot_duplicate_candidate_skipped_count": 0,
+        "virtual_pilot_dedup_group_count": 0,
         "virtual_pilot_small_block_soft_penalty_count": 0,
-        "virtual_pilot_fail_stage_count": {},
-        "virtual_pilot_scheduler_budget": 0,
-        "virtual_pilot_selected_by_bucket_count": {},
-        "virtual_pilot_scheduler_selected_blocks": [],
-        "virtual_pilot_scheduler_skipped_due_to_limit": [],
         "virtual_pilot_spec_enum_total": 0,
         "virtual_pilot_spec_enum_both_valid_count": 0,
-        "virtual_pilot_ton_fill_attempt_count": 0,
-        "virtual_pilot_ton_fill_success_count": 0,
-        "virtual_pilot_dedup_group_count": 0,
-        "virtual_pilot_duplicate_candidate_skipped_count": 0,
-        "virtual_pilot_selected_unique_pilot_key_count": 0,
-        "virtual_pilot_selected_by_family_count": {},
+        "virtual_pilot_spec_enum_done_count": 0,
         "virtual_pilot_family_prefilter_fail_count": 0,
         "virtual_pilot_width_group_family_attempt_count": 0,
         "virtual_pilot_thickness_family_attempt_count": 0,
+        "virtual_pilot_ton_fill_attempt_count": 0,
+        "virtual_pilot_ton_fill_success_count": 0,
         "virtual_pilot_selected_candidate_count": 0,
         "virtual_pilot_dedup_kept_count": 0,
         "virtual_pilot_dedup_skipped_count": 0,
         "virtual_pilot_attempt_started_count": 0,
-        "virtual_pilot_spec_enum_done_count": 0,
         "virtual_pilot_recut_entered_count": 0,
         "virtual_pilot_segment_valid_count": 0,
         "virtual_pilot_ton_fill_entered_count": 0,
         "virtual_pilot_apply_check_entered_count": 0,
         "virtual_pilot_apply_success_count": 0,
-        "virtual_pilot_execution_stage_by_family": {},
+        "virtual_pilot_selected_by_bucket_count": {},
+        "virtual_pilot_selected_by_family_count": {},
+        "virtual_pilot_fail_stage_count": {},
         "virtual_pilot_post_spec_fail_stage_count": {},
-        "virtual_pilot_family_execution_audit": {},
-        "virtual_pilot_width_group_guarantee_attempted": False,
+        "virtual_pilot_reject_by_reason_count": {},
         "conservative_apply_attempt_count": 0,
         "conservative_apply_success_count": 0,
         "conservative_apply_reject_count": 0,
@@ -4485,6 +4511,60 @@ def _reconstruct_underfilled_segments(
         f"[APS][UNDERFILLED_RECON_ENTER] enabled=True, valid_in={len(valid_segments)}, "
         f"underfilled_in={len(underfilled_segments)}, lines={lines}"
     )
+
+    # =========================================================================
+    # Gain precheck: only continue if there's a realistic improvement signal
+    # =========================================================================
+    # Add cutter optimization diagnostics
+    diag.update({
+        "cutter_blocks_touched": 0,
+        "cutter_blocks_improved": 0,
+        "cutter_blocks_skipped_by_precheck": 0,
+        "cutter_blocks_skipped_by_no_gain_set": 0,
+        "cutter_no_gain_streak_max": 0,
+    })
+
+    # Precheck: build useful signals
+    _all_under = valid_segments + underfilled_segments
+    _has_underfilled = bool(underfilled_segments)
+    _gap_to_min_tons = max(0.0, campaign_ton_min - min((s.total_tons for s in underfilled_segments), default=0.0))
+    _gap_threshold = campaign_ton_min * 0.15  # 15% of min = clear signal
+    _has_significant_gap = _gap_to_min_tons > _gap_threshold
+    _has_real_bridge = bool(allow_real_bridge)
+    # Guarded family is profile-specific; check from config
+    _has_guard_family = bool(getattr(cfg.model, "virtual_family_frontload_enabled", False)) if cfg and cfg.model else False
+    _precheck_pass = (
+        _has_underfilled
+        or _has_significant_gap
+        or _has_real_bridge
+        or _has_guard_family
+    )
+    if not _precheck_pass:
+        diag["cutter_blocks_skipped_by_precheck"] = len(underfilled_segments)
+        diag["underfilled_reconstruction_not_entered_reason"] = "PRECHECK_FAILED_NO_GAIN_SIGNAL"
+        diag["underfilled_reconstruction_seconds"] = round(perf_counter() - t0, 6)
+        diag["reconstruction_seconds"] = diag["underfilled_reconstruction_seconds"]
+        print(
+            f"[APS][UNDERFILLED_RECON_PRECHECK] SKIP — no gain signal: "
+            f"has_underfilled={_has_underfilled}, gap={_gap_to_min_tons:.0f}/{_gap_threshold:.0f}, "
+            f"has_real_bridge={_has_real_bridge}, has_guard_family={_has_guard_family}"
+        )
+        return list(valid_segments), list(underfilled_segments), diag
+
+    # =========================================================================
+    # No-gain skip set: blocks that showed zero improvement twice → skip
+    # =========================================================================
+    # Note: no_gain_skip_set is initialized empty here. In the ALNS main loop,
+    # it persists across round calls via a module-level variable.
+    no_gain_skip_set: set[int] = set()
+
+    # =========================================================================
+    # Early stop: consecutive no-gain streak
+    # =========================================================================
+    no_gain_streak = 0
+    early_stop_no_gain_limit = 5  # Stop after N consecutive blocks with no gain
+    reconstruction_early_stopped = False
+
     if not underfilled_segments:
         census_dict = bridgeability_census.to_dict()
         suggestion = _suggest_next_phase_from_census(census_dict)
@@ -4511,11 +4591,16 @@ def _reconstruct_underfilled_segments(
         print(
             f"[APS][UNDERFILLED_RECON_SUMMARY] attempts=0, success=0, blocks_tested=0, "
             f"valid_delta=0, underfilled_delta=0, salvaged_segments=0, salvaged_orders=0, "
-            f"prefilter_reject_count=0, endpoint_early_stop_count=0, local_band_retry_count=0, "
+            f"cutter_blocks_touched=0, cutter_blocks_improved=0, "
+            f"cutter_blocks_skipped_by_precheck={diag.get('cutter_blocks_skipped_by_precheck', 0)}, "
+            f"cutter_blocks_skipped_by_no_gain_set=0, cutter_no_gain_streak_max=0, "
+            f"reconstruction_early_stopped=False, prefilter_reject_count=0, "
+            f"endpoint_early_stop_count=0, local_band_retry_count=0, "
             f"improvement_recorded_count=0, improvement_applied_count=0, apply_reject_count=0, "
             f"bridgeability_route_suggestion={diag['bridgeability_route_suggestion']}, "
-            f"virtual_pilot_attempt_count=0, virtual_pilot_success_count=0, "
-            f"virtual_pilot_apply_count=0, virtual_pilot_reject_count=0"
+            f"virtual_pilot_skipped_due_to_disabled={bool(diag.get('virtual_pilot_skipped_due_to_disabled', True))}, "
+            f"conservative_apply_attempt_count=0, conservative_apply_success_count=0, "
+            f"conservative_apply_reject_count=0"
         )
         return list(valid_segments), [], diag
 
@@ -4599,6 +4684,12 @@ def _reconstruct_underfilled_segments(
         virtual_pilot_family_quota["OTHER"] += int(virtual_pilot_max_blocks) - sum(virtual_pilot_family_quota.values())
 
     for line in sorted({s.line for s in underfilled_segments}):
+        # ---- Early stop: consecutive no-gain streak limit ----
+        if reconstruction_early_stopped:
+            print(f"[APS][RECON_EARLY_STOP] line={line}, reason=NO_GAIN_STREAK_LIMIT({early_stop_no_gain_limit})")
+            diag["reconstruction_stage_early_stopped"] = True
+            break
+
         line_under = sorted([s for s in underfilled_segments if s.line == line], key=lambda s: s.campaign_local_id)
         line_pair_rows_by_key = _build_template_pair_rows_by_key(tpl_df, str(line))
         line_bridge_schema = _print_bridge_schema_samples(tpl_df, str(line))
@@ -4611,6 +4702,13 @@ def _reconstruct_underfilled_segments(
             continue
         i = 0
         while i < len(line_under):
+            # ---- No-gain skip set: block already tried with no gain twice ----
+            block_uid = f"{line}:{i}"
+            if block_uid in no_gain_skip_set:
+                diag["cutter_blocks_skipped_by_no_gain_set"] = diag.get("cutter_blocks_skipped_by_no_gain_set", 0) + 1
+                remaining_under.append(line_under[i])
+                i += 1
+                continue
             best = None
             best_size = 1
             block_id = i
@@ -4620,6 +4718,8 @@ def _reconstruct_underfilled_segments(
                 remaining_under.append(line_under[i])
                 i += 1
                 continue
+            # Block will be processed — count as touched
+            diag["cutter_blocks_touched"] = diag.get("cutter_blocks_touched", 0) + 1
             for block_size in (4, 3, 2):
                 if i + block_size > len(line_under):
                     continue
@@ -6181,7 +6281,30 @@ def _reconstruct_underfilled_segments(
                 f"residual_underfilled={len(under_out)}"
             )
             diag["reconstruction_no_gain"] = False
+            # Reset no-gain streak on improvement
+            no_gain_streak = 0
             i += best_size
+            # Track improved block
+            diag["cutter_blocks_improved"] = diag.get("cutter_blocks_improved", 0) + 1
+        else:
+            # No improvement: increment streak
+            no_gain_streak += 1
+            if no_gain_streak > diag.get("cutter_no_gain_streak_max", 0):
+                diag["cutter_no_gain_streak_max"] = no_gain_streak
+            # Early stop if no-gain streak limit reached
+            if no_gain_streak >= early_stop_no_gain_limit:
+                reconstruction_early_stopped = True
+                print(
+                    f"[APS][RECON_EARLY_STOP] line={line}, block_id={block_id}, "
+                    f"reason=NO_GAIN_STREAK({no_gain_streak}>={early_stop_no_gain_limit}), "
+                    f"remaining_under={len(line_under) - i}"
+                )
+                # Count remaining blocks as skipped by precheck
+                diag["cutter_blocks_skipped_by_precheck"] = (
+                    diag.get("cutter_blocks_skipped_by_precheck", 0)
+                    + len(line_under) - i
+                )
+                break
 
     diag["underfilled_reconstruction_valid_delta"] = int(len(new_valid) - len(valid_segments))
     diag["underfilled_reconstruction_underfilled_delta"] = int(len(underfilled_segments) - len(remaining_under))
@@ -6321,6 +6444,13 @@ def _reconstruct_underfilled_segments(
         f"underfilled_delta={int(diag.get('underfilled_reconstruction_underfilled_delta', 0))}, "
         f"salvaged_segments={int(diag.get('underfilled_reconstruction_segments_salvaged', 0))}, "
         f"salvaged_orders={int(diag.get('underfilled_reconstruction_orders_salvaged', 0))}, "
+        # ---- Cutter optimization stats ----
+        f"cutter_blocks_touched={int(diag.get('cutter_blocks_touched', 0))}, "
+        f"cutter_blocks_improved={int(diag.get('cutter_blocks_improved', 0))}, "
+        f"cutter_blocks_skipped_by_precheck={int(diag.get('cutter_blocks_skipped_by_precheck', 0))}, "
+        f"cutter_blocks_skipped_by_no_gain_set={int(diag.get('cutter_blocks_skipped_by_no_gain_set', 0))}, "
+        f"cutter_no_gain_streak_max={int(diag.get('cutter_no_gain_streak_max', 0))}, "
+        f"reconstruction_early_stopped={bool(diag.get('reconstruction_stage_early_stopped', False))}, "
         f"ton_rescue_extract_success={int(diag.get('repair_bridge_ton_rescue_extract_success', 0))}, "
         f"ton_rescue_partial_success={int(diag.get('repair_bridge_ton_rescue_partial_success', 0))}, "
         f"ton_rescue_pair_fail_width={int(diag.get('repair_bridge_ton_rescue_pair_fail_width', 0))}, "
@@ -6338,35 +6468,8 @@ def _reconstruct_underfilled_segments(
         f"improvement_applied_count={int(diag.get('underfilled_reconstruction_improvement_applied_count', 0))}, "
         f"apply_reject_count={int(diag.get('underfilled_reconstruction_apply_reject_count', 0))}, "
         f"bridgeability_route_suggestion={str(diag.get('bridgeability_route_suggestion', ''))}, "
-        f"virtual_pilot_attempt_count={int(diag.get('virtual_pilot_attempt_count', 0) or 0)}, "
-        f"virtual_pilot_success_count={int(diag.get('virtual_pilot_success_count', 0) or 0)}, "
-        f"virtual_pilot_apply_count={int(diag.get('virtual_pilot_apply_count', 0) or 0)}, "
-        f"virtual_pilot_reject_count={int(diag.get('virtual_pilot_reject_count', 0) or 0)}, "
-        f"virtual_pilot_eligible_block_count={int(diag.get('virtual_pilot_eligible_block_count', 0) or 0)}, "
-        f"virtual_pilot_structural_eligible_block_count={int(diag.get('virtual_pilot_structural_eligible_block_count', 0) or 0)}, "
-        f"virtual_pilot_runtime_enabled_block_count={int(diag.get('virtual_pilot_runtime_enabled_block_count', 0) or 0)}, "
-        f"virtual_pilot_final_eligible_block_count={int(diag.get('virtual_pilot_final_eligible_block_count', 0) or 0)}, "
-        f"virtual_pilot_selected_block_count={int(diag.get('virtual_pilot_selected_block_count', 0) or 0)}, "
-        f"virtual_pilot_skipped_block_count={int(diag.get('virtual_pilot_skipped_block_count', 0) or 0)}, "
-        f"virtual_pilot_skipped_due_to_disabled_count={int(diag.get('virtual_pilot_skipped_due_to_disabled_count', 0) or 0)}, "
-        f"virtual_pilot_skipped_due_to_limit_count={int(diag.get('virtual_pilot_skipped_due_to_limit_count', 0) or 0)}, "
-        f"virtual_pilot_skipped_due_to_no_pilotable_candidate_count={int(diag.get('virtual_pilot_skipped_due_to_no_pilotable_candidate_count', 0) or 0)}, "
-        f"virtual_pilot_small_block_soft_penalty_count={int(diag.get('virtual_pilot_small_block_soft_penalty_count', 0) or 0)}, "
-        f"virtual_pilot_fail_stage_count={dict(diag.get('virtual_pilot_fail_stage_count', {}) or {})}, "
-        f"virtual_pilot_scheduler_budget={int(diag.get('virtual_pilot_scheduler_budget', 0) or 0)}, "
-        f"virtual_pilot_selected_by_bucket_count={dict(diag.get('virtual_pilot_selected_by_bucket_count', {}) or {})}, "
-        f"virtual_pilot_dedup_group_count={int(diag.get('virtual_pilot_dedup_group_count', 0) or 0)}, "
-        f"virtual_pilot_duplicate_candidate_skipped_count={int(diag.get('virtual_pilot_duplicate_candidate_skipped_count', 0) or 0)}, "
-        f"virtual_pilot_selected_unique_pilot_key_count={int(diag.get('virtual_pilot_selected_unique_pilot_key_count', 0) or 0)}, "
-        f"virtual_pilot_selected_by_family_count={dict(diag.get('virtual_pilot_selected_by_family_count', {}) or {})}, "
-        f"virtual_pilot_family_prefilter_fail_count={int(diag.get('virtual_pilot_family_prefilter_fail_count', 0) or 0)}, "
-        f"virtual_pilot_width_group_family_attempt_count={int(diag.get('virtual_pilot_width_group_family_attempt_count', 0) or 0)}, "
-        f"virtual_pilot_thickness_family_attempt_count={int(diag.get('virtual_pilot_thickness_family_attempt_count', 0) or 0)}, "
-        f"virtual_pilot_spec_enum_total={int(diag.get('virtual_pilot_spec_enum_total', 0) or 0)}, "
-        f"virtual_pilot_spec_enum_both_valid_count={int(diag.get('virtual_pilot_spec_enum_both_valid_count', 0) or 0)}, "
-        f"virtual_pilot_ton_fill_attempt_count={int(diag.get('virtual_pilot_ton_fill_attempt_count', 0) or 0)}, "
-        f"virtual_pilot_ton_fill_success_count={int(diag.get('virtual_pilot_ton_fill_success_count', 0) or 0)}, "
-        f"virtual_pilot_reject_by_reason_count={dict(diag.get('virtual_pilot_reject_by_reason_count', {}) or {})}, "
+        # ---- Legacy virtual pilot: 降级为单一布尔字段 ----
+        f"virtual_pilot_skipped_due_to_disabled={bool(diag.get('virtual_pilot_skipped_due_to_disabled', True))}, "
         f"conservative_apply_attempt_count={int(diag.get('conservative_apply_attempt_count', 0) or 0)}, "
         f"conservative_apply_success_count={int(diag.get('conservative_apply_success_count', 0) or 0)}, "
         f"conservative_apply_reject_count={int(diag.get('conservative_apply_reject_count', 0) or 0)}"

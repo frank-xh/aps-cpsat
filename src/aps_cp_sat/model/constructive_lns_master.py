@@ -71,13 +71,155 @@ class DropReason(Enum):
 
 
 class NeighborhoodType(Enum):
-    """ALNS neighborhood destruction strategy."""
+    """
+    ALNS neighborhood destruction strategy.
+
+    Current production neighborhoods (verified effective):
+    - LOW_FILL_SEGMENT: Low fill % (near min) segments
+    - HIGH_DROP_PRESSURE: Segments near many dropped orders
+    - TAIL_REBALANCE: Low-fill tail segments eligible for rebalancing
+
+    REMOVED neighborhoods (experimental, no proven gain in production):
+    - HIGH_VIRTUAL_USAGE: Removed - no business meaning in current path
+    - SMALL_ROLL_RESCUE: Removed - not part of constructive_lns main path
+    """
     LOW_FILL_SEGMENT = "LOW_FILL_SEGMENT"            # Low fill % (near min) segments
     HIGH_DROP_PRESSURE = "HIGH_DROP_PRESSURE"         # Segments near many dropped orders
-    HIGH_VIRTUAL_USAGE = "HIGH_VIRTUAL_USAGE"        # Segments using many virtual bridges
     TAIL_REBALANCE = "TAIL_REBALANCE"                # Low-fill tail segments eligible for rebalancing
-    # ---- small_roll rescue: rescue small_roll campaigns with 0 chains/orders ----
-    SMALL_ROLL_RESCUE = "SMALL_ROLL_RESCUE"          # Priority on small_roll underfilled / dropped segments
+    WIDTH_TENSION_HOTSPOT = "WIDTH_TENSION_HOTSPOT"   # Width tension / drop-pressure (family edge candidate)
+    GROUP_SWITCH_HOTSPOT = "GROUP_SWITCH_HOTSPOT"      # Group switch pressure (family edge candidate)
+    BRIDGE_DEPENDENT_SEGMENT = "BRIDGE_DEPENDENT_SEGMENT"  # Segments with many bridge edges
+
+
+# ---------------------------------------------------------------------------
+# Guarded virtual family ALNS helpers
+# ---------------------------------------------------------------------------
+
+def should_enable_virtual_family_for_neighborhood(
+    neighborhood: NeighborhoodType,
+    cfg: PlannerConfig,
+    *,
+    dropped_count: int = 0,
+    underfill_detected: bool = False,
+    drop_pressure_score: float = 0.0,
+    group_switch_hotspot: bool = False,
+    width_tension_hotspot: bool = False,
+    bridge_dependent_segment: bool = False,
+) -> tuple[bool, str]:
+    """
+    Determine if virtual family edges should be enabled for the given ALNS neighborhood.
+
+    Returns (enabled, reason) tuple:
+      - enabled: True only when profile enabled AND neighborhood qualifies AND pressure signal present
+      - reason: Human-readable reason for diagnostics
+
+    Priority order for family repair (guarded profile):
+      PRIMARY (always considered first):
+        - LOW_FILL_SEGMENT: most direct impact on fill quality
+        - HIGH_DROP_PRESSURE: resolves drop pressure
+        - GROUP_SWITCH_HOTSPOT: addresses group transition complexity
+      SECONDARY (allowed but may be rate-limited):
+        - WIDTH_TENSION_HOTSPOT: width tension resolution
+        - BRIDGE_DEPENDENT_SEGMENT: bridge dependency resolution
+    """
+    model = getattr(cfg, "model", None)
+    if model is None:
+        return False, "cfg_none"
+    if not getattr(model, "virtual_family_frontload_enabled", False):
+        return False, "profile_disabled"
+
+    primary_neighborhoods = {
+        NeighborhoodType.LOW_FILL_SEGMENT,
+        NeighborhoodType.HIGH_DROP_PRESSURE,
+        NeighborhoodType.GROUP_SWITCH_HOTSPOT,
+    }
+    secondary_neighborhoods = {
+        NeighborhoodType.WIDTH_TENSION_HOTSPOT,
+        NeighborhoodType.BRIDGE_DEPENDENT_SEGMENT,
+    }
+    family_neighborhoods = primary_neighborhoods | secondary_neighborhoods
+
+    if neighborhood not in family_neighborhoods:
+        return False, f"neighborhood={neighborhood.value}_not_family_eligible"
+
+    # Primary neighborhoods: require at least one pressure signal
+    if neighborhood in primary_neighborhoods:
+        if underfill_detected:
+            return True, f"primary={neighborhood.value}_underfill_detected"
+        if drop_pressure_score > 0 or dropped_count > 0:
+            return True, f"primary={neighborhood.value}_drop_pressure"
+        if group_switch_hotspot:
+            return True, f"primary={neighborhood.value}_group_switch"
+        # Primary neighborhoods can also enable with mild signal
+        if drop_pressure_score >= 0:
+            return True, f"primary={neighborhood.value}_mild_signal"
+        return False, f"primary={neighborhood.value}_no_signal"
+
+    # Secondary neighborhoods: require stronger signal
+    if neighborhood in secondary_neighborhoods:
+        if bridge_dependent_segment and underfill_detected:
+            return True, f"secondary={neighborhood.value}_bridge_underfill"
+        if width_tension_hotspot and dropped_count > 0:
+            return True, f"secondary={neighborhood.value}_width_drop"
+        return False, f"secondary={neighborhood.value}_insufficient_signal"
+
+
+def should_run_local_cpsat(
+    neighborhood: NeighborhoodType,
+    cfg: PlannerConfig,
+    candidate_count: int,
+    *,
+    round_num: int = 0,
+    max_cpsat_rounds: int = 8,
+) -> Tuple[bool, str]:
+    """
+    Unified gate for deciding whether to run expensive local CP-SAT subproblem.
+
+    Returns:
+        Tuple of (should_run: bool, reason: str)
+
+    Gate conditions (skip if any matches):
+        1. neighborhood not in ALNS-eligible set
+        2. candidate count exceeds local_cpsat_max_orders
+        3. already past max_cpsat_rounds (local CP-SAT not worthwhile after mid-run)
+        4. neighborhood is TAIL_REBALANCE with no dropped orders to reinsert
+        5. candidate count too small (< 2 orders)
+
+    Gate conditions (allow if all pass):
+        1. neighborhood in {LOW_FILL_SEGMENT, HIGH_DROP_PRESSURE,
+                           GROUP_SWITCH_HOTSPOT, WIDTH_TENSION_HOTSPOT,
+                           BRIDGE_DEPENDENT_SEGMENT}
+        2. candidate_count <= local_cpsat_max_orders
+        3. round_num < max_cpsat_rounds
+        4. candidate_count >= 2
+    """
+    # ---- Condition 1: neighborhood eligibility ----
+    cpsat_eligible_neighborhoods = {
+        NeighborhoodType.LOW_FILL_SEGMENT,
+        NeighborhoodType.HIGH_DROP_PRESSURE,
+        NeighborhoodType.TAIL_REBALANCE,
+        NeighborhoodType.GROUP_SWITCH_HOTSPOT,
+        NeighborhoodType.WIDTH_TENSION_HOTSPOT,
+        NeighborhoodType.BRIDGE_DEPENDENT_SEGMENT,
+    }
+    if neighborhood not in cpsat_eligible_neighborhoods:
+        return False, f"NEIGHBORHOOD_NOT_ELIGIBLE({neighborhood.value})"
+
+    # ---- Condition 2: candidate scale check ----
+    max_orders = int(getattr(cfg.model, "local_cpsat_max_orders", 45) if cfg.model else 45)
+    if candidate_count > max_orders:
+        return False, f"CANDIDATE_COUNT_EXCEEDED({candidate_count}>{max_orders})"
+
+    # ---- Condition 3: round budget check ----
+    if round_num >= max_cpsat_rounds:
+        return False, f"ROUND_EXCEEDED({round_num}>={max_cpsat_rounds})"
+
+    # ---- Condition 4: minimum candidate check ----
+    if candidate_count < 2:
+        return False, f"TOO_FEW_CANDIDATES({candidate_count})"
+
+    # ---- All checks passed ----
+    return True, "GATE_PASSED"
 
 
 # ---------------------------------------------------------------------------
@@ -416,9 +558,30 @@ class LnsRound:
     tail_rebalance_neighborhood_selected_count: int = 0  # how many rounds used TAIL_REBALANCE
     low_fill_neighborhood_success_count: int = 0  # accepted rounds for LOW_FILL_SEGMENT
     tail_rebalance_neighborhood_success_count: int = 0  # accepted rounds for TAIL_REBALANCE
-    # SMALL_ROLL_RESCUE neighborhood diagnostics
-    small_roll_campaign_count: int = 0  # number of small_roll campaigns in current solution
-    small_roll_rescue_dropped_count: int = 0  # dropped orders that are small_roll candidates
+    # NOTE: SMALL_ROLL_RESCUE and HIGH_VIRTUAL_USAGE removed (experimental, not in production)
+    # ---- Guarded virtual family ALNS diagnostics ----
+    virtual_family_frontload_enabled: bool = False  # Profile-level total switch
+    virtual_family_enabled_for_this_round: bool = False  # Round-level actual enabled result
+    virtual_family_enable_reason: str = ""  # Why family was enabled/disabled this round
+    virtual_family_disable_reason: str = ""  # Why family was disabled this round (if applicable)
+    alns_virtual_family_attempt_count: int = 0  # Rounds where family edge was attempted
+    alns_virtual_family_accept_count: int = 0  # Rounds where family edge was accepted
+    alns_virtual_family_reject_count: int = 0  # Rounds where family edge was rejected
+    alns_virtual_family_budget_block_count: int = 0  # Rounds blocked by budget limit
+    alns_virtual_family_no_gain_count: int = 0  # Rounds with no improvement from family edge
+    alns_virtual_family_neighborhood_histogram: dict = field(default_factory=dict)  # Count by neighborhood type
+    local_cpsat_virtual_family_selected_count: int = 0  # Family edges selected in local CP-SAT this round
+    # ---- Family repair value metrics (guarded profile) ----
+    # Count-based
+    family_repair_attempt_count: int = 0  # Family repair subproblem attempts
+    family_repair_accept_count: int = 0   # Family repair subproblem accepted
+    family_repair_gain_dropped: int = 0   # Dropped orders resolved by family repair
+    family_repair_gain_underfilled: int = 0  # Underfilled segments improved by family repair
+    family_repair_gain_scheduled_orders: int = 0  # Orders scheduled via family repair
+    family_repair_no_gain_count: int = 0   # Family repair attempts with no improvement
+    # Average value metrics
+    family_repair_avg_gain_per_attempt: float = 0.0  # avg(dropped + underfilled) per attempt
+    family_repair_avg_seconds_per_success: float = 0.0  # avg seconds per successful attempt
 
 
 @dataclass
@@ -493,13 +656,15 @@ def _normalize_bridge_metadata(
         - selected_virtual_bridge_count: int  (number of virtual coils if expanded)
         - selected_real_bridge_order_id: str  (order_id of real bridge if applicable)
 
-    Route C (direct_only mode, allow_virtual=False, allow_real=False):
+    Route RB (mainline, allow_virtual=False, allow_real=True):
         - DIRECT_EDGE: all expand fields = False/0/""
-        - REAL_BRIDGE_EDGE: should not appear (leak), but handle gracefully
-        - VIRTUAL_BRIDGE_EDGE: should not appear (leak), but handle gracefully
+        - REAL_BRIDGE_EDGE: legitimate mainline edge, capture real_bridge_order_id
+        - VIRTUAL_BRIDGE_EDGE: blocked (leak in mainline)
 
-    Any bridge edge appearing in planned_df under direct_only mode is logged
-    as a leak in the parent function's diagnostics.
+    Route C (baseline, allow_virtual=False, allow_real=False):
+        - DIRECT_EDGE: all expand fields = False/0/""
+        - REAL_BRIDGE_EDGE: blocked (leak in baseline)
+        - VIRTUAL_BRIDGE_EDGE: blocked (leak in baseline)
     """
     # Get bridge expansion mode from config
     bridge_expand_mode = str(getattr(cfg.model, "bridge_expansion_mode", "disabled") if cfg else "disabled")
@@ -525,7 +690,8 @@ def _normalize_bridge_metadata(
         result["selected_bridge_path"] = ""
 
     elif edge_type == "REAL_BRIDGE_EDGE":
-        # Route C leak: REAL_BRIDGE_EDGE should not appear
+        # Route RB: REAL_BRIDGE_EDGE is legitimate in mainline
+        # Route C: REAL_BRIDGE_EDGE is blocked (leak in baseline)
         result["selected_bridge_expandable"] = False
         result["selected_bridge_expand_mode"] = "disabled"
         result["selected_virtual_bridge_count"] = 0
@@ -534,11 +700,11 @@ def _normalize_bridge_metadata(
                 tpl_row.get("bridge_order_id", tpl_row.get("real_bridge_order_id", ""))
             )
         if is_direct_only:
-            # Mark as leak: force bridge_path to empty, this is a data anomaly
+            # Mark as leak in baseline mode: force bridge_path to empty
             result["selected_bridge_path"] = ""
 
     elif edge_type == "VIRTUAL_BRIDGE_EDGE":
-        # Route C leak: VIRTUAL_BRIDGE_EDGE should not appear
+        # Route RB / Route C: VIRTUAL_BRIDGE_EDGE is blocked (leak in both modes)
         if is_direct_only:
             result["selected_bridge_expandable"] = False
             result["selected_bridge_expand_mode"] = "disabled"
@@ -1108,15 +1274,16 @@ def _select_neighborhood(
     """
     Select 1-2 campaign segments according to the given strategy.
 
-    Strategies:
+    Current production strategies:
     - LOW_FILL_SEGMENT: segments with low fill % (near min) — enhanced multi-criteria
         scoring: gap_to_min, donor availability, dropped candidates, template integrity.
     - HIGH_DROP_PRESSURE: segments adjacent to many dropped orders
-    - HIGH_VIRTUAL_USAGE: segments with many virtual bridge edges (disabled in direct_only mode)
     - TAIL_REBALANCE: underfilled tails (or near-min valid segs) with donor candidates;
         when underfilled_bias_segs is provided, prioritize those.
-    - SMALL_ROLL_RESCUE: small_roll segments prioritized when small_roll has 0 campaigns;
-        targets underfilled small_roll segments for rescue insertion
+
+    REMOVED strategies (experimental, no proven gain):
+    - HIGH_VIRTUAL_USAGE: Removed - no business meaning in current path
+    - SMALL_ROLL_RESCUE: Removed - not part of constructive_lns main path
     """
     if not segments:
         return []
@@ -1185,10 +1352,6 @@ def _select_neighborhood(
             pressure = drop_count
             scored.append((pressure, seg))
 
-        elif strategy == NeighborhoodType.HIGH_VIRTUAL_USAGE:
-            vb_edges = 0
-            scored.append((vb_edges, seg))
-
         elif strategy == NeighborhoodType.TAIL_REBALANCE:
             # Pick segments that are closest to ton_min (tail candidates).
             if seg.total_tons >= ton_min:
@@ -1197,20 +1360,6 @@ def _select_neighborhood(
                 scored.append((score, seg))
             else:
                 scored.append((0.0, seg))
-
-        elif strategy == NeighborhoodType.SMALL_ROLL_RESCUE:
-            small_roll_camp_count = sum(1 for s in valid_segs if s.line == "small_roll")
-            if seg.line == "small_roll":
-                if small_roll_camp_count == 0:
-                    score = 0.0
-                else:
-                    fill_ratio = seg.total_tons / ton_min if ton_min > 0 else 0.0
-                    score = 0.5 + abs(fill_ratio - 1.0) * 0.1
-                scored.append((score, seg))
-            else:
-                fill_ratio = seg.total_tons / ton_min if ton_min > 0 else 0.0
-                score = 2.0 + abs(fill_ratio - 1.0)
-                scored.append((score, seg))
         else:
             scored.append((0.0, seg))
 
@@ -1925,6 +2074,14 @@ def _run_alns_iteration(
         "low_fill_candidates": 0,
         "low_fill_avg_gap_to_min": 0.0,
         "low_fill_selected_gap": 0.0,
+        # ---- Local CP-SAT gate diagnostics ----
+        "local_cpsat_skipped_due_to_gate": 0,
+        "local_cpsat_attempt_count": 0,
+        "local_cpsat_success_count": 0,
+        "local_cpsat_no_improve_count": 0,
+        "local_cpsat_infeasible_count": 0,
+        "local_cpsat_total_seconds": 0.0,
+        "local_cpsat_skip_reason_histogram": {},
     }
 
     # ---- Step 1: Select neighborhood ----
@@ -2165,6 +2322,61 @@ def _run_alns_iteration(
     total_pool_conn_filtered = 0
     total_pool_already_tried = 0
 
+    # ---- ALNS family round-level stats (accumulated across lines in this round) ----
+    _round_alns_family_attempt = 0
+    _round_alns_family_accept = 0
+    _round_alns_family_reject = 0
+    _round_alns_family_budget_block = 0
+    _round_total_local_family_selected = 0
+
+    # ---- Compute pressure signals for family edge gating ----
+    # These are used to decide if should_enable_virtual_family_for_neighborhood returns True.
+    _dropped_count = sum(len(v) for v in current_dropped.values())
+    _ton_min = float(cfg.rule.campaign_ton_min)
+    _underfill_detected = any(
+        s.total_tons < _ton_min for s in new_segs if s.is_valid
+    )
+    _drop_pressure_score = float(_dropped_count) / max(1, len(orders_df))
+    _total_tons_in_segs = sum(s.total_tons for s in new_segs if s.is_valid)
+    _width_tension_hotspot = False
+    _group_switch_hotspot = False
+    _bridge_dependent_segment = False
+    # Detect hotspots from segments: wide-to-narrow transitions, group switches, low-fill bridge segments
+    for seg in new_segs:
+        if not seg.is_valid or not seg.order_ids:
+            continue
+        if seg.total_tons < _ton_min:
+            # Underfilled segment may be bridge-dependent
+            _bridge_dependent_segment = True
+        # Check for group transitions / width tension within segment
+        if len(seg.order_ids) >= 2:
+            seg_recs = {oid: dict(orders_df.set_index("order_id").loc[oid]) for oid in seg.order_ids if oid in orders_df.set_index("order_id").index}
+            widths = [float(r.get("width", 0) or 0) for r in seg_recs.values()]
+            if len(widths) >= 2:
+                width_range = max(widths) - min(widths)
+                if width_range > 200:
+                    _width_tension_hotspot = True
+            groups = [str(r.get("steel_group", "") or "") for r in seg_recs.values()]
+            if len(set(groups)) >= 3:
+                _group_switch_hotspot = True
+
+    # Decide round-level family enablement ONCE per ALNS round (before per-line loop)
+    _profile_family_enabled = getattr(cfg.model, "virtual_family_frontload_enabled", False)
+    if _profile_family_enabled:
+        _allow_guarded_family_this_round, _family_enable_reason = should_enable_virtual_family_for_neighborhood(
+            neighborhood,
+            cfg,
+            dropped_count=_dropped_count,
+            underfill_detected=_underfill_detected,
+            drop_pressure_score=_drop_pressure_score,
+            group_switch_hotspot=_group_switch_hotspot,
+            width_tension_hotspot=_width_tension_hotspot,
+            bridge_dependent_segment=_bridge_dependent_segment,
+        )
+    else:
+        _allow_guarded_family_this_round = False
+        _family_enable_reason = "profile_disabled"
+
     # Track which pool candidates have already been assigned to a line this round
     # to avoid sending the same dropped order to multiple lines simultaneously
     already_assigned_pool_candidates: Set[str] = set()
@@ -2237,7 +2449,37 @@ def _run_alns_iteration(
         if not candidate_orders:
             continue
 
-        # Build subproblem
+        # ---- Unified local CP-SAT gate ----
+        max_cpsat_rounds = int(getattr(cfg.model, "lns_max_total_rounds", 10) if cfg.model else 10)
+        _gate_ok, _gate_reason = should_run_local_cpsat(
+            neighborhood,
+            cfg,
+            len(candidate_orders),
+            round_num=round_num,
+            max_cpsat_rounds=max_cpsat_rounds,
+        )
+        if not _gate_ok:
+            tail_repair_diag["local_cpsat_skipped_due_to_gate"] += 1
+            _hist = tail_repair_diag.get("local_cpsat_skip_reason_histogram", {})
+            _hist[_gate_reason] = _hist.get(_gate_reason, 0) + 1
+            tail_repair_diag["local_cpsat_skip_reason_histogram"] = _hist
+            continue
+
+        # Build subproblem with request-level family controls
+        # prefer_guarded_virtual_family: when ALNS neighborhood is primary family neighborhood,
+        # indicate that family edges should be moderately preferred in scoring
+        _prefer_family = bool(_allow_guarded_family_this_round and (
+            neighborhood in {
+                NeighborhoodType.LOW_FILL_SEGMENT,
+                NeighborhoodType.HIGH_DROP_PRESSURE,
+                NeighborhoodType.GROUP_SWITCH_HOTSPOT,
+            }
+        ))
+        _family_reason = (
+            f"primary_neighborhood={neighborhood.value}"
+            if _prefer_family
+            else ("secondary_neighborhood" if _allow_guarded_family_this_round else "disabled")
+        )
         req = LocalInsertRequest(
             line=line,
             fixed_order_ids=fixed_orders,
@@ -2245,17 +2487,70 @@ def _run_alns_iteration(
             time_limit_seconds=time_limit,
             random_seed=rand.randint(1, 999999),
             max_orders_in_subproblem=max_destroy_orders,
+            # Guarded virtual family request-level controls
+            allow_guarded_virtual_family=_allow_guarded_family_this_round,
+            virtual_family_budget_for_rebuild=int(getattr(cfg.model, "virtual_family_budget_per_line", 4) if cfg.model else 4),
+            virtual_family_allowed_families=list(getattr(cfg.model, "virtual_family_frontload_allowed_families", []) if cfg.model else []),
+            virtual_family_max_bridge_count=int(getattr(cfg.model, "virtual_family_frontload_max_bridge_count", 2) if cfg.model else 2),
+            # Family repair scoring preference (guarded profile)
+            prefer_guarded_virtual_family=_prefer_family,
+            guarded_virtual_family_reason=_family_reason,
         )
 
+        import time as _time_module
+        _cpsat_t0 = _time_module.perf_counter()
         result = solve_local_insertion_subproblem(
             req, orders_df, transition_pack, cfg,
         )
+        _cpsat_elapsed = _time_module.perf_counter() - _cpsat_t0
+
+        # Record gate-aware CP-SAT diagnostics
+        tail_repair_diag["local_cpsat_attempt_count"] += 1
+        tail_repair_diag["local_cpsat_total_seconds"] += _cpsat_elapsed
+        if result.status in (InsertStatus.OPTIMAL, InsertStatus.FEASIBLE):
+            tail_repair_diag["local_cpsat_success_count"] += 1
+        elif result.status == InsertStatus.INFEASIBLE:
+            tail_repair_diag["local_cpsat_infeasible_count"] += 1
+        else:
+            tail_repair_diag["local_cpsat_no_improve_count"] += 1
         if isinstance(result.diagnostics, dict):
             tail_repair_diag["local_inserter_direct_arcs_allowed"] += int(result.diagnostics.get("direct_arcs_allowed", 0) or 0)
             tail_repair_diag["local_inserter_real_bridge_arcs_allowed"] += int(result.diagnostics.get("real_bridge_arcs_allowed", 0) or 0)
             tail_repair_diag["local_inserter_real_bridge_arcs_blocked"] += int(result.diagnostics.get("real_bridge_arcs_blocked", 0) or 0)
             tail_repair_diag["local_inserter_virtual_bridge_arcs_blocked"] += int(result.diagnostics.get("virtual_bridge_arcs_blocked", 0) or 0)
             tail_repair_diag["local_inserter_edge_policy_used"] = str(result.diagnostics.get("edge_policy_used", "") or tail_repair_diag.get("local_inserter_edge_policy_used", ""))
+
+            # Track ALNS family stats from local inserter result
+            if _allow_guarded_family_this_round:
+                _local_family_selected = int(result.diagnostics.get("rebuild_virtual_family_selected_count", 0) or 0)
+                _local_family_budget_blocked = int(result.diagnostics.get("rebuild_virtual_family_budget_blocked_count", 0) or 0)
+                _local_prefer = bool(result.diagnostics.get("rebuild_guarded_virtual_family_preferred", 0))
+                _local_reason = str(result.diagnostics.get("rebuild_guarded_virtual_family_reason", ""))
+                # Attempt = this line's request allowed guarded family
+                _round_alns_family_attempt += 1
+                _round_total_local_family_selected += _local_family_selected
+                if _local_family_selected > 0:
+                    _round_alns_family_accept += 1
+                else:
+                    _round_alns_family_reject += 1
+                if _local_family_budget_blocked > 0:
+                    _round_alns_family_budget_block += 1
+                # ---- Family repair value metrics (guarded profile) ----
+                # These are tracked in round_diag, then aggregated to LnsEngineDiag
+                _gain_dropped = len(accepted_pool) if result.status in (InsertStatus.OPTIMAL, InsertStatus.FEASIBLE) else 0
+                _gain_underfilled = 1 if (_local_family_selected > 0 and _underfill_detected) else 0
+                _gain_scheduled = len(accepted_ids) if _local_family_selected > 0 else 0
+                tail_repair_diag["family_repair_attempt_count"] += 1
+                tail_repair_diag["family_repair_accept_count"] += (_local_family_selected > 0)
+                tail_repair_diag["family_repair_gain_dropped"] += _gain_dropped
+                tail_repair_diag["family_repair_gain_underfilled"] += _gain_underfilled
+                tail_repair_diag["family_repair_gain_scheduled_orders"] += _gain_scheduled
+                tail_repair_diag["family_repair_no_gain_count"] += (1 if (_local_family_selected == 0 and _gain_dropped == 0) else 0)
+                tail_repair_diag["family_repair_prefer_count"] = tail_repair_diag.get("family_repair_prefer_count", 0) + int(_local_prefer)
+                tail_repair_diag["family_repair_avg_seconds_per_success"] = (
+                    (tail_repair_diag.get("family_repair_avg_seconds_per_success", 0.0) * max(0, tail_repair_diag.get("family_repair_accept_count", 0) - 1) + _cpsat_elapsed)
+                    / max(1, tail_repair_diag.get("family_repair_accept_count", 0))
+                )
 
         if result.status in (InsertStatus.OPTIMAL, InsertStatus.FEASIBLE):
             repair_count += 1
@@ -2340,7 +2635,34 @@ def _run_alns_iteration(
         "filtered_by_capability_count": total_pool_cap_filtered,
         "filtered_by_connectivity_count": total_pool_conn_filtered,
         "skipped_already_tried_count": total_pool_already_tried,
+        # ALNS round-level family stats
+        "alns_virtual_family_attempt_count": _round_alns_family_attempt,
+        "alns_virtual_family_accept_count": _round_alns_family_accept,
+        "alns_virtual_family_reject_count": _round_alns_family_reject,
+        "alns_virtual_family_budget_block_count": _round_alns_family_budget_block,
+        "alns_virtual_family_no_gain_count": 0,
+        "alns_virtual_family_neighborhood_histogram": {
+            neighborhood.name: _round_alns_family_attempt,
+        } if _allow_guarded_family_this_round else {},
+        "local_cpsat_virtual_family_selected_count": _round_total_local_family_selected,
+        "virtual_family_enabled_for_this_round": int(_allow_guarded_family_this_round),
+        "virtual_family_enable_reason": str(_family_enable_reason),
+        # ---- Family repair value metrics (guarded profile) ----
+        "family_repair_attempt_count": int(tail_repair_diag.get("family_repair_attempt_count", 0)),
+        "family_repair_accept_count": int(tail_repair_diag.get("family_repair_accept_count", 0)),
+        "family_repair_gain_dropped": int(tail_repair_diag.get("family_repair_gain_dropped", 0)),
+        "family_repair_gain_underfilled": int(tail_repair_diag.get("family_repair_gain_underfilled", 0)),
+        "family_repair_gain_scheduled_orders": int(tail_repair_diag.get("family_repair_gain_scheduled_orders", 0)),
+        "family_repair_no_gain_count": int(tail_repair_diag.get("family_repair_no_gain_count", 0)),
+        "family_repair_avg_gain_per_attempt": float(
+            tail_repair_diag.get("family_repair_gain_dropped", 0) + tail_repair_diag.get("family_repair_gain_underfilled", 0)
+        ) / max(1, tail_repair_diag.get("family_repair_attempt_count", 1)),
+        "family_repair_avg_seconds_per_success": float(tail_repair_diag.get("family_repair_avg_seconds_per_success", 0.0)),
     }
+
+    # Propagate round-level family stats to tail_repair_diag for consistency
+    tail_repair_diag["virtual_family_enabled_for_this_round"] = _allow_guarded_family_this_round
+    tail_repair_diag["virtual_family_enable_reason"] = _family_enable_reason
 
     return (
         new_segs,
@@ -2763,19 +3085,15 @@ def run_constructive_lns_master(
     # HIGH_VIRTUAL_USAGE has no business meaning and is excluded.
     is_direct_only = not allow_virtual_bridge and not allow_real_bridge
     base_neighborhoods: List[NeighborhoodType]
-    if is_direct_only:
-        base_neighborhoods = [
-            NeighborhoodType.LOW_FILL_SEGMENT,
-            NeighborhoodType.HIGH_DROP_PRESSURE,
-            NeighborhoodType.TAIL_REBALANCE,
-            NeighborhoodType.SMALL_ROLL_RESCUE,
-        ]
-        print(
-            f"[APS][constructive_lns] neighborhood_policy=direct_only_no_virtual_neighborhoods, "
-            f"pool={[n.value for n in base_neighborhoods]}"
-        )
-    else:
-        base_neighborhoods = list(NeighborhoodType)
+    # Current production neighborhoods only (HIGH_VIRTUAL_USAGE and SMALL_ROLL_RESCUE removed)
+    base_neighborhoods = [
+        NeighborhoodType.LOW_FILL_SEGMENT,
+        NeighborhoodType.HIGH_DROP_PRESSURE,
+        NeighborhoodType.TAIL_REBALANCE,
+    ]
+    print(
+        f"[APS][constructive_lns] neighborhood_pool={[n.value for n in base_neighborhoods]}"
+    )
 
     rounds_records: List[LnsRound] = []
     no_improve_streak = 0
@@ -2804,7 +3122,6 @@ def run_constructive_lns_master(
         "skipped_already_tried_count": 0,
     }
     # Neighborhood selection counters
-    small_roll_rescue_selected_count: int = 0
     accum_tail_repair_diag: dict = {
         "tail_rebalance_lns_success_count": 0,
         "tail_rebalance_lns_shifted_orders": 0,
@@ -2819,6 +3136,13 @@ def run_constructive_lns_master(
         "local_inserter_virtual_bridge_arcs_blocked": 0,
         "local_inserter_edge_policy_used": "",
         "low_fill_candidates_total": 0,
+        # ---- Local CP-SAT gate diagnostics (must be here for accumulation) ----
+        "local_cpsat_skipped_due_to_gate": 0,
+        "local_cpsat_attempt_count": 0,
+        "local_cpsat_success_count": 0,
+        "local_cpsat_no_improve_count": 0,
+        "local_cpsat_infeasible_count": 0,
+        "local_cpsat_total_seconds": 0.0,
     }
 
     # ---- Phase timers for LNS ----
@@ -2858,9 +3182,6 @@ def run_constructive_lns_master(
             neighborhoods = list(base_neighborhoods)
 
         neighborhood = neighborhoods[r % len(neighborhoods)]
-
-        if neighborhood == NeighborhoodType.SMALL_ROLL_RESCUE:
-            small_roll_rescue_selected_count += 1
 
         # Run destruction + repair
         (
@@ -2904,12 +3225,7 @@ def run_constructive_lns_master(
         elapsed = rt1 - rt0
 
         if not did_work:
-            # Compute small_roll diagnostics for this round (before the update)
-            small_roll_camp_cnt = sum(1 for s in current_segs if s.is_valid and s.line == "small_roll")
-            small_roll_dropped_cnt = sum(
-                len(oids) for reason, oids in current_dropped.items()
-                if "small" in reason.lower() or "TAIL_UNDERFILLED" in reason
-            )
+            # NOTE: SMALL_ROLL_RESCUE removed (experimental, not in production)
             rounds_records.append(LnsRound(
                 round=r + 1,
                 neighborhood_type=neighborhood,
@@ -2944,8 +3260,26 @@ def run_constructive_lns_master(
                 tail_rebalance_neighborhood_selected_count=0,
                 low_fill_neighborhood_success_count=0,
                 tail_rebalance_neighborhood_success_count=0,
-                small_roll_campaign_count=small_roll_camp_cnt,
-                small_roll_rescue_dropped_count=small_roll_dropped_cnt,
+                virtual_family_frontload_enabled=getattr(cfg.model, "virtual_family_frontload_enabled", False),
+                alns_virtual_family_attempt_count=round_pool_stats.get("alns_virtual_family_attempt_count", 0),
+                alns_virtual_family_accept_count=round_pool_stats.get("alns_virtual_family_accept_count", 0),
+                alns_virtual_family_reject_count=round_pool_stats.get("alns_virtual_family_reject_count", 0),
+                alns_virtual_family_budget_block_count=round_pool_stats.get("alns_virtual_family_budget_block_count", 0),
+                alns_virtual_family_no_gain_count=round_pool_stats.get("alns_virtual_family_no_gain_count", 0),
+                alns_virtual_family_neighborhood_histogram=round_pool_stats.get("alns_virtual_family_neighborhood_histogram", {}),
+                virtual_family_enabled_for_this_round=bool(round_pool_stats.get("virtual_family_enabled_for_this_round", 0)),
+                virtual_family_enable_reason=str(round_pool_stats.get("virtual_family_enable_reason", "")),
+                virtual_family_disable_reason="no_neighborhood_available" if not round_pool_stats.get("virtual_family_enabled_for_this_round", 0) else "",
+                local_cpsat_virtual_family_selected_count=int(round_pool_stats.get("local_cpsat_virtual_family_selected_count", 0)),
+                # ---- Family repair value metrics (guarded profile) ----
+                family_repair_attempt_count=int(round_pool_stats.get("family_repair_attempt_count", 0)),
+                family_repair_accept_count=int(round_pool_stats.get("family_repair_accept_count", 0)),
+                family_repair_gain_dropped=int(round_pool_stats.get("family_repair_gain_dropped", 0)),
+                family_repair_gain_underfilled=int(round_pool_stats.get("family_repair_gain_underfilled", 0)),
+                family_repair_gain_scheduled_orders=int(round_pool_stats.get("family_repair_gain_scheduled_orders", 0)),
+                family_repair_no_gain_count=int(round_pool_stats.get("family_repair_no_gain_count", 0)),
+                family_repair_avg_gain_per_attempt=float(round_pool_stats.get("family_repair_avg_gain_per_attempt", 0.0)),
+                family_repair_avg_seconds_per_success=float(round_pool_stats.get("family_repair_avg_seconds_per_success", 0.0)),
             ))
             no_improve_streak += 1
             continue
@@ -2998,12 +3332,7 @@ def run_constructive_lns_master(
         tail_target_fill = 0.0
         tail_target_tons = 0.0
         tail_target_prev_tons = 0.0
-        # ---- SMALL_ROLL_RESCUE diagnostics ----
-        small_roll_camp_cnt = sum(1 for s in current_segs if s.is_valid and s.line == "small_roll")
-        small_roll_dropped_cnt = sum(
-            len(oids) for reason, oids in current_dropped.items()
-            if "small" in reason.lower() or "TAIL_UNDERFILLED" in reason
-        )
+        # NOTE: SMALL_ROLL_RESCUE removed (experimental, not in production)
         if neighborhood == NeighborhoodType.TAIL_REBALANCE and current_segs:
             # Pick the same segment that _select_neighborhood would have picked
             # (ascending |fill_ratio-1|, underfilled segments score 0.0)
@@ -3084,8 +3413,25 @@ def run_constructive_lns_master(
             tail_rebalance_neighborhood_success_count=(
                 1 if (neighborhood == NeighborhoodType.TAIL_REBALANCE and accepted) else 0
             ),
-            small_roll_campaign_count=small_roll_camp_cnt,
-            small_roll_rescue_dropped_count=small_roll_dropped_cnt,
+            virtual_family_frontload_enabled=getattr(cfg.model, "virtual_family_frontload_enabled", False),
+            alns_virtual_family_attempt_count=round_pool_stats.get("alns_virtual_family_attempt_count", 0),
+            alns_virtual_family_accept_count=round_pool_stats.get("alns_virtual_family_accept_count", 0),
+            alns_virtual_family_reject_count=round_pool_stats.get("alns_virtual_family_reject_count", 0),
+            alns_virtual_family_budget_block_count=round_pool_stats.get("alns_virtual_family_budget_block_count", 0),
+            alns_virtual_family_no_gain_count=round_pool_stats.get("alns_virtual_family_no_gain_count", 0),
+            alns_virtual_family_neighborhood_histogram=round_pool_stats.get("alns_virtual_family_neighborhood_histogram", {}),
+            virtual_family_enabled_for_this_round=bool(round_pool_stats.get("virtual_family_enabled_for_this_round", 0)),
+            virtual_family_enable_reason=str(round_pool_stats.get("virtual_family_enable_reason", "")),
+            local_cpsat_virtual_family_selected_count=int(round_pool_stats.get("local_cpsat_virtual_family_selected_count", 0)),
+            # ---- Family repair value metrics (guarded profile) ----
+            family_repair_attempt_count=int(round_pool_stats.get("family_repair_attempt_count", 0)),
+            family_repair_accept_count=int(round_pool_stats.get("family_repair_accept_count", 0)),
+            family_repair_gain_dropped=int(round_pool_stats.get("family_repair_gain_dropped", 0)),
+            family_repair_gain_underfilled=int(round_pool_stats.get("family_repair_gain_underfilled", 0)),
+            family_repair_gain_scheduled_orders=int(round_pool_stats.get("family_repair_gain_scheduled_orders", 0)),
+            family_repair_no_gain_count=int(round_pool_stats.get("family_repair_no_gain_count", 0)),
+            family_repair_avg_gain_per_attempt=float(round_pool_stats.get("family_repair_avg_gain_per_attempt", 0.0)),
+            family_repair_avg_seconds_per_success=float(round_pool_stats.get("family_repair_avg_seconds_per_success", 0.0)),
         ))
 
         if no_improve_streak >= max_no_improve:
@@ -3126,8 +3472,25 @@ def run_constructive_lns_master(
                 tail_rebalance_neighborhood_selected_count=0,
                 low_fill_neighborhood_success_count=0,
                 tail_rebalance_neighborhood_success_count=0,
-                small_roll_campaign_count=small_roll_camp_cnt,
-                small_roll_rescue_dropped_count=small_roll_dropped_cnt,
+                virtual_family_frontload_enabled=getattr(cfg.model, "virtual_family_frontload_enabled", False),
+                alns_virtual_family_attempt_count=round_pool_stats.get("alns_virtual_family_attempt_count", 0),
+                alns_virtual_family_accept_count=round_pool_stats.get("alns_virtual_family_accept_count", 0),
+                alns_virtual_family_reject_count=round_pool_stats.get("alns_virtual_family_reject_count", 0),
+                alns_virtual_family_budget_block_count=round_pool_stats.get("alns_virtual_family_budget_block_count", 0),
+                alns_virtual_family_no_gain_count=round_pool_stats.get("alns_virtual_family_no_gain_count", 0),
+                alns_virtual_family_neighborhood_histogram=round_pool_stats.get("alns_virtual_family_neighborhood_histogram", {}),
+                virtual_family_enabled_for_this_round=bool(round_pool_stats.get("virtual_family_enabled_for_this_round", 0)),
+                virtual_family_enable_reason=str(round_pool_stats.get("virtual_family_enable_reason", "")),
+                local_cpsat_virtual_family_selected_count=int(round_pool_stats.get("local_cpsat_virtual_family_selected_count", 0)),
+                # ---- Family repair value metrics (guarded profile) ----
+                family_repair_attempt_count=int(round_pool_stats.get("family_repair_attempt_count", 0)),
+                family_repair_accept_count=int(round_pool_stats.get("family_repair_accept_count", 0)),
+                family_repair_gain_dropped=int(round_pool_stats.get("family_repair_gain_dropped", 0)),
+                family_repair_gain_underfilled=int(round_pool_stats.get("family_repair_gain_underfilled", 0)),
+                family_repair_gain_scheduled_orders=int(round_pool_stats.get("family_repair_gain_scheduled_orders", 0)),
+                family_repair_no_gain_count=int(round_pool_stats.get("family_repair_no_gain_count", 0)),
+                family_repair_avg_gain_per_attempt=float(round_pool_stats.get("family_repair_avg_gain_per_attempt", 0.0)),
+                family_repair_avg_seconds_per_success=float(round_pool_stats.get("family_repair_avg_seconds_per_success", 0.0)),
             ))
             break
 
@@ -3458,9 +3821,14 @@ def run_constructive_lns_master(
             "target_fill_ratio": rec.target_fill_ratio,
             "target_tail_tons": rec.target_tail_tons,
             "target_prev_segment_tons": rec.target_prev_segment_tons,
-            # SMALL_ROLL_RESCUE neighborhood diagnostics
-            "small_roll_campaign_count": rec.small_roll_campaign_count,
-            "small_roll_rescue_dropped_count": rec.small_roll_rescue_dropped_count,
+            # Guarded virtual family ALNS diagnostics
+            "virtual_family_frontload_enabled": rec.virtual_family_frontload_enabled,
+            "alns_virtual_family_attempt_count": rec.alns_virtual_family_attempt_count,
+            "alns_virtual_family_accept_count": rec.alns_virtual_family_accept_count,
+            "alns_virtual_family_reject_count": rec.alns_virtual_family_reject_count,
+            "alns_virtual_family_budget_block_count": rec.alns_virtual_family_budget_block_count,
+            "alns_virtual_family_no_gain_count": rec.alns_virtual_family_no_gain_count,
+            "local_cpsat_virtual_family_selected_count": rec.local_cpsat_virtual_family_selected_count,
         })
     rounds_df = pd.DataFrame(rounds_rows)
 
@@ -3554,51 +3922,11 @@ def run_constructive_lns_master(
         "bridgeability_route_suggestion",
         "bridgeability_census",
         "bridgeability_census_items",
-        "virtual_pilot_attempt_count",
-        "virtual_pilot_success_count",
-        "virtual_pilot_apply_count",
-        "virtual_pilot_reject_count",
-        "virtual_pilot_eligible_block_count",
-        "virtual_pilot_structural_eligible_block_count",
-        "virtual_pilot_runtime_enabled_block_count",
-        "virtual_pilot_final_eligible_block_count",
-        "virtual_pilot_selected_block_count",
-        "virtual_pilot_skipped_block_count",
-        "virtual_pilot_skipped_due_to_disabled_count",
-        "virtual_pilot_skipped_due_to_limit_count",
-        "virtual_pilot_skipped_due_to_no_pilotable_candidate_count",
-        "virtual_pilot_reject_by_reason_count",
-        "virtual_pilot_small_block_soft_penalty_count",
-        "virtual_pilot_fail_stage_count",
-        "virtual_pilot_scheduler_budget",
-        "virtual_pilot_selected_by_bucket_count",
-        "virtual_pilot_scheduler_selected_blocks",
-        "virtual_pilot_scheduler_skipped_due_to_limit",
-        "virtual_pilot_spec_enum_total",
-        "virtual_pilot_spec_enum_both_valid_count",
-        "virtual_pilot_ton_fill_attempt_count",
-        "virtual_pilot_ton_fill_success_count",
-        "virtual_pilot_dedup_group_count",
-        "virtual_pilot_duplicate_candidate_skipped_count",
-        "virtual_pilot_selected_unique_pilot_key_count",
-        "virtual_pilot_selected_by_family_count",
-        "virtual_pilot_family_prefilter_fail_count",
-        "virtual_pilot_width_group_family_attempt_count",
-        "virtual_pilot_thickness_family_attempt_count",
-        "virtual_pilot_selected_candidate_count",
-        "virtual_pilot_dedup_kept_count",
-        "virtual_pilot_dedup_skipped_count",
-        "virtual_pilot_attempt_started_count",
-        "virtual_pilot_spec_enum_done_count",
-        "virtual_pilot_recut_entered_count",
-        "virtual_pilot_segment_valid_count",
-        "virtual_pilot_ton_fill_entered_count",
-        "virtual_pilot_apply_check_entered_count",
-        "virtual_pilot_apply_success_count",
-        "virtual_pilot_execution_stage_by_family",
-        "virtual_pilot_post_spec_fail_stage_count",
-        "virtual_pilot_family_execution_audit",
-        "virtual_pilot_width_group_guarantee_attempted",
+        # ---- Legacy virtual pilot: 降级为单一总字段 ----
+        # legacy virtual pilot 相关详细字段已从默认 engine_meta 移除；
+        # 只保留一个总字段用于判断是否运行过 virtual pilot。
+        # 旧有细粒度字段仍在 campaign_cutter.py 内部记录，兼容旧调用方。
+        "virtual_pilot_skipped_due_to_disabled",
         "conservative_apply_attempt_count",
         "conservative_apply_success_count",
         "conservative_apply_reject_count",
@@ -3649,24 +3977,10 @@ def run_constructive_lns_master(
             return []
         if key == "bridgeability_census":
             return {}
-        if key == "virtual_pilot_reject_by_reason_count":
-            return {}
-        if key == "virtual_pilot_fail_stage_count":
-            return {}
-        if key == "virtual_pilot_selected_by_bucket_count":
-            return {}
-        if key == "virtual_pilot_selected_by_family_count":
-            return {}
-        if key == "virtual_pilot_execution_stage_by_family":
-            return {}
-        if key == "virtual_pilot_post_spec_fail_stage_count":
-            return {}
-        if key == "virtual_pilot_family_execution_audit":
-            return {}
-        if key == "virtual_pilot_width_group_guarantee_attempted":
-            return False
-        if key in {"virtual_pilot_scheduler_selected_blocks", "virtual_pilot_scheduler_skipped_due_to_limit"}:
-            return []
+        # ---- Legacy virtual pilot: 降级为单一布尔总字段 ----
+        if key == "virtual_pilot_skipped_due_to_disabled":
+            # 当 repair_only_virtual_bridge_pilot_enabled=False 时，virtual pilot 被禁用
+            return bool(getattr(cfg.model, "repair_only_virtual_bridge_pilot_enabled", False) is False)
         if key in {"repair_bridge_pack_type", "bridgeability_route_suggestion"}:
             return ""
         if key.endswith("_reason"):
@@ -3707,9 +4021,11 @@ def run_constructive_lns_master(
         "constructive_edge_policy": (
             "direct_only"  # Route C: both virtual and real bridge edges are disabled
             if not allow_virtual_bridge and not allow_real_bridge
-            else "direct_plus_real_bridge"
+            else "direct_plus_real_bridge"  # Route RB: real allowed, virtual blocked
             if not allow_virtual_bridge
-            else "all_edges_allowed"
+            else "direct_plus_real_plus_guarded_family"  # Guarded virtual family frontload
+            if getattr(cfg.model, "virtual_family_frontload_enabled", False)
+            else "all_edges_allowed"  # Legacy/experimental
         ),
         "accepted_direct_edge_count": int(build_result.diagnostics.get("accepted_direct_edge_count", 0) or 0),
         "accepted_real_bridge_edge_count": int(build_result.diagnostics.get("accepted_real_bridge_edge_count", 0) or 0),
@@ -3720,8 +4036,6 @@ def run_constructive_lns_master(
         "campaign_id_string_preserved": True,
         # neighborhood pool diagnostics
         "neighborhood_pool_used": [n.value for n in neighborhoods],
-        "high_virtual_usage_disabled_in_direct_only": bool(is_direct_only),
-        "small_roll_rescue_selected_count": small_roll_rescue_selected_count,
         # bridge_edge_leak_detected is already set by the leak detection block above;
         # do NOT reset it here — preserve whatever was recorded.
     })
@@ -3842,8 +4156,6 @@ def run_constructive_lns_master(
         "bridge_edge_leak_detected": False,  # Will be set below after planned_df check
         # neighborhood pool diagnostics
         "neighborhood_pool_used": [n.value for n in neighborhoods],
-        "high_virtual_usage_disabled_in_direct_only": bool(is_direct_only),
-        "small_roll_rescue_selected_count": small_roll_rescue_selected_count,
         # ---- Tail Repair LNS Diagnostics ----
         "tail_rebalance_lns_success_count": accum_tail_repair_diag.get("tail_rebalance_lns_success_count", 0),
         "tail_rebalance_lns_shifted_orders": accum_tail_repair_diag.get("tail_rebalance_lns_shifted_orders", 0),
@@ -3866,6 +4178,13 @@ def run_constructive_lns_master(
         "low_fill_neighborhood_success_count": sum(r.low_fill_neighborhood_success_count for r in rounds_records),
         "tail_rebalance_neighborhood_success_count": sum(r.tail_rebalance_neighborhood_success_count for r in rounds_records),
         "low_fill_candidates_total": accum_tail_repair_diag.get("low_fill_candidates_total", 0),
+        # ---- Local CP-SAT gate stats (propagated from tail repair) ----
+        "local_cpsat_skipped_due_to_gate": accum_tail_repair_diag.get("local_cpsat_skipped_due_to_gate", 0),
+        "local_cpsat_attempt_count": accum_tail_repair_diag.get("local_cpsat_attempt_count", 0),
+        "local_cpsat_success_count": accum_tail_repair_diag.get("local_cpsat_success_count", 0),
+        "local_cpsat_no_improve_count": accum_tail_repair_diag.get("local_cpsat_no_improve_count", 0),
+        "local_cpsat_infeasible_count": accum_tail_repair_diag.get("local_cpsat_infeasible_count", 0),
+        "local_cpsat_total_seconds": accum_tail_repair_diag.get("local_cpsat_total_seconds", 0.0),
         "rounds_summary": {
             "accepted_count": sum(1 for r in rounds_records if r.accepted),
             "total_destroy_count": sum(r.destroy_count for r in rounds_records),

@@ -91,10 +91,36 @@ class ModelConfig:
     lns_max_total_rounds: int = 10                  # Maximum total rounds allowed
     lns_min_rounds_before_early_stop: int = 4      # Minimum rounds before early stop is allowed
     # ---- Bridge edge policy for constructive_lns path ----
-    # Route B: disable virtual bridge edge to prioritize official_exported=True
-    allow_virtual_bridge_edge_in_constructive: bool = False  # False = only DIRECT_EDGE allowed
-    allow_real_bridge_edge_in_constructive: bool = False     # False = direct_only mode (Route C)
-    bridge_expansion_mode: str = "disabled"  # "disabled" = no virtual bridge expansion
+    # Route RB (mainline): allow REAL_BRIDGE_EDGE, disable VIRTUAL_BRIDGE_EDGE
+    #   - allow_real_bridge_edge_in_constructive = True  (mainline default)
+    #   - allow_virtual_bridge_edge_in_constructive = False
+    # Route C (baseline): disable ALL bridge edges in constructive
+    #   - allow_real_bridge_edge_in_constructive = False
+    #   - allow_virtual_bridge_edge_in_constructive = False
+    allow_virtual_bridge_edge_in_constructive: bool = False  # False = no virtual bridge in mainline
+    allow_real_bridge_edge_in_constructive: bool = False     # False = direct_only (Route C), True = real-bridge-frontload (Route RB)
+    bridge_expansion_mode: str = "disabled"  # "disabled" = no virtual bridge expansion (mainline)
+    # ---- Virtual Bridge Family Edge: Guarded Frontload (受控前移实验线) ----
+    # Only applicable when allow_virtual_bridge_edge_in_constructive = True AND
+    # the edge type is VIRTUAL_BRIDGE_FAMILY_EDGE (NOT legacy VIRTUAL_BRIDGE_EDGE).
+    # Legacy virtual exact expansion remains disabled.
+    # Dual-pool: global pool = strict (greedy), repair pool = wider (ALNS + local rebuild).
+    virtual_family_frontload_enabled: bool = False  # Master switch for guarded family frontload
+    virtual_family_frontload_global_topk_per_from: int = 3  # Top-K per (from_order_id, line, bridge_family)
+    virtual_family_frontload_global_max_edges_total: int = 360  # Global cap on family edges for greedy
+    virtual_family_frontload_repair_max_edges_total: int = 900  # Cap for repair pool (ALNS + local rebuild)
+    virtual_family_frontload_allowed_families: list[str] = field(default_factory=lambda: ["WIDTH_GROUP", "THICKNESS", "GROUP_TRANSITION"])
+    virtual_family_frontload_max_bridge_count: int = 2  # Max bridge_count for frontload eligibility
+    virtual_family_frontload_only_when_underfill_or_drop_pressure: bool = True  # Context-aware gating
+    virtual_family_frontload_min_block_tons: float = 80.0
+    virtual_family_frontload_max_block_tons: float = 450.0
+    virtual_family_frontload_alns_only_extra_topk: int = 4  # Extra top-k for ALNS repair neighborhood
+    virtual_family_frontload_local_cpsat_only: bool = False  # If True, global constructive gets 0 family edges
+    virtual_family_frontload_global_penalty: float = 100.0  # Penalty added to family edge score in greedy
+    virtual_family_frontload_local_penalty: float = 70.0    # Penalty in local CP-SAT objective
+    virtual_family_frontload_require_family_budget: bool = True  # Enforce budget limits in greedy
+    virtual_family_budget_per_line: int = 4    # Max family edges per line in global constructive
+    virtual_family_budget_per_segment: int = 2  # Max family edges per segment in global constructive
     # Repair-only bridge policy. Initial constructive and initial cutter remain
     # direct-only; these switches apply only to underfilled reconstruction.
     repair_only_real_bridge_enabled: bool = True

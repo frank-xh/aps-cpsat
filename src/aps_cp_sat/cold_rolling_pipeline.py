@@ -150,13 +150,19 @@ class ColdRollingPipeline:
         """
         requested_profile = str(req.config.model.profile_name or "").strip()
 
-        # ---- Allowed ALNS profiles ----
+        # ---- Allowed ALNS profiles (current production paths only) ----
+        # Profile semantics:
+        #   - constructive_lns_search: Production mainline (Route RB / direct_plus_real_bridge)
+        #   - constructive_lns_real_bridge_frontload: Alias of constructive_lns_search
+        #   - constructive_lns_direct_only_baseline: Regression baseline (Route C / direct_only)
+        #   - constructive_lns_virtual_guarded_frontload: Guarded virtual family experiment line
+        # NOTE: constructive_lns_bridge_family_master / debug_acceptance 已移出默认主路径，
+        # 保留于 compat/experimental_disabled/ 或 debug-only，不进入默认生产守卫。
         _ALLOWED_ALNS_PROFILES = {
-            "constructive_lns_search",
-            "constructive_lns_direct_only_baseline",
-            "constructive_lns_debug_acceptance",
-            "constructive_lns_real_bridge_frontload",
-            "constructive_lns_bridge_family_master",  # Future: family edge + oracle stub
+            "constructive_lns_search",                      # Production mainline (Route RB)
+            "constructive_lns_real_bridge_frontload",       # Alias of mainline (Route RB)
+            "constructive_lns_direct_only_baseline",        # Diagnostic baseline (Route C)
+            "constructive_lns_virtual_guarded_frontload",   # Guarded virtual family experiment
         }
 
         # Case B: auto-correct empty/default
@@ -182,43 +188,63 @@ class ColdRollingPipeline:
             f"Only {sorted(_ALLOWED_ALNS_PROFILES)} are allowed in current engineering mode"
         )
 
+    # =========================================================================
+    # UNIFIED_ENGINE_META_FIELDS: unified口径的元数据字段
+    # 只保留当前真实主线使用的能力字段；旧 virtual pilot / oracle / family master 等已移除
+    # =========================================================================
     _UNIFIED_ENGINE_META_FIELDS = (
+        # ---- Configuration ----
         "profile_name",
         "solver_path",
         "constructive_edge_policy",
         "bridge_expansion_mode",
         "allow_virtual_bridge_edge_in_constructive",
         "allow_real_bridge_edge_in_constructive",
-        "repair_only_real_bridge_enabled",
-        "repair_only_virtual_bridge_enabled",
-        "repair_only_virtual_bridge_pilot_enabled",
+        # ---- Single Candidate Graph 追踪 ----
+        "candidate_graph_source",
+        # ---- Guarded virtual family (受控虚拟族桥接) ----
+        "virtual_family_frontload_enabled",
+        # Greedy/constructive phase family stats
+        "greedy_virtual_family_edge_uses",
+        "greedy_virtual_family_budget_blocked_count",
+        # ---- Scheduling statistics ----
         "scheduled_real_orders",
         "scheduled_virtual_orders",
         "dropped_count",
         "campaign_count",
         "low_slots",
         "tail_underfilled_count",
+        # ---- Edge type statistics ----
         "selected_real_bridge_edge_count",
         "selected_virtual_bridge_edge_count",
         "selected_virtual_bridge_family_edge_count",
+        "selected_legacy_virtual_bridge_edge_count",
         "max_bridge_count_used",
+        # ---- ALNS performance ----
         "lns_accepted_rounds",
         "lns_drop_delta",
         "reconstruction_no_gain",
-        "virtual_pilot_attempt_count",
-        "virtual_pilot_success_count",
-        "virtual_pilot_apply_count",
+        # ---- ALNS guarded virtual family stats ----
+        "alns_virtual_family_attempt_count",
+        "alns_virtual_family_accept_count",
+        "local_cpsat_virtual_family_selected_count",
+        # ---- Cutter optimization stats ----
+        "cutter_blocks_touched",
+        "cutter_blocks_improved",
+        "cutter_blocks_skipped_by_precheck",
+        "cutter_blocks_skipped_by_no_gain_set",
+        "cutter_no_gain_streak_max",
+        # ---- Local CP-SAT gate stats ----
+        "local_cpsat_attempt_count",
+        "local_cpsat_success_count",
+        "local_cpsat_skipped_due_to_gate",
+        "local_cpsat_total_seconds",
+        # ---- Legacy virtual pilot 降级统计 ----
+        "virtual_pilot_skipped_due_to_disabled",
+        # ---- Acceptance status ----
         "acceptance",
         "acceptance_gate_reason",
         "validation_gate_reason",
-        # Family edge diagnostics
-        "virtual_family_edge_count",
-        "virtual_family_filtered_by_chain_limit_count",
-        "virtual_family_filtered_by_temp_count",
-        "virtual_family_filtered_by_group_count",
-        "virtual_family_topk_pruned_count",
-        "accepted_virtual_bridge_family_edge_count",
-        "real_bridge_arcs_allowed",
     )
 
     @staticmethod
@@ -311,30 +337,20 @@ class ColdRollingPipeline:
             or lns_engine_meta.get("constructive_edge_policy")
             or cls._constructive_edge_policy_from_flags(allow_virtual, allow_real)
         )
+        # Only propagate candidate graph diagnostics that are actually used in production
         for key in (
             "candidate_graph_edge_count",
             "candidate_graph_direct_edge_count",
             "candidate_graph_real_bridge_edge_count",
-            "candidate_graph_virtual_bridge_family_edge_count",
             "candidate_graph_filtered_by_width_count",
             "candidate_graph_filtered_by_thickness_count",
             "candidate_graph_filtered_by_temp_count",
             "candidate_graph_filtered_by_group_count",
-            "candidate_graph_filtered_by_max_virtual_chain_count",
-            "candidate_graph_reason_histogram",
-            # Virtual family edge pruning diagnostics
-            "virtual_family_edge_count",
-            "virtual_family_filtered_by_chain_limit_count",
-            "virtual_family_filtered_by_temp_count",
-            "virtual_family_filtered_by_group_count",
-            "virtual_family_topk_pruned_count",
-            "virtual_family_bridge_family_counts",
-            "virtual_family_max_chain_limit",
-            # Constructive builder accepted counts
-            "accepted_virtual_bridge_family_edge_count",
         ):
             if key in candidate_graph_diag:
                 em[key] = candidate_graph_diag.get(key)
+        # ---- Guarded virtual family (受控虚拟族桥接) diagnostics ----
+        build_diags = lns_diag.get("constructive_build_diags", {}) if isinstance(lns_diag, dict) else {}
 
         if schedule_df is None:
             schedule_df = pd.DataFrame()
@@ -363,6 +379,16 @@ class ColdRollingPipeline:
         lns_initial_drop = int(lns_diag.get("initial_dropped_count", em.get("lns_initial_dropped_count", 0)) or 0)
         lns_final_drop = int(lns_diag.get("final_dropped_count", em.get("lns_final_dropped_count", dropped_count)) or dropped_count)
 
+        # ---- Compute ALNS family stats from rounds_df (guarded virtual family) ----
+        _round_alns_attempt = 0
+        _round_alns_accept = 0
+        _round_local_family_selected = 0
+        if isinstance(rounds_df, pd.DataFrame) and not rounds_df.empty:
+            for col in ("alns_virtual_family_attempt_count", "alns_virtual_family_accept_count"):
+                if col in rounds_df.columns:
+                    _round_alns_attempt += int(rounds_df[col].sum())
+            _round_local_family_selected = int(rounds_df["local_cpsat_virtual_family_selected_count"].sum()) if "local_cpsat_virtual_family_selected_count" in rounds_df.columns else 0
+
         em.update(
             {
                 "profile_name": profile_name,
@@ -374,17 +400,20 @@ class ColdRollingPipeline:
                 # Backward-compatible aliases used by older writer/decoder code.
                 "virtual_bridge_edge_enabled_in_constructive": allow_virtual,
                 "real_bridge_edge_enabled_in_constructive": allow_real,
-                "repair_only_real_bridge_enabled": bool(
-                    em.get("repair_only_real_bridge_enabled", getattr(model_cfg, "repair_only_real_bridge_enabled", False))
+                # ---- Single Candidate Graph source tracking ----
+                "candidate_graph_source": str(
+                    em.get("candidate_graph_source", build_diags.get("candidate_graph_source", "unknown")) or "unknown"
                 ),
-                "repair_only_virtual_bridge_enabled": bool(
-                    em.get("repair_only_virtual_bridge_enabled", getattr(model_cfg, "repair_only_virtual_bridge_enabled", False))
+                # Guarded virtual family (受控虚拟族桥接) - profile-level switch
+                "virtual_family_frontload_enabled": bool(
+                    getattr(model_cfg, "virtual_family_frontload_enabled", False)
                 ),
-                "repair_only_virtual_bridge_pilot_enabled": bool(
-                    em.get(
-                        "repair_only_virtual_bridge_pilot_enabled",
-                        getattr(model_cfg, "repair_only_virtual_bridge_pilot_enabled", False),
-                    )
+                # Greedy/constructive phase family stats (from constructive_build_diags)
+                "greedy_virtual_family_edge_uses": int(
+                    em.get("greedy_virtual_family_edge_uses", build_diags.get("greedy_virtual_family_edge_uses", 0)) or 0
+                ),
+                "greedy_virtual_family_budget_blocked_count": int(
+                    em.get("greedy_virtual_family_budget_blocked_count", build_diags.get("greedy_virtual_family_budget_blocked_count", 0)) or 0
                 ),
                 "scheduled_real_orders": scheduled_real,
                 "scheduled_virtual_orders": scheduled_virtual,
@@ -407,9 +436,12 @@ class ColdRollingPipeline:
                 "selected_virtual_bridge_edge_count": int(
                     em.get("selected_virtual_bridge_edge_count", cls._count_edge_type(schedule_df, "VIRTUAL_BRIDGE_EDGE")) or 0
                 ),
+                # Guarded virtual family edge counts (受控虚拟族桥接)
                 "selected_virtual_bridge_family_edge_count": int(
                     em.get("selected_virtual_bridge_family_edge_count", cls._count_edge_type(schedule_df, "VIRTUAL_BRIDGE_FAMILY_EDGE")) or 0
                 ),
+                # Legacy virtual bridge edge count (旧式虚拟桥接, 始终为0因legacy被禁用)
+                "selected_legacy_virtual_bridge_edge_count": int(0),
                 "max_bridge_count_used": int(
                     em.get(
                         "max_bridge_count_used",
@@ -428,9 +460,44 @@ class ColdRollingPipeline:
                         and int(em.get("underfilled_reconstruction_underfilled_delta", cut_diags.get("underfilled_reconstruction_underfilled_delta", 0)) or 0) == 0,
                     )
                 ),
-                "virtual_pilot_attempt_count": int(em.get("virtual_pilot_attempt_count", cut_diags.get("virtual_pilot_attempt_count", 0)) or 0),
-                "virtual_pilot_success_count": int(em.get("virtual_pilot_success_count", cut_diags.get("virtual_pilot_success_count", 0)) or 0),
-                "virtual_pilot_apply_count": int(em.get("virtual_pilot_apply_count", cut_diags.get("virtual_pilot_apply_count", 0)) or 0),
+                # ALNS guarded virtual family stats (受控虚拟族桥接)
+                "alns_virtual_family_attempt_count": _round_alns_attempt,
+                "alns_virtual_family_accept_count": _round_alns_accept,
+                "local_cpsat_virtual_family_selected_count": _round_local_family_selected,
+                # ---- Cutter optimization stats ----
+                "cutter_blocks_touched": int(
+                    em.get("cutter_blocks_touched", cut_diags.get("cutter_blocks_touched", 0)) or 0
+                ),
+                "cutter_blocks_improved": int(
+                    em.get("cutter_blocks_improved", cut_diags.get("cutter_blocks_improved", 0)) or 0
+                ),
+                "cutter_blocks_skipped_by_precheck": int(
+                    em.get("cutter_blocks_skipped_by_precheck", cut_diags.get("cutter_blocks_skipped_by_precheck", 0)) or 0
+                ),
+                "cutter_blocks_skipped_by_no_gain_set": int(
+                    em.get("cutter_blocks_skipped_by_no_gain_set", cut_diags.get("cutter_blocks_skipped_by_no_gain_set", 0)) or 0
+                ),
+                "cutter_no_gain_streak_max": int(
+                    em.get("cutter_no_gain_streak_max", cut_diags.get("cutter_no_gain_streak_max", 0)) or 0
+                ),
+                # ---- Local CP-SAT gate stats ----
+                "local_cpsat_attempt_count": int(
+                    em.get("local_cpsat_attempt_count", lns_diag.get("local_cpsat_attempt_count", 0)) or 0
+                ),
+                "local_cpsat_success_count": int(
+                    em.get("local_cpsat_success_count", lns_diag.get("local_cpsat_success_count", 0)) or 0
+                ),
+                "local_cpsat_skipped_due_to_gate": int(
+                    em.get("local_cpsat_skipped_due_to_gate", lns_diag.get("local_cpsat_skipped_due_to_gate", 0)) or 0
+                ),
+                "local_cpsat_total_seconds": float(
+                    em.get("local_cpsat_total_seconds", lns_diag.get("local_cpsat_total_seconds", 0.0)) or 0.0
+                ),
+                # ---- Legacy virtual pilot 降级统计 ----
+                # virtual_pilot 相关字段已从默认主线移除；此处只保留一个总字段
+                "virtual_pilot_skipped_due_to_disabled": bool(
+                    getattr(model_cfg, "repair_only_virtual_bridge_pilot_enabled", False) is False
+                ),
                 "acceptance": str(em.get("acceptance", em.get("result_acceptance_status", "unknown")) or "unknown"),
                 "acceptance_gate_reason": str(em.get("acceptance_gate_reason", "unknown") or "unknown"),
                 "validation_gate_reason": str(em.get("validation_gate_reason", "unknown") or "unknown"),
@@ -453,9 +520,8 @@ class ColdRollingPipeline:
             f"allow_virtual_bridge_edge_in_constructive={allow_virtual}, "
             f"allow_real_bridge_edge_in_constructive={allow_real}, "
             f"bridge_expansion_mode={getattr(model_cfg, 'bridge_expansion_mode', 'disabled')}, "
-            f"repair_only_real_bridge_enabled={bool(getattr(model_cfg, 'repair_only_real_bridge_enabled', False))}, "
-            f"repair_only_virtual_bridge_enabled={bool(getattr(model_cfg, 'repair_only_virtual_bridge_enabled', False))}, "
-            f"repair_only_virtual_bridge_pilot_enabled={bool(getattr(model_cfg, 'repair_only_virtual_bridge_pilot_enabled', False))}"
+            f"virtual_family_frontload_enabled={bool(getattr(model_cfg, 'virtual_family_frontload_enabled', False))}, "
+            f"candidate_graph_source=from_pipeline"
         )
 
     @classmethod
@@ -942,51 +1008,8 @@ class ColdRollingPipeline:
             "bridgeability_route_suggestion": str(em.get("bridgeability_route_suggestion", "")),
             "bridgeability_census": em.get("bridgeability_census", {}),
             "bridgeability_census_items": em.get("bridgeability_census_items", []),
-            "virtual_pilot_attempt_count": int(em.get("virtual_pilot_attempt_count", 0) or 0),
-            "virtual_pilot_success_count": int(em.get("virtual_pilot_success_count", 0) or 0),
-            "virtual_pilot_apply_count": int(em.get("virtual_pilot_apply_count", 0) or 0),
-            "virtual_pilot_reject_count": int(em.get("virtual_pilot_reject_count", 0) or 0),
-            "virtual_pilot_eligible_block_count": int(em.get("virtual_pilot_eligible_block_count", 0) or 0),
-            "virtual_pilot_structural_eligible_block_count": int(em.get("virtual_pilot_structural_eligible_block_count", 0) or 0),
-            "virtual_pilot_runtime_enabled_block_count": int(em.get("virtual_pilot_runtime_enabled_block_count", 0) or 0),
-            "virtual_pilot_final_eligible_block_count": int(em.get("virtual_pilot_final_eligible_block_count", 0) or 0),
-            "virtual_pilot_selected_block_count": int(em.get("virtual_pilot_selected_block_count", 0) or 0),
-            "virtual_pilot_skipped_block_count": int(em.get("virtual_pilot_skipped_block_count", 0) or 0),
-            "virtual_pilot_skipped_due_to_disabled_count": int(em.get("virtual_pilot_skipped_due_to_disabled_count", 0) or 0),
-            "virtual_pilot_skipped_due_to_limit_count": int(em.get("virtual_pilot_skipped_due_to_limit_count", 0) or 0),
-            "virtual_pilot_skipped_due_to_no_pilotable_candidate_count": int(em.get("virtual_pilot_skipped_due_to_no_pilotable_candidate_count", 0) or 0),
-            "virtual_pilot_reject_by_reason_count": em.get("virtual_pilot_reject_by_reason_count", {}),
-            "virtual_pilot_small_block_soft_penalty_count": int(em.get("virtual_pilot_small_block_soft_penalty_count", 0) or 0),
-            "virtual_pilot_fail_stage_count": em.get("virtual_pilot_fail_stage_count", {}),
-            "virtual_pilot_scheduler_budget": int(em.get("virtual_pilot_scheduler_budget", 0) or 0),
-            "virtual_pilot_selected_by_bucket_count": em.get("virtual_pilot_selected_by_bucket_count", {}),
-            "virtual_pilot_scheduler_selected_blocks": em.get("virtual_pilot_scheduler_selected_blocks", []),
-            "virtual_pilot_scheduler_skipped_due_to_limit": em.get("virtual_pilot_scheduler_skipped_due_to_limit", []),
-            "virtual_pilot_spec_enum_total": int(em.get("virtual_pilot_spec_enum_total", 0) or 0),
-            "virtual_pilot_spec_enum_both_valid_count": int(em.get("virtual_pilot_spec_enum_both_valid_count", 0) or 0),
-            "virtual_pilot_ton_fill_attempt_count": int(em.get("virtual_pilot_ton_fill_attempt_count", 0) or 0),
-            "virtual_pilot_ton_fill_success_count": int(em.get("virtual_pilot_ton_fill_success_count", 0) or 0),
-            "virtual_pilot_dedup_group_count": int(em.get("virtual_pilot_dedup_group_count", 0) or 0),
-            "virtual_pilot_duplicate_candidate_skipped_count": int(em.get("virtual_pilot_duplicate_candidate_skipped_count", 0) or 0),
-            "virtual_pilot_selected_unique_pilot_key_count": int(em.get("virtual_pilot_selected_unique_pilot_key_count", 0) or 0),
-            "virtual_pilot_selected_by_family_count": em.get("virtual_pilot_selected_by_family_count", {}),
-            "virtual_pilot_family_prefilter_fail_count": int(em.get("virtual_pilot_family_prefilter_fail_count", 0) or 0),
-            "virtual_pilot_width_group_family_attempt_count": int(em.get("virtual_pilot_width_group_family_attempt_count", 0) or 0),
-            "virtual_pilot_thickness_family_attempt_count": int(em.get("virtual_pilot_thickness_family_attempt_count", 0) or 0),
-            "virtual_pilot_selected_candidate_count": int(em.get("virtual_pilot_selected_candidate_count", 0) or 0),
-            "virtual_pilot_dedup_kept_count": int(em.get("virtual_pilot_dedup_kept_count", 0) or 0),
-            "virtual_pilot_dedup_skipped_count": int(em.get("virtual_pilot_dedup_skipped_count", 0) or 0),
-            "virtual_pilot_attempt_started_count": int(em.get("virtual_pilot_attempt_started_count", 0) or 0),
-            "virtual_pilot_spec_enum_done_count": int(em.get("virtual_pilot_spec_enum_done_count", 0) or 0),
-            "virtual_pilot_recut_entered_count": int(em.get("virtual_pilot_recut_entered_count", 0) or 0),
-            "virtual_pilot_segment_valid_count": int(em.get("virtual_pilot_segment_valid_count", 0) or 0),
-            "virtual_pilot_ton_fill_entered_count": int(em.get("virtual_pilot_ton_fill_entered_count", 0) or 0),
-            "virtual_pilot_apply_check_entered_count": int(em.get("virtual_pilot_apply_check_entered_count", 0) or 0),
-            "virtual_pilot_apply_success_count": int(em.get("virtual_pilot_apply_success_count", 0) or 0),
-            "virtual_pilot_execution_stage_by_family": em.get("virtual_pilot_execution_stage_by_family", {}),
-            "virtual_pilot_post_spec_fail_stage_count": em.get("virtual_pilot_post_spec_fail_stage_count", {}),
-            "virtual_pilot_family_execution_audit": em.get("virtual_pilot_family_execution_audit", {}),
-            "virtual_pilot_width_group_guarantee_attempted": bool(em.get("virtual_pilot_width_group_guarantee_attempted", False)),
+            # ---- Legacy virtual pilot: 已降级为单一总字段 ----
+            # 旧有 ~45 个 virtual_pilot 细项字段已从此处移除；只保留总字段
             "conservative_apply_attempt_count": int(em.get("conservative_apply_attempt_count", 0) or 0),
             "conservative_apply_success_count": int(em.get("conservative_apply_success_count", 0) or 0),
             "conservative_apply_reject_count": int(em.get("conservative_apply_reject_count", 0) or 0),
@@ -1831,51 +1854,8 @@ class ColdRollingPipeline:
                 "bridgeability_route_suggestion",
                 "bridgeability_census",
                 "bridgeability_census_items",
-                "virtual_pilot_attempt_count",
-                "virtual_pilot_success_count",
-                "virtual_pilot_apply_count",
-                "virtual_pilot_reject_count",
-                "virtual_pilot_eligible_block_count",
-                "virtual_pilot_structural_eligible_block_count",
-                "virtual_pilot_runtime_enabled_block_count",
-                "virtual_pilot_final_eligible_block_count",
-                "virtual_pilot_selected_block_count",
-                "virtual_pilot_skipped_block_count",
-                "virtual_pilot_skipped_due_to_disabled_count",
-                "virtual_pilot_skipped_due_to_limit_count",
-                "virtual_pilot_skipped_due_to_no_pilotable_candidate_count",
-                "virtual_pilot_reject_by_reason_count",
-                "virtual_pilot_small_block_soft_penalty_count",
-                "virtual_pilot_fail_stage_count",
-                "virtual_pilot_scheduler_budget",
-                "virtual_pilot_selected_by_bucket_count",
-                "virtual_pilot_scheduler_selected_blocks",
-                "virtual_pilot_scheduler_skipped_due_to_limit",
-                "virtual_pilot_spec_enum_total",
-                "virtual_pilot_spec_enum_both_valid_count",
-                "virtual_pilot_ton_fill_attempt_count",
-                "virtual_pilot_ton_fill_success_count",
-                "virtual_pilot_dedup_group_count",
-                "virtual_pilot_duplicate_candidate_skipped_count",
-                "virtual_pilot_selected_unique_pilot_key_count",
-                "virtual_pilot_selected_by_family_count",
-                "virtual_pilot_family_prefilter_fail_count",
-                "virtual_pilot_width_group_family_attempt_count",
-                "virtual_pilot_thickness_family_attempt_count",
-                "virtual_pilot_selected_candidate_count",
-                "virtual_pilot_dedup_kept_count",
-                "virtual_pilot_dedup_skipped_count",
-                "virtual_pilot_attempt_started_count",
-                "virtual_pilot_spec_enum_done_count",
-                "virtual_pilot_recut_entered_count",
-                "virtual_pilot_segment_valid_count",
-                "virtual_pilot_ton_fill_entered_count",
-                "virtual_pilot_apply_check_entered_count",
-                "virtual_pilot_apply_success_count",
-                "virtual_pilot_execution_stage_by_family",
-                "virtual_pilot_post_spec_fail_stage_count",
-                "virtual_pilot_family_execution_audit",
-                "virtual_pilot_width_group_guarantee_attempted",
+                # ---- Legacy virtual pilot: 已降级为单一总字段 ----
+                # 旧有 ~45 个 virtual_pilot 细项字段已从此处移除
                 "conservative_apply_attempt_count",
                 "conservative_apply_success_count",
                 "conservative_apply_reject_count",
@@ -1896,24 +1876,6 @@ class ColdRollingPipeline:
                         _default_val = []
                     elif _k == "bridgeability_census":
                         _default_val = {}
-                    elif _k == "virtual_pilot_reject_by_reason_count":
-                        _default_val = {}
-                    elif _k == "virtual_pilot_fail_stage_count":
-                        _default_val = {}
-                    elif _k == "virtual_pilot_selected_by_bucket_count":
-                        _default_val = {}
-                    elif _k == "virtual_pilot_selected_by_family_count":
-                        _default_val = {}
-                    elif _k == "virtual_pilot_execution_stage_by_family":
-                        _default_val = {}
-                    elif _k == "virtual_pilot_post_spec_fail_stage_count":
-                        _default_val = {}
-                    elif _k == "virtual_pilot_family_execution_audit":
-                        _default_val = {}
-                    elif _k in {"virtual_pilot_scheduler_selected_blocks", "virtual_pilot_scheduler_skipped_due_to_limit"}:
-                        _default_val = []
-                    elif _k == "virtual_pilot_width_group_guarantee_attempted":
-                        _default_val = False
                     elif _k in {"repair_bridge_pack_type", "bridgeability_route_suggestion"} or _k.endswith("_reason"):
                         _default_val = ""
                     elif _k == "repair_bridge_pack_has_real_rows":

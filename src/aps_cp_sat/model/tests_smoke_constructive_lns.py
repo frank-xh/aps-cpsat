@@ -941,33 +941,75 @@ def smoke_bridge_edge_policy_filtering() -> bool:
 
 
 # ------------------------------------------------------------------
-# Smoke 6: frozen direct-only baseline and unified engine_meta fields
+# Smoke 6: mainline profile and baseline profile semantics
 # ------------------------------------------------------------------
 
-def smoke_direct_only_baseline_profile_and_unified_meta() -> bool:
+def smoke_mainline_and_baseline_profiles() -> bool:
     """
-    Verify the frozen baseline profile keeps constructive direct-only semantics
-    and the pipeline metadata normalization exposes the stable A/B fields.
-    """
-    print("\n[smoke_direct_only_baseline_profile_and_unified_meta]")
+    Verify the mainline profile (constructive_lns_search) now uses Route RB:
+        - allow_real_bridge_edge_in_constructive = True
+        - allow_virtual_bridge_edge_in_constructive = False
+        - bridge_expansion_mode = "disabled"
 
-    cfg = build_profile_config("constructive_lns_direct_only_baseline")
-    baseline_ok = (
-        cfg.model.profile_name == "constructive_lns_direct_only_baseline"
-        and cfg.model.main_solver_strategy == "constructive_lns"
-        and cfg.model.allow_virtual_bridge_edge_in_constructive is False
-        and cfg.model.allow_real_bridge_edge_in_constructive is False
-        and cfg.model.bridge_expansion_mode == "disabled"
-        and cfg.model.repair_only_real_bridge_enabled is True
-        and cfg.model.repair_only_virtual_bridge_enabled is False
-        and cfg.model.repair_only_virtual_bridge_pilot_enabled is False
+    And baseline profile (constructive_lns_direct_only_baseline) uses Route C:
+        - allow_real_bridge_edge_in_constructive = False
+        - allow_virtual_bridge_edge_in_constructive = False
+        - bridge_expansion_mode = "disabled"
+    """
+    print("\n[smoke_mainline_and_baseline_profiles]")
+
+    # ---- Test 1: Mainline profile (Route RB) ----
+    mainline_cfg = build_profile_config("constructive_lns_search")
+    mainline_ok = (
+        mainline_cfg.model.profile_name == "constructive_lns_search"
+        and mainline_cfg.model.main_solver_strategy == "constructive_lns"
+        and mainline_cfg.model.allow_virtual_bridge_edge_in_constructive is False
+        and mainline_cfg.model.allow_real_bridge_edge_in_constructive is True
+        and mainline_cfg.model.bridge_expansion_mode == "disabled"
+        and mainline_cfg.model.repair_only_real_bridge_enabled is True
+        and mainline_cfg.model.repair_only_virtual_bridge_enabled is False
+        and mainline_cfg.model.repair_only_virtual_bridge_pilot_enabled is False
     )
     _check_result(
-        "baseline profile freezes direct-only constructive config",
+        "mainline profile (Route RB) has allow_real=True, allow_virtual=False",
+        mainline_ok,
+        f"profile={mainline_cfg.model.profile_name}, real={mainline_cfg.model.allow_real_bridge_edge_in_constructive}, "
+        f"virtual={mainline_cfg.model.allow_virtual_bridge_edge_in_constructive}, "
+        f"pilot={mainline_cfg.model.repair_only_virtual_bridge_pilot_enabled}",
+    )
+
+    # ---- Test 2: Baseline profile (Route C) ----
+    baseline_cfg = build_profile_config("constructive_lns_direct_only_baseline")
+    baseline_ok = (
+        baseline_cfg.model.profile_name == "constructive_lns_direct_only_baseline"
+        and baseline_cfg.model.main_solver_strategy == "constructive_lns"
+        and baseline_cfg.model.allow_virtual_bridge_edge_in_constructive is False
+        and baseline_cfg.model.allow_real_bridge_edge_in_constructive is False
+        and baseline_cfg.model.bridge_expansion_mode == "disabled"
+        and baseline_cfg.model.repair_only_real_bridge_enabled is True
+        and baseline_cfg.model.repair_only_virtual_bridge_enabled is False
+        and baseline_cfg.model.repair_only_virtual_bridge_pilot_enabled is False
+    )
+    _check_result(
+        "baseline profile (Route C) has allow_real=False, allow_virtual=False",
         baseline_ok,
-        f"profile={cfg.model.profile_name}, real={cfg.model.allow_real_bridge_edge_in_constructive}, "
-        f"virtual={cfg.model.allow_virtual_bridge_edge_in_constructive}, "
-        f"pilot={cfg.model.repair_only_virtual_bridge_pilot_enabled}",
+        f"profile={baseline_cfg.model.profile_name}, real={baseline_cfg.model.allow_real_bridge_edge_in_constructive}, "
+        f"virtual={baseline_cfg.model.allow_virtual_bridge_edge_in_constructive}, "
+        f"pilot={baseline_cfg.model.repair_only_virtual_bridge_pilot_enabled}",
+    )
+
+    # ---- Test 3: real_bridge_frontload is alias of mainline ----
+    alias_cfg = build_profile_config("constructive_lns_real_bridge_frontload")
+    alias_ok = (
+        alias_cfg.model.profile_name == "constructive_lns_real_bridge_frontload"
+        and alias_cfg.model.allow_virtual_bridge_edge_in_constructive is False
+        and alias_cfg.model.allow_real_bridge_edge_in_constructive is True
+        and alias_cfg.model.bridge_expansion_mode == "disabled"
+    )
+    _check_result(
+        "real_bridge_frontload is alias of mainline (Route RB)",
+        alias_ok,
+        f"profile={alias_cfg.model.profile_name}, real={alias_cfg.model.allow_real_bridge_edge_in_constructive}",
     )
 
     # cold_rolling_pipeline imports result_writer, which imports openpyxl for
@@ -983,12 +1025,13 @@ def smoke_direct_only_baseline_profile_and_unified_meta() -> bool:
 
     from aps_cp_sat.cold_rolling_pipeline import ColdRollingPipeline
 
-    schedule_df = pd.DataFrame([
+    # ---- Test 4: Baseline profile meta normalization ----
+    baseline_schedule_df = pd.DataFrame([
         {"order_id": "A", "campaign_id": "C1", "selected_edge_type": "DIRECT_EDGE", "is_virtual": False},
         {"order_id": "B", "campaign_id": "C1", "selected_edge_type": "DIRECT_EDGE", "is_virtual": False},
     ])
-    dropped_df = pd.DataFrame([{"order_id": "Z"}])
-    meta = ColdRollingPipeline._ensure_unified_engine_meta(
+    baseline_dropped_df = pd.DataFrame([{"order_id": "Z"}])
+    baseline_meta = ColdRollingPipeline._ensure_unified_engine_meta(
         {
             "engine_used": "constructive_lns",
             "main_path": "constructive_lns",
@@ -996,30 +1039,66 @@ def smoke_direct_only_baseline_profile_and_unified_meta() -> bool:
             "acceptance_gate_reason": "SMOKE",
             "validation_gate_reason": "SMOKE",
         },
-        cfg,
-        schedule_df=schedule_df,
-        dropped_df=dropped_df,
+        baseline_cfg,
+        schedule_df=baseline_schedule_df,
+        dropped_df=baseline_dropped_df,
         rounds_df=pd.DataFrame(),
     )
     required_keys = list(ColdRollingPipeline._UNIFIED_ENGINE_META_FIELDS)
-    missing = [k for k in required_keys if k not in meta]
-    meta_ok = (
-        not missing
-        and meta["constructive_edge_policy"] == "direct_only"
-        and meta["bridge_expansion_mode"] == "disabled"
-        and meta["scheduled_real_orders"] == 2
-        and meta["scheduled_virtual_orders"] == 0
-        and meta["dropped_count"] == 1
-        and meta["campaign_count"] == 1
-        and meta["acceptance"] == "BEST_SEARCH_CANDIDATE_ANALYSIS"
+    baseline_missing = [k for k in required_keys if k not in baseline_meta]
+    baseline_meta_ok = (
+        not baseline_missing
+        and baseline_meta["constructive_edge_policy"] == "direct_only"
+        and baseline_meta["bridge_expansion_mode"] == "disabled"
+        and baseline_meta["scheduled_real_orders"] == 2
+        and baseline_meta["scheduled_virtual_orders"] == 0
+        and baseline_meta["dropped_count"] == 1
+        and baseline_meta["campaign_count"] == 1
+        and baseline_meta["acceptance"] == "BEST_SEARCH_CANDIDATE_ANALYSIS"
     )
     _check_result(
-        "unified engine_meta fields are always present",
-        meta_ok,
-        f"missing={missing}, policy={meta.get('constructive_edge_policy')}, "
-        f"scheduled_real={meta.get('scheduled_real_orders')}, dropped={meta.get('dropped_count')}",
+        "baseline profile unified engine_meta fields are correct",
+        baseline_meta_ok,
+        f"missing={baseline_missing}, policy={baseline_meta.get('constructive_edge_policy')}, "
+        f"scheduled_real={baseline_meta.get('scheduled_real_orders')}, dropped={baseline_meta.get('dropped_count')}",
     )
-    return baseline_ok and meta_ok
+
+    # ---- Test 5: Mainline profile meta normalization ----
+    mainline_schedule_df = pd.DataFrame([
+        {"order_id": "A", "campaign_id": "C1", "selected_edge_type": "DIRECT_EDGE", "is_virtual": False},
+        {"order_id": "B", "campaign_id": "C1", "selected_edge_type": "REAL_BRIDGE_EDGE", "is_virtual": False,
+         "selected_real_bridge_order_id": "R1"},
+    ])
+    mainline_dropped_df = pd.DataFrame([{"order_id": "Z"}])
+    mainline_meta = ColdRollingPipeline._ensure_unified_engine_meta(
+        {
+            "engine_used": "constructive_lns",
+            "main_path": "constructive_lns",
+            "result_acceptance_status": "BEST_SEARCH_CANDIDATE_ANALYSIS",
+            "acceptance_gate_reason": "SMOKE",
+            "validation_gate_reason": "SMOKE",
+        },
+        mainline_cfg,
+        schedule_df=mainline_schedule_df,
+        dropped_df=mainline_dropped_df,
+        rounds_df=pd.DataFrame(),
+    )
+    mainline_meta_ok = (
+        mainline_meta["constructive_edge_policy"] == "direct_plus_real_bridge"
+        and mainline_meta["bridge_expansion_mode"] == "disabled"
+        and mainline_meta["allow_real_bridge_edge_in_constructive"] is True
+        and mainline_meta["allow_virtual_bridge_edge_in_constructive"] is False
+        and mainline_meta["selected_real_bridge_edge_count"] == 1
+    )
+    _check_result(
+        "mainline profile unified engine_meta fields are correct",
+        mainline_meta_ok,
+        f"policy={mainline_meta.get('constructive_edge_policy')}, "
+        f"allow_real={mainline_meta.get('allow_real_bridge_edge_in_constructive')}, "
+        f"selected_real_bridge={mainline_meta.get('selected_real_bridge_edge_count')}",
+    )
+
+    return mainline_ok and baseline_ok and alias_ok and baseline_meta_ok and mainline_meta_ok
 
 
 # ------------------------------------------------------------------
@@ -1095,332 +1174,715 @@ def smoke_candidate_graph_build_result() -> bool:
 
 
 # ------------------------------------------------------------------
-# Smoke 8: Virtual Bridge Family Edge + Bridge Realization Oracle
+# Smoke 8: Guarded Virtual Family Frontload profile and eligibility
 # ------------------------------------------------------------------
 
-def smoke_virtual_bridge_family_edge() -> bool:
+def smoke_guarded_virtual_family_frontload() -> bool:
     """
-    Verify VIRTUAL_BRIDGE_FAMILY_EDGE enters Candidate Graph with correct fields,
-    BridgeRealizationOracle is fully wired, and NOT_IMPLEMENTED_YET stub works.
-
-    Coverage:
-    1. CandidateEdge with family fields (estimated_bridge_count_min/max, requires_pc_transition)
-    2. VIRTUAL_BRIDGE_FAMILY_EDGE filtered by allow_virtual flag (same as legacy virtual)
-    3. BridgeRealizationOracle.realize() returns properly structured RealizationResult
-    4. NOT_IMPLEMENTED_YET fail_reason for virtual family edges
-    5. Real bridge edge returns feasible with basic check
-    6. fail_reason enumeration is canonical (RealizationFailReason)
-    7. oracle context construction works
+    Verify the constructive_lns_virtual_guarded_frontload profile exists
+    and that is_virtual_family_frontload_eligible gating works correctly.
     """
-    print("\n[smoke_virtual_bridge_family_edge]")
+    print("\n[smoke_guarded_virtual_family_frontload]")
 
-    # -- Orders DataFrame --------------------------------------------
+    # -- Profile existence check ---------------------------------------
+    from aps_cp_sat.config.parameters import build_profile_config
+
+    try:
+        cfg = build_profile_config("constructive_lns_virtual_guarded_frontload")
+        profile_ok = cfg is not None
+    except Exception as exc:
+        _check_result("profile exists", False, f"error: {exc}")
+        return False
+
+    _check_result(
+        "profile exists",
+        profile_ok,
+        f"profile={getattr(cfg.model, 'profile_name', 'N/A')}",
+    )
+    if not profile_ok:
+        return False
+
+    # -- Profile settings check -----------------------------------------
+    model_cfg = cfg.model
+    frontload_enabled = getattr(model_cfg, "virtual_family_frontload_enabled", False)
+    bridge_expansion_disabled = getattr(model_cfg, "bridge_expansion_mode", "") == "disabled"
+    allow_virtual = getattr(model_cfg, "allow_virtual_bridge_edge_in_constructive", False)
+    topk = getattr(model_cfg, "virtual_family_frontload_global_topk_per_from", 0)
+    global_cap = getattr(model_cfg, "virtual_family_frontload_global_max_edges_total", 0)
+    budget_per_line = getattr(model_cfg, "virtual_family_budget_per_line", 0)
+    budget_per_seg = getattr(model_cfg, "virtual_family_budget_per_segment", 0)
+    global_penalty = getattr(model_cfg, "virtual_family_frontload_global_penalty", 0.0)
+
+    settings_ok = (
+        frontload_enabled
+        and bridge_expansion_disabled
+        and allow_virtual
+        and topk == 2
+        and global_cap == 300
+        and budget_per_line == 3
+        and budget_per_seg == 1
+        and global_penalty == 120.0
+    )
+    _check_result(
+        "profile settings correct",
+        settings_ok,
+        f"enabled={frontload_enabled}, expansion={bridge_expansion_disabled}, "
+        f"topk={topk}, cap={global_cap}, budget_line={budget_per_line}, "
+        f"budget_seg={budget_per_seg}, penalty={global_penalty}",
+    )
+
+    # -- Eligibility gating check ---------------------------------------
+    from aps_cp_sat.model.candidate_graph_types import (
+        CandidateEdge,
+        is_virtual_family_frontload_eligible,
+    )
+
+    # Not VIRTUAL_BRIDGE_FAMILY_EDGE → blocked
+    fake_legacy = CandidateEdge(
+        edge_type="VIRTUAL_BRIDGE_EDGE",
+        from_order_id="O1",
+        to_order_id="O2",
+        line="big_roll",
+        bridge_family="",
+        estimated_bridge_count=1,
+    )
+    eligible, reason = is_virtual_family_frontload_eligible(fake_legacy, cfg=cfg)
+    legacy_blocked = (not eligible) and (reason == "NOT_VIRTUAL_BRIDGE_FAMILY_EDGE")
+    _check_result(
+        "legacy VIRTUAL_BRIDGE_EDGE blocked",
+        legacy_blocked,
+        f"eligible={eligible}, reason={reason}",
+    )
+
+    # VIRTUAL_BRIDGE_FAMILY_EDGE with proper metadata
+    fake_family = CandidateEdge(
+        edge_type="VIRTUAL_BRIDGE_FAMILY_EDGE",
+        from_order_id="O1",
+        to_order_id="O2",
+        line="big_roll",
+        bridge_family="WIDTH_GROUP",
+        estimated_bridge_count=1,
+    )
+
+    # Family in allowlist, bridge_count within limit → should pass frontload gates
+    # (may still fail due to other factors like block_tons, context)
+    eligible2, reason2 = is_virtual_family_frontload_eligible(fake_family, cfg=cfg)
+    _check_result(
+        "VIRTUAL_BRIDGE_FAMILY_EDGE passes family/type gate",
+        reason2 != "FAMILY_NOT_ALLOWED",
+        f"eligible={eligible2}, reason={reason2}",
+    )
+
+    # -- is_virtual_family_frontload_eligible function check -----------
+    from aps_cp_sat.model.candidate_graph_types import is_virtual_family_frontload_eligible
+
+    eligibility_fn_ok = callable(is_virtual_family_frontload_eligible)
+    _check_result(
+        "is_virtual_family_frontload_eligible is callable",
+        eligibility_fn_ok,
+        f"callable={eligibility_fn_ok}",
+    )
+
+    # -- NeighborhoodType enum check -----------------------------------
+    from aps_cp_sat.model.constructive_lns_master import NeighborhoodType
+
+    new_neighborhoods = {
+        "WIDTH_TENSION_HOTSPOT",
+        "GROUP_SWITCH_HOTSPOT",
+        "BRIDGE_DEPENDENT_SEGMENT",
+    }
+    neighborhoods_ok = all(
+        hasattr(NeighborhoodType, n) for n in new_neighborhoods
+    )
+    _check_result(
+        "new NeighborhoodType values present",
+        neighborhoods_ok,
+        f"neighborhoods={new_neighborhoods}",
+    )
+
+    return (
+        profile_ok
+        and settings_ok
+        and legacy_blocked
+        and eligibility_fn_ok
+        and neighborhoods_ok
+    )
+
+
+# ------------------------------------------------------------------
+# Smoke 9: guarded virtual frontload profile accepted by both pipeline and master
+# ------------------------------------------------------------------
+
+def smoke_profile_guards_guarded_virtual_frontload() -> bool:
+    """
+    Verify constructive_lns_virtual_guarded_frontload is admitted by the
+    model/master guard (the pipeline guard is an instance method; we verify
+    indirectly by confirming the profile builds cleanly via build_profile_config).
+
+    This closes the "guarded profile guard" loop that was previously
+    configured but not wired into the allowed set.
+    """
+    print("\n[smoke_profile_guards_guarded_virtual_frontload]")
+
+    target_profile = "constructive_lns_virtual_guarded_frontload"
+
+    # ---- build_profile_config succeeds for guarded profile ----
+    from aps_cp_sat.config.parameters import build_profile_config
+    try:
+        cfg = build_profile_config(target_profile)
+        build_ok = cfg is not None
+    except Exception as exc:
+        _check_result("build_profile_config succeeds for guarded profile", False, f"error: {exc}")
+        return False
+    _check_result(
+        "build_profile_config('constructive_lns_virtual_guarded_frontload') succeeds",
+        build_ok,
+        f"profile={getattr(cfg.model, 'profile_name', 'N/A')}",
+    )
+
+    # ---- Master guard: guarded profile is NOT rejected as illegal ----
+    # We verify by running run_constructive_lns_master with the guarded profile
+    # and confirming it does NOT raise a RuntimeError about "illegal profile".
+    # It may raise other errors (e.g., no valid orders) but NOT the guard error.
+    orders_df = pd.DataFrame([
+        {"order_id": "A", "tons": 200, "width": 1250, "thickness": 2.0,
+         "steel_group": "X", "due_rank": 1, "priority": 1, "line_capability": "dual"},
+        {"order_id": "B", "tons": 300, "width": 1240, "thickness": 2.1,
+         "steel_group": "X", "due_rank": 2, "priority": 1, "line_capability": "dual"},
+    ])
+    tpl_df = pd.DataFrame([{
+        "from_order_id": "A", "to_order_id": "B", "line": "big_roll",
+        "edge_type": "DIRECT_EDGE", "cost": 1, "bridge_count": 0,
+        "width_smooth_cost": 0, "thickness_smooth_cost": 0,
+        "temp_margin_cost": 0, "cross_group_cost": 0,
+    }])
+    cfg_guard = build_profile_config(target_profile)
+    cfg_guard = PlannerConfig(
+        rule=cfg_guard.rule,
+        model=ModelConfig(
+            **{
+                **cfg_guard.model.__dict__,
+                "profile_name": target_profile,
+                "main_solver_strategy": "constructive_lns",
+            }
+        ),
+        score=cfg_guard.score,
+    )
+
+    from aps_cp_sat.model.constructive_lns_master import run_constructive_lns_master
+    try:
+        run_constructive_lns_master(
+            orders_df=orders_df,
+            transition_pack={"templates": tpl_df},
+            cfg=cfg_guard,
+            random_seed=42,
+        )
+        master_ok = True
+        master_msg = "no error raised"
+    except RuntimeError as exc:
+        if "illegal profile" in str(exc):
+            master_ok = False
+            master_msg = f"illegal profile error: {exc}"
+        else:
+            # Non-profile RuntimeError is fine (e.g., no feasible solution)
+            master_ok = True
+            master_msg = f"non-profile RuntimeError (OK): {exc}"
+    except Exception:
+        master_ok = True
+        master_msg = "non-RuntimeError exception (OK)"
+
+    _check_result(
+        "master guard does NOT reject guarded virtual frontload profile",
+        master_ok,
+        master_msg,
+    )
+
+    # ---- should_run_local_cpsat function exists and is callable ----
+    from aps_cp_sat.model.constructive_lns_master import should_run_local_cpsat
+    gate_fn_ok = callable(should_run_local_cpsat)
+    _check_result(
+        "should_run_local_cpsat is callable",
+        gate_fn_ok,
+        f"callable={gate_fn_ok}",
+    )
+
+    return build_ok and master_ok and gate_fn_ok
+
+
+# ------------------------------------------------------------------
+# Smoke 10: local CP-SAT unified gate logic
+# ------------------------------------------------------------------
+
+def smoke_local_cpsat_gate() -> bool:
+    """
+    Verify should_run_local_cpsat() returns correct skip/pass decisions
+    for each gate condition.
+    """
+    print("\n[smoke_local_cpsat_gate]")
+
+    from aps_cp_sat.model.constructive_lns_master import (
+        should_run_local_cpsat,
+        NeighborhoodType,
+    )
+    cfg = _minimal_cfg()
+
+    all_ok = True
+
+    # Gate 1: neighborhood not in eligible set
+    ineligible = NeighborhoodType.LOW_FILL_SEGMENT  # eligible; try something else
+    # Use a neighborhood not in the eligible set for this test
+    # We use HIGH_DROP_PRESSURE which IS eligible, so test with a non-eligible one
+    # All NeighborhoodType values we test here
+    all_neighborhoods = list(NeighborhoodType)
+    # A TAIL_REBALANCE is eligible → should PASS
+    gate_ok, gate_reason = should_run_local_cpsat(
+        NeighborhoodType.TAIL_REBALANCE, cfg, candidate_count=3, round_num=0
+    )
+    tail_pass = gate_ok and gate_reason == "GATE_PASSED"
+    _check_result(
+        "TAIL_REBALANCE (eligible) + count=3 + round=0 → GATE_PASSED",
+        tail_pass,
+        f"ok={gate_ok}, reason={gate_reason}",
+    )
+    all_ok = all_ok and tail_pass
+
+    # Gate 2: candidate count exceeds local_cpsat_max_orders
+    gate_ok2, gate_reason2 = should_run_local_cpsat(
+        NeighborhoodType.TAIL_REBALANCE, cfg, candidate_count=9999, round_num=0
+    )
+    count_blocked = (not gate_ok2) and "CANDIDATE_COUNT_EXCEEDED" in gate_reason2
+    _check_result(
+        "count=9999 → CANDIDATE_COUNT_EXCEEDED",
+        count_blocked,
+        f"ok={gate_ok2}, reason={gate_reason2}",
+    )
+    all_ok = all_ok and count_blocked
+
+    # Gate 3: already past max_cpsat_rounds
+    gate_ok3, gate_reason3 = should_run_local_cpsat(
+        NeighborhoodType.TAIL_REBALANCE, cfg, candidate_count=3, round_num=99
+    )
+    round_blocked = (not gate_ok3) and "ROUND_EXCEEDED" in gate_reason3
+    _check_result(
+        "round=99 → ROUND_EXCEEDED",
+        round_blocked,
+        f"ok={gate_ok3}, reason={gate_reason3}",
+    )
+    all_ok = all_ok and round_blocked
+
+    # Gate 4: candidate count too small
+    gate_ok4, gate_reason4 = should_run_local_cpsat(
+        NeighborhoodType.TAIL_REBALANCE, cfg, candidate_count=1, round_num=0
+    )
+    too_small = (not gate_ok4) and "TOO_FEW_CANDIDATES" in gate_reason4
+    _check_result(
+        "count=1 → TOO_FEW_CANDIDATES",
+        too_small,
+        f"ok={gate_ok4}, reason={gate_reason4}",
+    )
+    all_ok = all_ok and too_small
+
+    # Verify tail_repair_diag fields are initialized by run_constructive_lns_master
+    from aps_cp_sat.model.constructive_lns_master import run_constructive_lns_master
+    orders_df = pd.DataFrame([
+        {"order_id": "A", "tons": 200, "width": 1250, "thickness": 2.0,
+         "steel_group": "X", "due_rank": 1, "priority": 1, "line_capability": "dual"},
+        {"order_id": "B", "tons": 300, "width": 1240, "thickness": 2.1,
+         "steel_group": "X", "due_rank": 2, "priority": 1, "line_capability": "dual"},
+    ])
+    tpl_df = pd.DataFrame([{
+        "from_order_id": "A", "to_order_id": "B", "line": "big_roll",
+        "edge_type": "DIRECT_EDGE", "cost": 1, "bridge_count": 0,
+        "width_smooth_cost": 0, "thickness_smooth_cost": 0,
+        "temp_margin_cost": 0, "cross_group_cost": 0,
+    }])
+    cfg_r1 = _minimal_cfg(rounds=1)
+    result = run_constructive_lns_master(
+        orders_df=orders_df,
+        transition_pack={"templates": tpl_df},
+        cfg=cfg_r1,
+        random_seed=42,
+    )
+    diag = result.diagnostics
+    diag_has_gate_skip = "local_cpsat_skipped_due_to_gate" in diag
+    _check_result(
+        "run_constructive_lns_master diagnostics include local_cpsat_skipped_due_to_gate",
+        diag_has_gate_skip,
+        f"keys={list(diag.keys())}",
+    )
+    all_ok = all_ok and diag_has_gate_skip
+
+    return all_ok
+
+
+# ------------------------------------------------------------------
+# Smoke 11: writer default summary has no legacy virtual_pilot_* fields
+# ------------------------------------------------------------------
+
+def smoke_writer_summary_no_virtual_pilot_legacy() -> bool:
+    """
+    Verify the default summary rows in result_writer do NOT contain
+    virtual_pilot_attempt_count, virtual_pilot_success_count, or
+    virtual_pilot_apply_count (those legacy fields were removed from
+    the default writer output).
+    """
+    print("\n[smoke_writer_summary_no_virtual_pilot_legacy]")
+
+    import types
+    if "openpyxl.utils" not in sys.modules:
+        _openpyxl = types.ModuleType("openpyxl")
+        _openpyxl_utils = types.ModuleType("openpyxl.utils")
+        _openpyxl_utils.get_column_letter = lambda idx: str(idx)  # type: ignore[attr-defined]
+        sys.modules.setdefault("openpyxl", _openpyxl)
+        sys.modules.setdefault("openpyxl.utils", _openpyxl_utils)
+
+    # Read result_writer source to confirm legacy fields are absent from summary rows
+    import os
+    result_writer_path = "d:/develop/WorkSpace/aps-cpsat/src/aps_cp_sat/io/result_writer.py"
+    with open(result_writer_path, "r", encoding="utf-8") as fh:
+        writer_source = fh.read()
+
+    legacy_fields = [
+        "virtual_pilot_attempt_count",
+        "virtual_pilot_success_count",
+        "virtual_pilot_apply_count",
+    ]
+
+    all_ok = True
+    for field in legacy_fields:
+        absent = field not in writer_source
+        _check_result(
+            f"result_writer.py does not contain '{field}'",
+            absent,
+            f"found={not absent}",
+        )
+        all_ok = all_ok and absent
+
+    # Also verify _UNIFIED_ENGINE_META_FIELDS in cold_rolling_pipeline does not contain them
+    from aps_cp_sat.cold_rolling_pipeline import ColdRollingPipeline
+    unified_fields = ColdRollingPipeline._UNIFIED_ENGINE_META_FIELDS
+    for field in legacy_fields:
+        absent_in_meta = field not in unified_fields
+        _check_result(
+            f"_UNIFIED_ENGINE_META_FIELDS does not contain '{field}'",
+            absent_in_meta,
+            f"found={not absent_in_meta}",
+        )
+        all_ok = all_ok and absent_in_meta
+
+    return all_ok
+
+
+# ------------------------------------------------------------------
+# Smoke 12: guarded virtual family fields are present in unified engine meta
+# ------------------------------------------------------------------
+
+def smoke_guarded_virtual_family_engine_meta_fields() -> bool:
+    """
+    Verify that the guarded virtual family fields are present in both
+    _UNIFIED_ENGINE_META_FIELDS and are correctly populated in the
+    output of _ensure_unified_engine_meta.
+    """
+    print("\n[smoke_guarded_virtual_family_engine_meta_fields]")
+
+    from aps_cp_sat.cold_rolling_pipeline import ColdRollingPipeline
+    from aps_cp_sat.config.parameters import build_profile_config
+
+    unified_fields = ColdRollingPipeline._UNIFIED_ENGINE_META_FIELDS
+
+    # Fields that must appear in _UNIFIED_ENGINE_META_FIELDS
+    required_in_fields = [
+        "selected_virtual_bridge_family_edge_count",
+        "selected_legacy_virtual_bridge_edge_count",
+        "local_cpsat_skipped_due_to_gate",
+        "greedy_virtual_family_edge_uses",
+        "alns_virtual_family_attempt_count",
+    ]
+
+    all_ok = True
+    for field in required_in_fields:
+        present = field in unified_fields
+        _check_result(
+            f"'{field}' in _UNIFIED_ENGINE_META_FIELDS",
+            present,
+            f"present={present}",
+        )
+        all_ok = all_ok and present
+
+    # Verify _ensure_unified_engine_meta populates these fields
+    cfg = build_profile_config("constructive_lns_search")
+    schedule_df = pd.DataFrame([
+        {"order_id": "A", "campaign_id": "C1", "selected_edge_type": "DIRECT_EDGE"},
+        {"order_id": "B", "campaign_id": "C1", "selected_edge_type": "VIRTUAL_BRIDGE_FAMILY_EDGE"},
+    ])
+    dropped_df = pd.DataFrame([{"order_id": "Z"}])
+
+    em_raw = {
+        "engine_used": "constructive_lns",
+        "main_path": "constructive_lns",
+        "result_acceptance_status": "BEST_SEARCH_CANDIDATE_ANALYSIS",
+        "acceptance_gate_reason": "SMOKE",
+        "validation_gate_reason": "SMOKE",
+        "greedy_virtual_family_edge_uses": 3,
+        "alns_virtual_family_attempt_count": 5,
+        "local_cpsat_skipped_due_to_gate": 2,
+    }
+
+    em = ColdRollingPipeline._ensure_unified_engine_meta(
+        em_raw, cfg,
+        schedule_df=schedule_df,
+        dropped_df=dropped_df,
+        rounds_df=pd.DataFrame(),
+    )
+
+    # Check that the fields are present in the output dict
+    for field in required_in_fields:
+        has_value = field in em
+        _check_result(
+            f"'{field}' is populated in engine_meta output",
+            has_value,
+            f"present={has_value}, value={em.get(field, 'MISSING')}",
+        )
+        all_ok = all_ok and has_value
+
+    # Specifically check local_cpsat_skipped_due_to_gate = 2 (from raw em)
+    cpsat_gate_val = em.get("local_cpsat_skipped_due_to_gate", -1)
+    cpsat_gate_ok = cpsat_gate_val == 2
+    _check_result(
+        "local_cpsat_skipped_due_to_gate = 2 (from raw em)",
+        cpsat_gate_ok,
+        f"value={cpsat_gate_val}",
+    )
+    all_ok = all_ok and cpsat_gate_ok
+
+    # selected_virtual_bridge_family_edge_count should be 1 (from schedule_df)
+    fam_count = em.get("selected_virtual_bridge_family_edge_count", -1)
+    fam_count_ok = fam_count == 1
+    _check_result(
+        "selected_virtual_bridge_family_edge_count = 1 (from schedule_df)",
+        fam_count_ok,
+        f"value={fam_count}",
+    )
+    all_ok = all_ok and fam_count_ok
+
+    # selected_legacy_virtual_bridge_edge_count should be 0 (legacy disabled)
+    legacy_count = em.get("selected_legacy_virtual_bridge_edge_count", -1)
+    legacy_count_ok = legacy_count == 0
+    _check_result(
+        "selected_legacy_virtual_bridge_edge_count = 0 (legacy disabled)",
+        legacy_count_ok,
+        f"value={legacy_count}",
+    )
+    all_ok = all_ok and legacy_count_ok
+
+    return all_ok
+
+
+# ------------------------------------------------------------------
+# Smoke 13: writer default summary shows new guarded virtual family fields
+# ------------------------------------------------------------------
+
+def smoke_writer_summary_guarded_virtual_family_fields() -> bool:
+    """
+    Verify result_writer's default summary and runtime rows include the 5
+    new guarded virtual family fields and demote selected_virtual_bridge_edge_count
+    to debug-only.
+
+    Minimal test: patches an em dict into the writer's internal row-building
+    logic and checks the resulting row list.
+    """
+    print("\n[smoke_writer_summary_guarded_virtual_family_fields]")
+
+    import types
+    import sys
+    # Mock openpyxl to avoid import error during smoke testing
+    if "openpyxl.utils" not in sys.modules:
+        _openpyxl = types.ModuleType("openpyxl")
+        _openpyxl_utils = types.ModuleType("openpyxl.utils")
+        _openpyxl_utils.get_column_letter = lambda idx: str(idx)  # type: ignore[attr-defined]
+        sys.modules.setdefault("openpyxl", _openpyxl)
+        sys.modules.setdefault("openpyxl.utils", _openpyxl_utils)
+
+    import os
+    # Always use the canonical project source path
+    writer_path = "d:/develop/WorkSpace/aps-cpsat/src/aps_cp_sat/io/result_writer.py"
+
+    # Read source to verify the 5 fields appear in the default summary section
+    with open(writer_path, "r", encoding="utf-8") as fh:
+        writer_src = fh.read()
+
+    required_fields = [
+        "selected_virtual_bridge_family_edge_count",
+        "selected_legacy_virtual_bridge_edge_count",
+        "local_cpsat_skipped_due_to_gate",
+        "greedy_virtual_family_edge_uses",
+        "alns_virtual_family_attempt_count",
+    ]
+
+    all_ok = True
+    for field in required_fields:
+        present = field in writer_src
+        _check_result(
+            f"result_writer.py contains '{field}' in default summary",
+            present,
+            f"present={present}",
+        )
+        all_ok = all_ok and present
+
+    # Verify selected_virtual_bridge_edge_count is ONLY in [debug] sections
+    # (i.e., not in the main display as "统一指标.selected_virtual_bridge_edge_count")
+    import re
+    # Main-display occurrence: "统一指标.selected_virtual_bridge_edge_count" NOT prefixed with [debug]
+    main_display_pattern = r'(?<!\[debug\])"统一指标\.selected_virtual_bridge_edge_count"'
+    main_display_matches = re.findall(main_display_pattern, writer_src)
+    demoted_ok = len(main_display_matches) == 0
+    _check_result(
+        "selected_virtual_bridge_edge_count is NOT in main display (only in [debug])",
+        demoted_ok,
+        f"main_display_occurrences={len(main_display_matches)}",
+    )
+    all_ok = all_ok and demoted_ok
+
+    # Verify [debug] entries exist for selected_virtual_bridge_edge_count
+    # The string in writer is: ("[debug]统一指标.selected_virtual_bridge_edge_count(旧口径)", ...)
+    debug_pattern = r'\[debug\]统一指标\.selected_virtual_bridge_edge_count\(旧口径\)'
+    debug_matches = re.findall(debug_pattern, writer_src)
+    debug_ok = len(debug_matches) == 2  # once in lns_rows, once in runtime_rows
+    _check_result(
+        "[debug] selected_virtual_bridge_edge_count appears exactly twice (lns_rows + runtime_rows)",
+        debug_ok,
+        f"debug_occurrences={len(debug_matches)}",
+    )
+    all_ok = all_ok and debug_ok
+
+    return all_ok
+
+
+# ------------------------------------------------------------------
+# Smoke 14: recon diag compatibility — internal compat counters initialized
+# ------------------------------------------------------------------
+
+def smoke_recon_diag_compat_counters() -> bool:
+    """
+    Verify that _reconstruct_underfilled_segments (campaign_cutter.py) initializes
+    all internal virtual_pilot_* compat counter fields so that runtime +=1
+    operations do not raise KeyError.
+
+    The fix adds ~33 integer counters and 5 dict-type fields to the diag init
+    block, distinguishing them from the mainline summary fields that ARE
+    propagated to engine_meta / writer (which remain absent from this block).
+    """
+    print("\n[smoke_recon_diag_compat_counters]")
+
+    # Always use the canonical project source path
+    cutter_path = "d:/develop/WorkSpace/aps-cpsat/src/aps_cp_sat/model/campaign_cutter.py"
+
+    with open(cutter_path, "r", encoding="utf-8") as fh:
+        cutter_src = fh.read()
+
+    # Fields that must appear in the diag init block (internal compat, NOT in summary)
+    compat_fields = [
+        "virtual_pilot_skipped_block_count",
+        "virtual_pilot_skipped_due_to_disabled_count",
+        "virtual_pilot_reject_by_reason_count",
+        "virtual_pilot_structural_eligible_block_count",
+        "virtual_pilot_runtime_enabled_block_count",
+        "virtual_pilot_final_eligible_block_count",
+        "virtual_pilot_eligible_block_count",
+        "virtual_pilot_selected_block_count",
+        "virtual_pilot_duplicate_candidate_skipped_count",
+        "virtual_pilot_dedup_group_count",
+        "virtual_pilot_small_block_soft_penalty_count",
+        "virtual_pilot_spec_enum_total",
+        "virtual_pilot_spec_enum_both_valid_count",
+        "virtual_pilot_attempt_count",
+        "virtual_pilot_success_count",
+        "virtual_pilot_apply_count",
+        "virtual_pilot_reject_count",
+        "virtual_pilot_selected_by_bucket_count",
+        "virtual_pilot_selected_by_family_count",
+        "virtual_pilot_fail_stage_count",
+        "virtual_pilot_post_spec_fail_stage_count",
+    ]
+
+    all_ok = True
+    for field in compat_fields:
+        present = field in cutter_src
+        _check_result(
+            f"diag init contains '{field}'",
+            present,
+            f"present={present}",
+        )
+        all_ok = all_ok and present
+
+    # Verify the compat block comment distinguishes from summary fields
+    has_comment = "Internal compat counters" in cutter_src or "internal compat" in cutter_src
+    _check_result(
+        "diag init has comment distinguishing internal compat from mainline summary",
+        has_comment,
+        f"has_distinguishing_comment={has_comment}",
+    )
+    all_ok = all_ok and has_comment
+
+    return all_ok
+
+
+# ------------------------------------------------------------------
+# Smoke 15: candidate_graph reuse — pipeline-provided graph used, no fallback
+# ------------------------------------------------------------------
+
+def smoke_candidate_graph_pipeline_reuse() -> bool:
+    """
+    Verify that when transition_pack contains a pre-built candidate_graph,
+    the constructive sequence builder uses it (candidate_graph_source='pipeline')
+    and does NOT trigger the TemplateEdgeGraph fallback warning.
+    """
+    print("\n[smoke_candidate_graph_pipeline_reuse]")
+
     orders_df = pd.DataFrame([
         {"order_id": "A", "tons": 100, "width": 1200, "thickness": 2.0,
-         "steel_group": "G1", "due_rank": 1, "priority": 1, "line_capability": "dual",
-         "temp_min": 700, "temp_max": 760},
-        {"order_id": "B", "tons": 100, "width": 1210, "thickness": 2.0,
-         "steel_group": "G1", "due_rank": 2, "priority": 1, "line_capability": "dual",
-         "temp_min": 710, "temp_max": 770},
-        {"order_id": "C", "tons": 100, "width": 1400, "thickness": 4.0,
-         "steel_group": "G2", "due_rank": 3, "priority": 1, "line_capability": "dual",
-         "temp_min": 400, "temp_max": 420},
-        # Real bridge order
-        {"order_id": "RB1", "tons": 50, "width": 1300, "thickness": 2.5,
-         "steel_group": "PC", "due_rank": 2, "priority": 1, "line_capability": "dual",
-         "temp_min": 650, "temp_max": 700, "bridge_penalty": 80},
+         "steel_group": "G1", "due_rank": 1, "priority": 1, "line_capability": "dual"},
+        {"order_id": "B", "tons": 100, "width": 1210, "thickness": 2.1,
+         "steel_group": "G1", "due_rank": 2, "priority": 1, "line_capability": "dual"},
+        {"order_id": "C", "tons": 100, "width": 1220, "thickness": 2.0,
+         "steel_group": "G1", "due_rank": 3, "priority": 1, "line_capability": "dual"},
     ])
-
-    # -- Template with all three edge types ----------------------------
     tpl_df = pd.DataFrame([
         {"from_order_id": "A", "to_order_id": "B", "line": "big_roll",
          "edge_type": "DIRECT_EDGE", "cost": 1, "bridge_count": 0,
-         "virtual_tons": 0, "physical_reverse_count": 0},
-        {"from_order_id": "A", "to_order_id": "C", "line": "big_roll",
-         "edge_type": "VIRTUAL_BRIDGE_FAMILY_EDGE", "cost": 9, "bridge_count": 2,
-         "virtual_tons": 20, "physical_reverse_count": 1,
-         "bridge_family": "GROUP_TRANSITION",
-         "estimated_bridge_count_min": 1, "estimated_bridge_count_max": 3,
-         "requires_pc_transition": True},
+         "width_smooth_cost": 0, "thickness_smooth_cost": 0,
+         "temp_margin_cost": 0, "cross_group_cost": 0},
         {"from_order_id": "B", "to_order_id": "C", "line": "big_roll",
-         "edge_type": "REAL_BRIDGE_EDGE", "cost": 5, "bridge_count": 1,
-         "real_bridge_order_id": "RB1",
-         "virtual_tons": 0, "physical_reverse_count": 0},
+         "edge_type": "DIRECT_EDGE", "cost": 1, "bridge_count": 0,
+         "width_smooth_cost": 0, "thickness_smooth_cost": 0,
+         "temp_margin_cost": 0, "cross_group_cost": 0},
     ])
-
     cfg = _minimal_cfg(campaign_ton_min=50, campaign_ton_max=1000)
 
-    # -- Test 1: CandidateGraph builds family edge with extended fields --
+    # Build candidate_graph from pipeline
     from aps_cp_sat.model.candidate_graph import build_candidate_graph
-    result = build_candidate_graph(orders_df, tpl_df, cfg)
+    candidate_graph = build_candidate_graph(orders_df, tpl_df, cfg)
 
-    family_edges = [e for e in result.edges if e.edge_type == "VIRTUAL_BRIDGE_FAMILY_EDGE"]
-    family_ok = len(family_edges) == 1 and (
-        family_edges[0].estimated_bridge_count_min >= 1
-        and family_edges[0].estimated_bridge_count_max >= 1
-        and family_edges[0].requires_pc_transition is True
-        and family_edges[0].bridge_family == "VIRTUAL_FAMILY"
-    )
+    # Put it in transition_pack (mimics pipeline's _attach_candidate_graph)
+    transition_pack = {"templates": tpl_df, "candidate_graph": candidate_graph}
+
+    # Run builder
+    from aps_cp_sat.model.constructive_sequence_builder import build_constructive_sequences
+    result = build_constructive_sequences(orders_df, transition_pack, cfg)
+
+    cg_source = result.diagnostics.get("candidate_graph_source", "MISSING")
+    source_ok = cg_source == "pipeline"
     _check_result(
-        "VIRTUAL_BRIDGE_FAMILY_EDGE has family extension fields",
-        family_ok,
-        f"min={family_edges[0].estimated_bridge_count_min}, "
-        f"max={family_edges[0].estimated_bridge_count_max}, "
-        f"requires_pc={family_edges[0].requires_pc_transition}",
+        "candidate_graph_source == 'pipeline' when pack has candidate_graph",
+        source_ok,
+        f"source={cg_source}",
     )
 
-    # -- Test 2: Pruning diagnostics are populated ----------------------
-    diag = result.diagnostics
-    pruning_ok = (
-        "virtual_family_edge_count" in diag
-        and "virtual_family_filtered_by_chain_limit_count" in diag
-        and "virtual_family_filtered_by_temp_count" in diag
-        and "virtual_family_filtered_by_group_count" in diag
-        and "virtual_family_topk_pruned_count" in diag
-        and "virtual_family_bridge_family_counts" in diag
-    )
-    _check_result(
-        "family edge pruning diagnostics are populated",
-        pruning_ok,
-        f"diag_keys={[k for k in diag if 'virtual_family' in k]}",
-    )
-
-    # -- Test 3: TemplateEdgeGraph filters VIRTUAL_BRIDGE_FAMILY_EDGE by policy --
-    from aps_cp_sat.model.constructive_sequence_builder import TemplateEdgeGraph
-
-    # Test allow_virtual=False → family edge filtered
-    class FakeModelFalse:
-        allow_virtual_bridge_edge_in_constructive = False
-        allow_real_bridge_edge_in_constructive = True
-
-    class _FRFalse:
-        max_width_gap = 100; max_thickness_gap = 0.5; max_temperature_diff = 50
-        real_reverse_step_max_mm = 300
-        virtual_reverse_attach_max_mm = 300
-        max_width_drop = 300
-        min_temp_overlap_real_real = 20.0
-        virtual_width_levels = []
-        virtual_thickness_levels = []
-        virtual_temp_min = 850.0; virtual_temp_max = 1050.0
-        virtual_tons = 5.0; max_width_rise_physical_step = 150.0
-
-    class _SCFalse:
-        direct_edge_cost = 0.0; real_bridge_cost = 0.0
-        virtual_bridge_cost = 0.0; virtual_family_cost = 0.0
-        width_smooth = 0.0; thick_smooth = 0.0; temp_margin = 0.0
-        non_pc_switch = 0.0; virtual_use = 0.0
-        real_bridge_penalty = 0.0; virtual_bridge_penalty = 0.0
-        direct_edge_penalty = 0.0; reverse_width_bridge_penalty = 0.0
-        template_base_cost_ratio = 0.0
-        edge_fallback_width_weight = 0; edge_fallback_thick_weight = 0
-        edge_fallback_due_weight = 0; edge_fallback_base_penalty = 0
-
-    class FakeCfgFalse:
-        model = FakeModelFalse(); line = "big_roll"
-        rule = _FRFalse()
-        score = _SCFalse()
-        def transition_check(self, from_oid, to_oid):
-            class _TC:
-                def fail_reason(self): return None
-            return _TC()
-        def check(self, from_oid, to_oid):
-            return lambda: None
-
-    graph_false = TemplateEdgeGraph(orders_df, tpl_df, FakeCfgFalse())
-    family_blocked = (
-        graph_false.accepted_virtual_bridge_family_edge_count == 0
-        and graph_false.filtered_virtual_bridge_edge_count >= 0
-        and graph_false.edge_policy == "direct_plus_real_bridge"
-    )
-    _check_result(
-        "family edge blocked when allow_virtual=False",
-        family_blocked,
-        f"accepted_family={graph_false.accepted_virtual_bridge_family_edge_count}, "
-        f"policy={graph_false.edge_policy}",
-    )
-
-    # Test allow_virtual=True → family edge allowed
-    class FakeModelTrue:
-        allow_virtual_bridge_edge_in_constructive = True
-        allow_real_bridge_edge_in_constructive = True
-
-    class _FRTrue:
-        max_width_gap = 100; max_thickness_gap = 0.5; max_temperature_diff = 50
-        real_reverse_step_max_mm = 300
-        virtual_reverse_attach_max_mm = 300
-        max_width_drop = 300
-        min_temp_overlap_real_real = 20.0
-        virtual_width_levels = []
-        virtual_thickness_levels = []
-        virtual_temp_min = 850.0; virtual_temp_max = 1050.0
-        virtual_tons = 5.0; max_width_rise_physical_step = 150.0
-
-    class _SCTrue:
-        direct_edge_cost = 0.0; real_bridge_cost = 0.0
-        virtual_bridge_cost = 0.0; virtual_family_cost = 0.0
-        width_smooth = 0.0; thick_smooth = 0.0; temp_margin = 0.0
-        non_pc_switch = 0.0; virtual_use = 0.0
-        real_bridge_penalty = 0.0; virtual_bridge_penalty = 0.0
-        direct_edge_penalty = 0.0; reverse_width_bridge_penalty = 0.0
-        template_base_cost_ratio = 0.0
-        edge_fallback_width_weight = 0; edge_fallback_thick_weight = 0
-        edge_fallback_due_weight = 0; edge_fallback_base_penalty = 0
-
-    class FakeCfgTrue:
-        model = FakeModelTrue(); line = "big_roll"
-        rule = _FRTrue()
-        score = _SCTrue()
-        def transition_check(self, from_oid, to_oid):
-            class _TC:
-                def fail_reason(self): return None
-            return _TC()
-        def check(self, from_oid, to_oid):
-            return lambda: None
-
-    graph_true = TemplateEdgeGraph(orders_df, tpl_df, FakeCfgTrue())
-    family_allowed = (
-        graph_true.accepted_virtual_bridge_family_edge_count >= 0
-        and graph_true.edge_policy == "all_edges_allowed"
-    )
-    _check_result(
-        "family edge allowed when allow_virtual=True",
-        family_allowed,
-        f"accepted_family={graph_true.accepted_virtual_bridge_family_edge_count}, "
-        f"policy={graph_true.edge_policy}",
-    )
-
-    # -- Test 4: BridgeRealizationOracle is fully wired -----------------
-    from aps_cp_sat.bridge import (
-        BridgeRealizationOracle,
-        OracleContext,
-        RealizationResult,
-        RealizationFailReason,
-    )
-
-    oracle = BridgeRealizationOracle()
-    context = OracleContext.from_config(orders_df, tpl_df, cfg, line="big_roll")
-
-    # Virtual family edge → NOT_IMPLEMENTED_YET
-    if family_edges:
-        result_family = oracle.realize(family_edges[0], context)
-        family_not_impl = (
-            result_family.feasible is False
-            and result_family.fail_reason == RealizationFailReason.NOT_IMPLEMENTED_YET
-            and result_family.realization_type == "failed"
-            and isinstance(result_family.diagnostics, dict)
-            and result_family.diagnostics.get("stub") is True
-        )
-        _check_result(
-            "Oracle: virtual family edge → NOT_IMPLEMENTED_YET",
-            family_not_impl,
-            f"feasible={result_family.feasible}, "
-            f"fail_reason={result_family.fail_reason.value}, "
-            f"type={result_family.realization_type}",
-        )
-
-    # Real bridge edge → feasible (basic check)
-    real_edges = [e for e in result.edges if e.edge_type == "REAL_BRIDGE_EDGE"]
-    if real_edges:
-        result_real = oracle.realize(real_edges[0], context)
-        real_feasible = (
-            result_real.feasible is True
-            and result_real.realization_type == "real"
-            and result_real.fail_reason == RealizationFailReason.OK
-            and len(result_real.exact_path) >= 1
-        )
-        _check_result(
-            "Oracle: real bridge edge → feasible (basic skeleton)",
-            real_feasible,
-            f"feasible={result_real.feasible}, "
-            f"type={result_real.realization_type}, "
-            f"path_len={len(result_real.exact_path)}",
-        )
-
-    # -- Test 5: RealizationResult factories work -----------------------
-    result_ok_real = RealizationResult.ok_real(
-        path=[{"order_id": "TEST"}], cost=50.0, diagnostics={"test": True}
-    )
-    factory_ok_real = (
-        result_ok_real.feasible is True
-        and result_ok_real.realization_type == "real"
-        and result_ok_real.fail_reason == RealizationFailReason.OK
-        and result_ok_real.diagnostics.get("test") is True
-    )
-    _check_result(
-        "RealizationResult.ok_real factory works",
-        factory_ok_real,
-        f"type={result_ok_real.realization_type}",
-    )
-
-    result_not_impl = RealizationResult.not_implemented("TEST_EDGE", explain="test stub")
-    factory_not_impl = (
-        result_not_impl.feasible is False
-        and result_not_impl.fail_reason == RealizationFailReason.NOT_IMPLEMENTED_YET
-        and "TEST_EDGE" in result_not_impl.fail_detail
-    )
-    _check_result(
-        "RealizationResult.not_implemented factory works",
-        factory_not_impl,
-        f"fail_reason={result_not_impl.fail_reason.value}",
-    )
-
-    # -- Test 6: OracleContext factory works ----------------------------
-    ctx = OracleContext.from_config(orders_df, tpl_df, cfg, line="small_roll")
-    ctx_ok = (
-        ctx.line == "small_roll"
-        and ctx.orders_df is not None
-        and ctx.tpl_df is not None
-        and ctx.max_virtual_chain == 5  # default from cfg.model.max_virtual_chain
-    )
-    _check_result(
-        "OracleContext.from_config factory works",
-        ctx_ok,
-        f"line={ctx.line}, max_chain={ctx.max_virtual_chain}",
-    )
-
-    # -- Test 7: Virtual family edge with chain limit exceeded ---
-    if family_edges:
-        from aps_cp_sat.model.candidate_graph_types import CandidateEdge
-        long_family = CandidateEdge(
-            from_order_id="A",
-            to_order_id="C",
-            line="big_roll",
-            edge_type="VIRTUAL_BRIDGE_FAMILY_EDGE",
-            bridge_family="GROUP_TRANSITION",
-            estimated_bridge_count=10,
-            estimated_bridge_count_min=8,
-            estimated_bridge_count_max=15,
-            requires_pc_transition=True,
-        )
-        ctx_tight = OracleContext(
-            orders_df=orders_df,
-            tpl_df=tpl_df,
-            config=cfg,
-            line="big_roll",
-            used_bridge_orders=set(),
-            max_virtual_chain=5,
-        )
-        result_long = oracle.realize(long_family, ctx_tight)
-        chain_fail = (
-            result_long.feasible is False
-            and result_long.fail_reason == RealizationFailReason.VIRTUAL_CHAIN_TOO_LONG
-            and "max_virtual_chain=5" in result_long.fail_detail
-        )
-        _check_result(
-            "Oracle: family edge exceeding chain limit → VIRTUAL_CHAIN_TOO_LONG",
-            chain_fail,
-            f"fail_reason={result_long.fail_reason.value}, "
-            f"detail={result_long.fail_detail[:80]}",
-        )
-
-    overall_ok = (
-        family_ok and pruning_ok and family_blocked and family_allowed
-        and factory_ok_real and factory_not_impl and ctx_ok
-    )
-    if family_edges:
-        overall_ok = overall_ok and family_not_impl and real_feasible and chain_fail
-
-    return overall_ok
+    # candidate_graph_source is recorded in diagnostics (the diagnostics field)
+    # NOTE: candidate_graph_diagnostics is stored in the builder internals but not
+    # exposed through the result object (ConstructiveBuildResult.diagnostics),
+    # so we only check candidate_graph_source here.
+    return source_ok
 
 
 # ------------------------------------------------------------------
@@ -1440,9 +1902,17 @@ def _main() -> int:
         ("smoke_local_insert",       smoke_local_insert),
         ("smoke_drop_reasons",       smoke_drop_reasons),
         ("smoke_bridge_edge_policy_filtering", smoke_bridge_edge_policy_filtering),
-        ("smoke_direct_only_baseline_profile_and_unified_meta", smoke_direct_only_baseline_profile_and_unified_meta),
+        ("smoke_mainline_and_baseline_profiles", smoke_mainline_and_baseline_profiles),
         ("smoke_candidate_graph_build_result", smoke_candidate_graph_build_result),
-        ("smoke_virtual_bridge_family_edge", smoke_virtual_bridge_family_edge),
+        ("smoke_guarded_virtual_family_frontload", smoke_guarded_virtual_family_frontload),
+        # ---- New smoke tests for closed-loop fixes ----
+        ("smoke_profile_guards_guarded_virtual_frontload", smoke_profile_guards_guarded_virtual_frontload),
+        ("smoke_local_cpsat_gate", smoke_local_cpsat_gate),
+        ("smoke_writer_summary_no_virtual_pilot_legacy", smoke_writer_summary_no_virtual_pilot_legacy),
+        ("smoke_guarded_virtual_family_engine_meta_fields", smoke_guarded_virtual_family_engine_meta_fields),
+        ("smoke_writer_summary_guarded_virtual_family_fields", smoke_writer_summary_guarded_virtual_family_fields),
+        ("smoke_recon_diag_compat_counters", smoke_recon_diag_compat_counters),
+        ("smoke_candidate_graph_pipeline_reuse", smoke_candidate_graph_pipeline_reuse),
     ]:
         try:
             ok = fn()

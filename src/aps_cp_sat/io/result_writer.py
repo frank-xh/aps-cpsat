@@ -34,7 +34,12 @@ EXPORT_RULE_KEYS = [
 
 
 _LINE_ZH = {"big_roll": "大辊线", "small_roll": "小辊线"}
-_EDGE_TYPE_ZH = {"DIRECT_EDGE": "直接相邻", "REAL_BRIDGE_EDGE": "实物桥接", "VIRTUAL_BRIDGE_EDGE": "虚拟桥接"}
+_EDGE_TYPE_ZH = {
+    "DIRECT_EDGE": "直接相邻",
+    "REAL_BRIDGE_EDGE": "实物桥接",
+    "VIRTUAL_BRIDGE_EDGE": "虚拟桥接",
+    "VIRTUAL_BRIDGE_FAMILY_EDGE": "族压缩桥接",
+}
 _CANDIDATE_STATUS_ZH = {
     "ASSIGNED_CANDIDATE": "候选已分配",
     "DROPPED_CANDIDATE": "候选已剔除",
@@ -191,6 +196,7 @@ def _build_candidate_line_summary(candidate_schedule_df: pd.DataFrame) -> pd.Dat
                 "candidate_direct_edge_count": int((edge_series == "DIRECT_EDGE").sum()) if not edge_series.empty else 0,
                 "candidate_real_bridge_edge_count": int((edge_series == "REAL_BRIDGE_EDGE").sum()) if not edge_series.empty else 0,
                 "candidate_virtual_bridge_edge_count": int((edge_series == "VIRTUAL_BRIDGE_EDGE").sum()) if not edge_series.empty else 0,
+                "candidate_virtual_bridge_family_edge_count": int((edge_series == "VIRTUAL_BRIDGE_FAMILY_EDGE").sum()) if not edge_series.empty else 0,
             }
         )
     return pd.DataFrame(rows)
@@ -664,18 +670,22 @@ def export_schedule_results(
         def _summary_cut_or_em(key: str, default=0):
             return cut_diag.get(key, em.get(key, default))
 
-        # Route C: Read bridge expansion mode for summary
+        # Route RB / Route C: Read bridge expansion mode for summary
         bridge_expansion_mode = str(em.get("bridge_expansion_mode", lns_engine_meta.get("bridge_expansion_mode", "disabled")))
         virtual_bridge_enabled = bool(em.get("allow_virtual_bridge_edge_in_constructive", em.get("virtual_bridge_edge_enabled_in_constructive", lns_engine_meta.get("allow_virtual_bridge_edge_in_constructive", lns_engine_meta.get("virtual_bridge_edge_enabled_in_constructive", False)))))
         real_bridge_enabled = bool(em.get("allow_real_bridge_edge_in_constructive", em.get("real_bridge_edge_enabled_in_constructive", lns_engine_meta.get("allow_real_bridge_edge_in_constructive", lns_engine_meta.get("real_bridge_edge_enabled_in_constructive", False)))))
         constructive_edge_policy = str(em.get("constructive_edge_policy", lns_engine_meta.get("constructive_edge_policy", "direct_only")))
-        bridge_edge_leak_detected = bool(em.get("bridge_edge_leak_detected", False))
+        # Route RB: REAL_BRIDGE_EDGE is legitimate, only VIRTUAL_EDGE is leak
+        # Route C: both REAL and VIRTUAL are disabled
+        virtual_bridge_leak_detected = bool(em.get("virtual_bridge_leak_detected", False))
 
         # Build route label string
-        if constructive_edge_policy == "direct_only":
+        # Route RB (mainline): direct + real bridge allowed, virtual blocked
+        if constructive_edge_policy == "direct_plus_real_bridge":
+            route_label = "路线RB(direct+real_bridge,禁用virtual)"
+        # Route C (baseline): only direct edge, all bridge disabled
+        elif constructive_edge_policy == "direct_only":
             route_label = "路线C(direct_only,禁用所有桥接边)"
-        elif constructive_edge_policy == "direct_plus_real_bridge":
-            route_label = "路线B(禁用虚拟桥接边,允许实物桥接)"
         elif bridge_expansion_mode == "disabled":
             route_label = "路线B(bridge_expansion=disabled)"
         else:
@@ -697,22 +707,22 @@ def export_schedule_results(
             ("LNS路径.无全局联合模型", bool(lns_engine_meta.get("no_global_joint_model", True))),
             ("LNS路径.无槽位分桶", bool(lns_engine_meta.get("no_slot_bucket", True))),
             ("LNS路径.无非法惩罚", bool(lns_engine_meta.get("no_illegal_penalty", True))),
-            # Route C: Edge policy fields
+            # Route RB / Route C: Edge policy fields
             ("LNS路径.桥接展开模式", bridge_expansion_mode),
             ("LNS路径.边策略", constructive_edge_policy),
             ("LNS路径.虚拟桥接边启用", "是" if virtual_bridge_enabled else "否"),
             ("LNS路径.实物桥接边启用", "是" if real_bridge_enabled else "否"),
             ("LNS路径.求解路线", route_label),
-            ("LNS路径.桥接边泄漏", "泄漏!" if bridge_edge_leak_detected else "无泄漏"),
+            # Route RB: only virtual bridge leak is a problem (real bridge is legitimate)
+            # Route C: both virtual and real are disabled
+            ("LNS路径.虚拟桥泄漏", "泄漏!" if virtual_bridge_leak_detected else "无泄漏"),
             ("统一指标.profile_name", str(em.get("profile_name", ""))),
             ("统一指标.solver_path", str(em.get("solver_path", ""))),
             ("统一指标.constructive_edge_policy", str(em.get("constructive_edge_policy", ""))),
             ("统一指标.bridge_expansion_mode", bridge_expansion_mode),
             ("统一指标.allow_virtual_bridge_edge_in_constructive", bool(virtual_bridge_enabled)),
             ("统一指标.allow_real_bridge_edge_in_constructive", bool(real_bridge_enabled)),
-            ("统一指标.repair_only_real_bridge_enabled", bool(em.get("repair_only_real_bridge_enabled", False))),
-            ("统一指标.repair_only_virtual_bridge_enabled", bool(em.get("repair_only_virtual_bridge_enabled", False))),
-            ("统一指标.repair_only_virtual_bridge_pilot_enabled", bool(em.get("repair_only_virtual_bridge_pilot_enabled", False))),
+            # ---- repair_only 字段已降级，不再在默认 summary 中展示 ----
             ("统一指标.scheduled_real_orders", int(em.get("scheduled_real_orders", 0) or 0)),
             ("统一指标.scheduled_virtual_orders", int(em.get("scheduled_virtual_orders", 0) or 0)),
             ("统一指标.dropped_count", int(em.get("dropped_count", 0) or 0)),
@@ -720,14 +730,17 @@ def export_schedule_results(
             ("统一指标.low_slots", int(em.get("low_slots", 0) or 0)),
             ("统一指标.tail_underfilled_count", int(em.get("tail_underfilled_count", 0) or 0)),
             ("统一指标.selected_real_bridge_edge_count", int(em.get("selected_real_bridge_edge_count", 0) or 0)),
-            ("统一指标.selected_virtual_bridge_edge_count", int(em.get("selected_virtual_bridge_edge_count", 0) or 0)),
+            # ---- 新口径：guarded virtual family ----
+            ("统一指标.selected_virtual_bridge_family_edge_count", int(em.get("selected_virtual_bridge_family_edge_count", 0) or 0)),
+            ("统一指标.selected_legacy_virtual_bridge_edge_count", int(em.get("selected_legacy_virtual_bridge_edge_count", 0) or 0)),
+            ("统一指标.local_cpsat_skipped_due_to_gate", int(em.get("local_cpsat_skipped_due_to_gate", 0) or 0)),
+            ("统一指标.greedy_virtual_family_edge_uses", int(em.get("greedy_virtual_family_edge_uses", 0) or 0)),
+            ("统一指标.alns_virtual_family_attempt_count", int(em.get("alns_virtual_family_attempt_count", 0) or 0)),
             ("统一指标.max_bridge_count_used", int(em.get("max_bridge_count_used", 0) or 0)),
             ("统一指标.lns_accepted_rounds", int(em.get("lns_accepted_rounds", 0) or 0)),
             ("统一指标.lns_drop_delta", int(em.get("lns_drop_delta", 0) or 0)),
             ("统一指标.reconstruction_no_gain", bool(em.get("reconstruction_no_gain", False))),
-            ("统一指标.virtual_pilot_attempt_count", int(em.get("virtual_pilot_attempt_count", 0) or 0)),
-            ("统一指标.virtual_pilot_success_count", int(em.get("virtual_pilot_success_count", 0) or 0)),
-            ("统一指标.virtual_pilot_apply_count", int(em.get("virtual_pilot_apply_count", 0) or 0)),
+            # ---- Legacy virtual pilot 已降级，不再在默认 summary 中展示 ----
             ("统一指标.acceptance", str(em.get("acceptance", em.get("result_acceptance_status", "")))),
             ("统一指标.acceptance_gate_reason", str(em.get("acceptance_gate_reason", ""))),
             ("统一指标.validation_gate_reason", str(em.get("validation_gate_reason", ""))),
@@ -790,18 +803,7 @@ def export_schedule_results(
             ("Repair实物桥.吨位救援valid增量", int(_summary_cut_or_em("repair_bridge_ton_rescue_valid_delta", 0) or 0)),
             ("Repair实物桥.吨位救援underfilled增量", int(_summary_cut_or_em("repair_bridge_ton_rescue_underfilled_delta", 0) or 0)),
             ("Repair实物桥.吨位救援订单增量", int(_summary_cut_or_em("repair_bridge_ton_rescue_scheduled_orders_delta", 0) or 0)),
-            ("虚拟桥pilot.选中候选数", int(_summary_cut_or_em("virtual_pilot_selected_candidate_count", 0) or 0)),
-            ("虚拟桥pilot.dedup保留数", int(_summary_cut_or_em("virtual_pilot_dedup_kept_count", 0) or 0)),
-            ("虚拟桥pilot.dedup跳过数", int(_summary_cut_or_em("virtual_pilot_dedup_skipped_count", 0) or 0)),
-            ("虚拟桥pilot.attempt开始数", int(_summary_cut_or_em("virtual_pilot_attempt_started_count", 0) or 0)),
-            ("虚拟桥pilot.spec枚举完成数", int(_summary_cut_or_em("virtual_pilot_spec_enum_done_count", 0) or 0)),
-            ("虚拟桥pilot.recut进入数", int(_summary_cut_or_em("virtual_pilot_recut_entered_count", 0) or 0)),
-            ("虚拟桥pilot.segment有效数", int(_summary_cut_or_em("virtual_pilot_segment_valid_count", 0) or 0)),
-            ("虚拟桥pilot.补吨进入数", int(_summary_cut_or_em("virtual_pilot_ton_fill_entered_count", 0) or 0)),
-            ("虚拟桥pilot.apply检查进入数", int(_summary_cut_or_em("virtual_pilot_apply_check_entered_count", 0) or 0)),
-            ("虚拟桥pilot.apply成功数", int(_summary_cut_or_em("virtual_pilot_apply_success_count", 0) or 0)),
-            ("虚拟桥pilot.WIDTH_GROUP保底attempt", "是" if bool(_summary_cut_or_em("virtual_pilot_width_group_guarantee_attempted", False)) else "否"),
-            ("虚拟桥pilot.post-spec失败分布", str(_summary_cut_or_em("virtual_pilot_post_spec_fail_stage_count", {}) or {})),
+            # ---- Legacy virtual pilot: 已降级为单一总字段，不在 summary 中展示 ----
             ("Repair实物桥.当前块吨位不足", int(_summary_cut_or_em("repair_bridge_filtered_ton_below_min_current_block", 0) or 0)),
             ("Repair实物桥.吨位救援不可能", int(_summary_cut_or_em("repair_bridge_filtered_ton_rescue_impossible", 0) or 0)),
             ("Repair实物桥.扩邻后仍吨位不足", int(_summary_cut_or_em("repair_bridge_filtered_ton_below_min_even_after_neighbor_expansion", 0) or 0)),
@@ -811,6 +813,8 @@ def export_schedule_results(
             ("Repair实物桥字段不匹配次数", int(_summary_cut_or_em("repair_bridge_field_name_mismatch_count", 0) or 0)),
             ("Repair实物桥pack不一致次数", int(_summary_cut_or_em("repair_bridge_inconsistency_count", 0) or 0)),
             ("Repair实物桥.耗时秒", round(float(_summary_cut_or_em("repair_only_real_bridge_seconds", 0.0) or 0.0), 3)),
+            # ---- selected_virtual_bridge_edge_count 已降级为 debug/compat，不在默认主展示 ----
+            ("[debug]统一指标.selected_virtual_bridge_edge_count(旧口径)", int(em.get("selected_virtual_bridge_edge_count", 0) or 0)),
         ]
         for row in lns_rows:
             summary_df.loc[len(summary_df)] = row
@@ -875,14 +879,12 @@ def export_schedule_results(
     bridge_edge_leak_detected = bool(em.get("bridge_edge_leak_detected", False))
 
     # Build route label
-    if constructive_edge_policy == "direct_only":
-        route_label = "路线C(direct_only,禁用所有桥接边)"
-    elif constructive_edge_policy == "direct_plus_real_bridge":
-        route_label = "路线B(禁用虚拟桥接边,允许实物桥接)"
-    elif bridge_expansion_mode == "disabled":
-        route_label = "路线B(bridge_expansion=disabled)"
-    else:
-        route_label = "路线A(支持桥接展开)"
+    # Route RB (mainline): direct + real bridge allowed, virtual blocked
+    if constructive_edge_policy == "direct_plus_real_bridge":
+        route_label = "mainline-RB(direct+real,禁用virtual)"
+    # Route C (baseline): only direct edge, all bridge disabled
+    elif constructive_edge_policy == "direct_only":
+        route_label = "baseline-C(direct_only,禁用所有桥接)"
 
     if str(engine_used) == "constructive_lns" or str(main_path) == "constructive_lns":
         lns_engine_meta = em.get("lns_engine_meta", {}) or {}
@@ -902,22 +904,21 @@ def export_schedule_results(
             ("LNS.最终切段数", int(lns_diag.get("final_planned_count", 0))),
             ("LNS.剔除变化量", int(lns_diag.get("final_dropped_count", 0) - lns_diag.get("initial_dropped_count", 0))),
             ("LNS.总求解秒数", round(float(lns_engine_meta.get("total_seconds", 0.0)), 2)),
-            # Route C: Edge policy fields for runtime summary
+            # Route RB / Route C: Edge policy fields for runtime summary
             ("LNS.桥接展开模式", bridge_expansion_mode),
             ("LNS.边策略", constructive_edge_policy),
             ("LNS.虚拟桥接边启用", "是" if virtual_bridge_enabled else "否"),
             ("LNS.实物桥接边启用", "是" if real_bridge_enabled else "否"),
             ("LNS.求解路线", route_label),
-            ("LNS.桥接边泄漏", "泄漏!" if bridge_edge_leak_detected else "无泄漏"),
+            # Route RB: only virtual bridge leak is a problem (real bridge is legitimate)
+            ("LNS.虚拟桥泄漏", "泄漏!" if virtual_bridge_leak_detected else "无泄漏"),
             ("统一指标.profile_name", str(em.get("profile_name", ""))),
             ("统一指标.solver_path", str(em.get("solver_path", ""))),
             ("统一指标.constructive_edge_policy", str(em.get("constructive_edge_policy", ""))),
             ("统一指标.bridge_expansion_mode", bridge_expansion_mode),
             ("统一指标.allow_virtual_bridge_edge_in_constructive", bool(virtual_bridge_enabled)),
             ("统一指标.allow_real_bridge_edge_in_constructive", bool(real_bridge_enabled)),
-            ("统一指标.repair_only_real_bridge_enabled", bool(em.get("repair_only_real_bridge_enabled", False))),
-            ("统一指标.repair_only_virtual_bridge_enabled", bool(em.get("repair_only_virtual_bridge_enabled", False))),
-            ("统一指标.repair_only_virtual_bridge_pilot_enabled", bool(em.get("repair_only_virtual_bridge_pilot_enabled", False))),
+            # ---- repair_only 字段已降级，不再在默认 summary 中展示 ----
             ("统一指标.scheduled_real_orders", int(em.get("scheduled_real_orders", 0) or 0)),
             ("统一指标.scheduled_virtual_orders", int(em.get("scheduled_virtual_orders", 0) or 0)),
             ("统一指标.dropped_count", int(em.get("dropped_count", 0) or 0)),
@@ -925,14 +926,17 @@ def export_schedule_results(
             ("统一指标.low_slots", int(em.get("low_slots", 0) or 0)),
             ("统一指标.tail_underfilled_count", int(em.get("tail_underfilled_count", 0) or 0)),
             ("统一指标.selected_real_bridge_edge_count", int(em.get("selected_real_bridge_edge_count", 0) or 0)),
-            ("统一指标.selected_virtual_bridge_edge_count", int(em.get("selected_virtual_bridge_edge_count", 0) or 0)),
+            # ---- 新口径：guarded virtual family ----
+            ("统一指标.selected_virtual_bridge_family_edge_count", int(em.get("selected_virtual_bridge_family_edge_count", 0) or 0)),
+            ("统一指标.selected_legacy_virtual_bridge_edge_count", int(em.get("selected_legacy_virtual_bridge_edge_count", 0) or 0)),
+            ("统一指标.local_cpsat_skipped_due_to_gate", int(em.get("local_cpsat_skipped_due_to_gate", 0) or 0)),
+            ("统一指标.greedy_virtual_family_edge_uses", int(em.get("greedy_virtual_family_edge_uses", 0) or 0)),
+            ("统一指标.alns_virtual_family_attempt_count", int(em.get("alns_virtual_family_attempt_count", 0) or 0)),
             ("统一指标.max_bridge_count_used", int(em.get("max_bridge_count_used", 0) or 0)),
             ("统一指标.lns_accepted_rounds", int(em.get("lns_accepted_rounds", 0) or 0)),
             ("统一指标.lns_drop_delta", int(em.get("lns_drop_delta", 0) or 0)),
             ("统一指标.reconstruction_no_gain", bool(em.get("reconstruction_no_gain", False))),
-            ("统一指标.virtual_pilot_attempt_count", int(em.get("virtual_pilot_attempt_count", 0) or 0)),
-            ("统一指标.virtual_pilot_success_count", int(em.get("virtual_pilot_success_count", 0) or 0)),
-            ("统一指标.virtual_pilot_apply_count", int(em.get("virtual_pilot_apply_count", 0) or 0)),
+            # ---- Legacy virtual pilot 已降级，不再在默认 summary 中展示 ----
             ("统一指标.acceptance", str(em.get("acceptance", em.get("result_acceptance_status", "")))),
             ("统一指标.acceptance_gate_reason", str(em.get("acceptance_gate_reason", ""))),
             ("统一指标.validation_gate_reason", str(em.get("validation_gate_reason", ""))),
@@ -1014,20 +1018,7 @@ def export_schedule_results(
             ("Repair实物桥.吨位救援valid增量", int(_cut_or_em("repair_bridge_ton_rescue_valid_delta", 0) or 0)),
             ("Repair实物桥.吨位救援underfilled增量", int(_cut_or_em("repair_bridge_ton_rescue_underfilled_delta", 0) or 0)),
             ("Repair实物桥.吨位救援订单增量", int(_cut_or_em("repair_bridge_ton_rescue_scheduled_orders_delta", 0) or 0)),
-            ("虚拟桥pilot.选中候选数", int(_cut_or_em("virtual_pilot_selected_candidate_count", 0) or 0)),
-            ("虚拟桥pilot.dedup保留数", int(_cut_or_em("virtual_pilot_dedup_kept_count", 0) or 0)),
-            ("虚拟桥pilot.dedup跳过数", int(_cut_or_em("virtual_pilot_dedup_skipped_count", 0) or 0)),
-            ("虚拟桥pilot.attempt开始数", int(_cut_or_em("virtual_pilot_attempt_started_count", 0) or 0)),
-            ("虚拟桥pilot.spec枚举完成数", int(_cut_or_em("virtual_pilot_spec_enum_done_count", 0) or 0)),
-            ("虚拟桥pilot.recut进入数", int(_cut_or_em("virtual_pilot_recut_entered_count", 0) or 0)),
-            ("虚拟桥pilot.segment有效数", int(_cut_or_em("virtual_pilot_segment_valid_count", 0) or 0)),
-            ("虚拟桥pilot.补吨进入数", int(_cut_or_em("virtual_pilot_ton_fill_entered_count", 0) or 0)),
-            ("虚拟桥pilot.apply检查进入数", int(_cut_or_em("virtual_pilot_apply_check_entered_count", 0) or 0)),
-            ("虚拟桥pilot.apply成功数", int(_cut_or_em("virtual_pilot_apply_success_count", 0) or 0)),
-            ("虚拟桥pilot.WIDTH_GROUP保底attempt", "是" if bool(_cut_or_em("virtual_pilot_width_group_guarantee_attempted", False)) else "否"),
-            ("虚拟桥pilot.family执行阶段", str(_cut_or_em("virtual_pilot_execution_stage_by_family", {}) or {})),
-            ("虚拟桥pilot.post-spec失败分布", str(_cut_or_em("virtual_pilot_post_spec_fail_stage_count", {}) or {})),
-            ("虚拟桥pilot.family执行审计", str(_cut_or_em("virtual_pilot_family_execution_audit", {}) or {})),
+            # ---- Legacy virtual pilot: 已降级为单一总字段，不在 runtime rows 中展示 ----
             ("Repair实物桥.当前块吨位不足", int(_cut_or_em("repair_bridge_filtered_ton_below_min_current_block", 0) or 0)),
             ("Repair实物桥.吨位救援不可能", int(_cut_or_em("repair_bridge_filtered_ton_rescue_impossible", 0) or 0)),
             ("Repair实物桥.扩邻后仍吨位不足", int(_cut_or_em("repair_bridge_filtered_ton_below_min_even_after_neighbor_expansion", 0) or 0)),
@@ -1058,6 +1049,8 @@ def export_schedule_results(
             ("Salvage.保留clean片数", int(lns_diag.get("final_segment_salvaged_piece_count", 0))),
             ("Salvage.降级fragments数", int(lns_diag.get("final_segment_demoted_fragment_count", 0))),
             ("Salvage.整段丢弃次数", int(lns_diag.get("final_segment_full_drop_count", 0))),
+            # ---- selected_virtual_bridge_edge_count 已降级为 debug/compat，不在默认主展示 ----
+            ("[debug]统一指标.selected_virtual_bridge_edge_count(旧口径)", int(em.get("selected_virtual_bridge_edge_count", 0) or 0)),
         ])
 
     if isinstance(failure_diagnostics, dict):

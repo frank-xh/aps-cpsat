@@ -14,6 +14,7 @@ from aps_cp_sat.model.candidate_graph_types import (
     TransitionCheckResult,
     VIRTUAL_BRIDGE_EDGE,
     VIRTUAL_BRIDGE_FAMILY_EDGE,
+    is_virtual_family_frontload_eligible,
 )
 from aps_cp_sat.transition.bridge_rules import (
     _hard_direct_step_ok,
@@ -218,15 +219,27 @@ def build_candidate_graph(
 
     edge_type_counts = Counter(edge.edge_type for edge in edges)
 
-    # ---- Virtual family edge pruning diagnostics ----
+    # ---- Virtual family edge pruning pipeline ----
+    # Raw family edge count (before any pruning)
+    virtual_family_raw_count = int(edge_type_counts.get(VIRTUAL_BRIDGE_FAMILY_EDGE, 0))
+
     max_chain = int(getattr(getattr(cfg, "rule", None), "max_virtual_chain", 10**9) if cfg is not None else 10**9)
     filtered_by_chain_limit = 0
     filtered_by_temp = 0
     filtered_by_group = 0
+    filtered_by_family_allowlist = 0
+    filtered_by_frontload_eligibility = 0
     topk_pruned = 0
+    global_cap_pruned = 0
 
-    # Per from_order_id family: track top-k and prune
-    family_topk_per_from: dict[str, list[tuple[int, CandidateEdge]]] = {}
+    # Per from_order_id + bridge_family: track candidates for top-k
+    family_topk_key: dict[tuple[str, str, str], list[tuple[int, float, CandidateEdge]]] = {}
+    # family_topk_key = (from_order_id, line, bridge_family) -> [(bridge_count, cost, edge), ...]
+
+    # ---- Phase 1: basic feasibility pruning ----
+    eligible_family_edges: list[CandidateEdge] = []
+    # Extract model config once for reuse in later phases
+    model = getattr(cfg, "model", None) if cfg else None
     for edge in edges:
         if edge.edge_type != VIRTUAL_BRIDGE_FAMILY_EDGE:
             continue
@@ -258,33 +271,168 @@ def build_candidate_graph(
                 filtered_by_group += 1
                 continue
 
-        fid = str(edge.from_order_id)
-        if fid not in family_topk_per_from:
-            family_topk_per_from[fid] = []
-        family_topk_per_from[fid].append((edge.effective_max_bridge_count(), edge))
+        # ---- Phase 2: family allowlist pruning ----
+        if model is not None and getattr(model, "virtual_family_frontload_enabled", False):
+            allowed_families = getattr(model, "virtual_family_frontload_allowed_families", [])
+            if allowed_families:
+                bridge_family = str(edge.metadata.get("explain_payload", {}).get("bridge_family", ""))
+                if bridge_family not in allowed_families:
+                    filtered_by_family_allowlist += 1
+                    continue
 
-    # Top-k pruning per from_order_id (keep top 5 per family)
-    topk = 5
-    for fid, candidates in family_topk_per_from.items():
-        if len(candidates) > topk:
-            topk_pruned += len(candidates) - topk
+        # ---- Phase 3: frontload eligibility gating ----
+        eligible, _ = is_virtual_family_frontload_eligible(edge, cfg, None)
+        if not eligible:
+            filtered_by_frontload_eligibility += 1
+            continue
 
-    # Family bridge count distribution
-    bridge_family_counts: dict[str, int] = {}
+        eligible_family_edges.append(edge)
+
+    # ---- Phase 4: top-k per (from_order_id, line, bridge_family) ----
+    topk_per = int(getattr(model, "virtual_family_frontload_global_topk_per_from", 2) if model else 2)
+    for edge in eligible_family_edges:
+        fam = str(edge.metadata.get("explain_payload", {}).get("bridge_family", "MIXED"))
+        key = (str(edge.from_order_id), str(edge.line), fam)
+        if key not in family_topk_key:
+            family_topk_key[key] = []
+        family_topk_key[key].append((edge.effective_max_bridge_count(), edge.template_cost, edge))
+
+    topk_kept_edges: set[CandidateEdge] = set()
+    for key, candidates in family_topk_key.items():
+        # Sort by bridge_count asc, then cost asc
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        kept = candidates[:topk_per]
+        pruned = len(candidates) - len(kept)
+        topk_pruned += pruned
+        topk_kept_edges.update(e[2] for e in kept)
+
+    # ---- Phase 5: global total cap (strict pool for greedy constructive) ----
+    global_max = int(getattr(model, "virtual_family_frontload_global_max_edges_total", 360) if model else 360)
+    if len(topk_kept_edges) > global_max:
+        # Sort by priority: bridge_count asc, cost asc, reverse_cost asc, expected_underfill_gain desc
+        def _global_cap_priority(e: CandidateEdge) -> tuple:
+            payload = e.metadata.get("explain_payload", {})
+            return (
+                e.effective_max_bridge_count(),
+                e.template_cost,
+                e.estimated_reverse_cost,
+                -float(payload.get("expected_underfill_gain", 0.0) or 0.0),
+                e.from_order_id,
+            )
+
+        sorted_edges = sorted(topk_kept_edges, key=_global_cap_priority)
+        topk_kept_edges = set(sorted_edges[:global_max])
+        global_cap_pruned = len(sorted_edges) - global_max
+
+    # ---- Build dual pool: strict global pool + wider repair pool ----
+    # Global pool: already in topk_kept_edges (strict: topk_per + global_max)
+    # Repair pool: wider (topk_per + alns_extra_topk) + repair_max_edges_total
+    # The repair pool includes ALL family edges from the wider top-k that are not already in global pool.
+    repair_family_edges_list: list[CandidateEdge] = []
+    repair_topk_pruned = 0
+    repair_cap_pruned = 0
+
+    # Apply wider top-k: (global topk_per + alns_extra_topk)
+    alns_extra_topk = int(getattr(model, "virtual_family_frontload_alns_only_extra_topk", 4) if model else 4)
+    wider_topk_per = topk_per + alns_extra_topk  # e.g., 3 + 4 = 7
+    wider_topk_kept: set[CandidateEdge] = set()
+    wider_family_topk_key: dict[tuple[str, str, str], list[tuple[int, float, CandidateEdge]]] = {}
+    for edge in eligible_family_edges:
+        fam = str(edge.metadata.get("explain_payload", {}).get("bridge_family", "MIXED"))
+        key = (str(edge.from_order_id), str(edge.line), fam)
+        if key not in wider_family_topk_key:
+            wider_family_topk_key[key] = []
+        wider_family_topk_key[key].append((edge.effective_max_bridge_count(), edge.template_cost, edge))
+
+    for key, candidates in wider_family_topk_key.items():
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        kept = candidates[:wider_topk_per]
+        pruned = len(candidates) - len(kept)
+        repair_topk_pruned += pruned
+        wider_topk_kept.update(e[2] for e in kept)
+
+    # Apply repair pool cap
+    repair_max = int(getattr(model, "virtual_family_frontload_repair_max_edges_total", 900) if model else 900)
+    # wider_topk_kept includes edges from global top-k + extra ALNS edges
+    # We want: ALL wider_topk_kept edges, then cap
+    # But deduplicate: global pool already has topk_kept_edges ⊂ wider_topk_kept
+    # repair pool = wider_topk_kept edges (including global ones, dedup by set)
+    # Then cap
+    all_repair_candidates = set(wider_topk_kept)  # wider top-k set
+    if len(all_repair_candidates) > repair_max:
+        def _repair_cap_priority(e: CandidateEdge) -> tuple:
+            payload = e.metadata.get("explain_payload", {})
+            return (
+                e.effective_max_bridge_count(),
+                e.template_cost,
+                e.estimated_reverse_cost,
+                -float(payload.get("expected_underfill_gain", 0.0) or 0.0),
+                e.from_order_id,
+            )
+        sorted_repair = sorted(all_repair_candidates, key=_repair_cap_priority)
+        all_repair_candidates = set(sorted_repair[:repair_max])
+        repair_cap_pruned = len(sorted_repair) - repair_max
+
+    # Build repair_family_edges: wider top-k kept, capped, as list
+    repair_family_edges_list = list(all_repair_candidates)
+    repair_family_edges_list.sort(key=lambda e: (
+        e.effective_max_bridge_count(), e.template_cost, e.from_order_id, e.to_order_id
+    ))
+
+    # Diagnostics for repair pool
+    repair_family_edge_pool_diagnostics = {
+        "virtual_family_repair_pool_wider_topk_per": int(wider_topk_per),
+        "virtual_family_repair_pool_repair_max_edges_total": int(repair_max),
+        "virtual_family_repair_pool_wider_topk_candidates": int(len(wider_topk_kept)),
+        "virtual_family_repair_pool_topk_pruned_count": int(repair_topk_pruned),
+        "virtual_family_repair_pool_cap_pruned_count": int(repair_cap_pruned),
+        "virtual_family_repair_pool_kept_count": int(len(repair_family_edges_list)),
+        # Overlap with global pool
+        "virtual_family_repair_pool_global_overlap_count": int(len(wider_topk_kept & topk_kept_edges)),
+        "virtual_family_repair_pool_extra_count": int(len(wider_topk_kept) - len(wider_topk_kept & topk_kept_edges)),
+    }
+    repair_family_edge_count = len(repair_family_edges_list)
+
+    # Rebuild final edges list: keep all non-family edges + topk-kept family edges
+    final_edges: list[CandidateEdge] = []
     for edge in edges:
+        if edge.edge_type != VIRTUAL_BRIDGE_FAMILY_EDGE:
+            final_edges.append(edge)
+        elif edge in topk_kept_edges:
+            final_edges.append(edge)
+
+    # Family bridge count distribution (for diagnostics)
+    bridge_family_counts: dict[str, int] = {}
+    for edge in final_edges:
         if edge.edge_type == VIRTUAL_BRIDGE_FAMILY_EDGE:
             fam = str(edge.metadata.get("explain_payload", {}).get("bridge_family", "MIXED"))
             bridge_family_counts[fam] = bridge_family_counts.get(fam, 0) + 1
 
+    final_type_counts = Counter(edge.edge_type for edge in final_edges)
+
     diagnostics = {
-        "candidate_graph_edge_count": int(len(edges)),
-        "candidate_graph_direct_edge_count": int(edge_type_counts.get(DIRECT_EDGE, 0)),
-        "candidate_graph_real_bridge_edge_count": int(edge_type_counts.get(REAL_BRIDGE_EDGE, 0)),
-        "candidate_graph_virtual_bridge_family_edge_count": int(edge_type_counts.get(VIRTUAL_BRIDGE_FAMILY_EDGE, 0)),
-        "virtual_family_edge_count": int(edge_type_counts.get(VIRTUAL_BRIDGE_FAMILY_EDGE, 0)),
+        "candidate_graph_edge_count": int(len(final_edges)),
+        "candidate_graph_direct_edge_count": int(final_type_counts.get(DIRECT_EDGE, 0)),
+        "candidate_graph_real_bridge_edge_count": int(final_type_counts.get(REAL_BRIDGE_EDGE, 0)),
+        "candidate_graph_virtual_bridge_family_edge_count": int(final_type_counts.get(VIRTUAL_BRIDGE_FAMILY_EDGE, 0)),
+        "virtual_family_edge_count": int(final_type_counts.get(VIRTUAL_BRIDGE_FAMILY_EDGE, 0)),
+        # Raw counts (before pruning)
+        "candidate_graph_virtual_bridge_family_edge_raw_count": int(virtual_family_raw_count),
+        "candidate_graph_virtual_bridge_family_edge_kept_count": int(final_type_counts.get(VIRTUAL_BRIDGE_FAMILY_EDGE, 0)),
+        # Dual-pool: global (strict) vs repair (wider)
+        "candidate_graph_virtual_bridge_family_edge_global_kept_count": int(final_type_counts.get(VIRTUAL_BRIDGE_FAMILY_EDGE, 0)),
+        "candidate_graph_virtual_bridge_family_edge_repair_kept_count": int(repair_family_edge_count),
+        # Pruning diagnostics
         "virtual_family_filtered_by_chain_limit_count": int(filtered_by_chain_limit),
         "virtual_family_filtered_by_temp_count": int(filtered_by_temp),
         "virtual_family_filtered_by_group_count": int(filtered_by_group),
+        "virtual_family_frontload_filtered_by_family_count": int(filtered_by_family_allowlist),
+        "virtual_family_frontload_filtered_by_context_count": int(filtered_by_frontload_eligibility),
+        "virtual_family_frontload_topk_pruned_count": int(topk_pruned),
+        "virtual_family_frontload_global_cap_pruned_count": int(global_cap_pruned),
+        "virtual_family_repair_pool_topk_pruned_count": int(repair_topk_pruned),
+        "virtual_family_repair_pool_cap_pruned_count": int(repair_cap_pruned),
+        # Legacy diagnostics (for compatibility)
         "virtual_family_topk_pruned_count": int(topk_pruned),
         "candidate_graph_filtered_by_width_count": int(reason_counts.get("WIDTH_RULE_FAIL", 0)),
         "candidate_graph_filtered_by_thickness_count": int(reason_counts.get("THICKNESS_RULE_FAIL", 0)),
@@ -294,5 +442,13 @@ def build_candidate_graph(
         "candidate_graph_reason_histogram": dict(reason_counts),
         "virtual_family_bridge_family_counts": bridge_family_counts,
         "virtual_family_max_chain_limit": int(max_chain),
+        "virtual_family_frontload_global_topk_per_from": int(topk_per),
+        "virtual_family_frontload_global_max_edges_total": int(global_max),
     }
-    return CandidateGraphBuildResult(edges=edges, diagnostics=diagnostics)
+    return CandidateGraphBuildResult(
+        edges=final_edges,
+        diagnostics=diagnostics,
+        repair_family_edges=repair_family_edges_list,
+        repair_family_edge_count=repair_family_edge_count,
+        repair_family_edge_pool_diagnostics=repair_family_edge_pool_diagnostics,
+    )

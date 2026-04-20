@@ -952,10 +952,17 @@ def solve_master_model(
         profile_name = str(getattr(current_cfg.model, "profile_name", "") or "")
 
         # ---- Profile guard: hard enforcement ----
+        # 当前生产主路径允许以下 profile：
+        #   - constructive_lns_search: 主线 (Route RB / real bridge mainline)
+        #   - constructive_lns_real_bridge_frontload: 主线别名
+        #   - constructive_lns_direct_only_baseline: 回归基线 (Route C / direct_only)
+        #   - constructive_lns_virtual_guarded_frontload: 受控 virtual family 实验线
+        # 其他 alias / 实验线 / debug profile 已从主路径移除。
         allowed_constructive_profiles = {
             "constructive_lns_search",
             "constructive_lns_direct_only_baseline",
             "constructive_lns_real_bridge_frontload",
+            "constructive_lns_virtual_guarded_frontload",
         }
         if profile_name not in allowed_constructive_profiles:
             raise RuntimeError(
@@ -983,9 +990,9 @@ def solve_master_model(
         print(f"[APS][constructive_lns] allow_real_bridge_edge_in_constructive={allow_real_bridge}")
         print(f"[APS][constructive_lns] constructive_edge_policy={constructive_edge_policy}")
         if constructive_edge_policy == "direct_only":
-            print(f"[APS][constructive_lns] Route C / direct_only: only DIRECT_EDGE is allowed")
+            print(f"[APS][constructive_lns] Route C (baseline): only DIRECT_EDGE is allowed")
         elif constructive_edge_policy == "direct_plus_real_bridge":
-            print(f"[APS][constructive_lns] Route RB / direct_plus_real_bridge: DIRECT_EDGE + REAL_BRIDGE_EDGE allowed, VIRTUAL_BRIDGE_EDGE blocked, bridge_expansion_mode={bridge_expansion_mode}")
+            print(f"[APS][constructive_lns] Route RB (mainline): DIRECT_EDGE + REAL_BRIDGE_EDGE allowed, VIRTUAL_BRIDGE_EDGE blocked, bridge_expansion_mode={bridge_expansion_mode}")
         else:
             print(f"[APS][constructive_lns] edge_policy={constructive_edge_policy}, bridge_expansion_mode={bridge_expansion_mode}")
         health = _assess_template_graph_health(current_transition_pack, current_cfg)

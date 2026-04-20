@@ -116,7 +116,13 @@ class TemplateEdgeGraph:
     - DIRECT_EDGE is always allowed
     """
 
-    def __init__(self, orders_df: pd.DataFrame, tpl_df: pd.DataFrame, cfg: PlannerConfig):
+    def __init__(
+        self,
+        orders_df: pd.DataFrame,
+        tpl_df: pd.DataFrame,
+        cfg: PlannerConfig,
+        candidate_graph=None,
+    ):
         self.cfg = cfg
         self.orders_df = orders_df
         self.tpl_df = tpl_df
@@ -137,9 +143,12 @@ class TemplateEdgeGraph:
         self.filtered_real_bridge_edge_count: int = 0
         self.candidate_graph_diagnostics: Dict = {}
 
+        # ---- Single graph build tracking ----
+        # candidate_graph_source: "pipeline" = reused from pipeline (normal)
+        #                          "builder_fallback" = built locally by TemplateEdgeGraph
+        self.candidate_graph_source: str = "builder_fallback"
+
         # ---- Small roll dual-order reserve: per-line degree tracking ----
-        # big_deg[oid] = in + out degree on big_roll
-        # small_deg[oid] = in + out degree on small_roll
         self.big_deg: Dict[str, int] = {}
         self.small_deg: Dict[str, int] = {}
 
@@ -147,27 +156,46 @@ class TemplateEdgeGraph:
         self.accepted_real_bridge_edge_count: int = 0
         self.accepted_virtual_bridge_family_edge_count: int = 0
 
-        # Determine edge policy string (Route C = direct_only)
-        # Policy determines which edge types are allowed in constructive building:
-        #   direct_only           : DIRECT only (Route C)
-        #   direct_plus_real_bridge: DIRECT + REAL (Route RB)
-        #   all_edges_allowed     : all three types allowed
-        #   family_frontload      : DIRECT + REAL + VIRTUAL_BRIDGE_FAMILY_EDGE (future)
+        # Determine edge policy string
+        cfg_model = getattr(cfg, "model", None)
+        guarded_enabled = (
+            getattr(cfg_model, "virtual_family_frontload_enabled", False)
+            if cfg_model else False
+        )
         if not self.allow_virtual and self.allow_real:
             self.edge_policy: str = "direct_plus_real_bridge"
         elif not self.allow_virtual and not self.allow_real:
             self.edge_policy = "direct_only"  # Route C: strictest mode
+        elif self.allow_virtual and self.allow_real and guarded_enabled:
+            self.edge_policy = "direct_plus_real_plus_guarded_family"  # Guarded virtual family frontload
         elif self.allow_virtual and self.allow_real:
             self.edge_policy = "all_edges_allowed"
         elif self.allow_real:
-            self.edge_policy = "family_frontload"  # allow_virtual means family edge
+            self.edge_policy = "family_frontload"
         else:
             self.edge_policy = "virtual_only"
 
-        self._build_graph()
+        # Family edge budget tracking for greedy phase
+        self.family_edge_used_per_line: dict[str, int] = defaultdict(int)
+        self.family_edge_used_per_segment: dict[str, int] = defaultdict(int)
+        self.greedy_virtual_family_edge_uses: int = 0
+        self.greedy_virtual_family_edge_rejects: int = 0
+        self.greedy_virtual_family_budget_blocked_count: int = 0
+        # ---- Future-aware penalty tracking (guarded profile only) ----
+        self.greedy_future_bridgeability_penalty_hits: int = 0
+        self.greedy_tail_underfill_risk_penalty_hits: int = 0
+        self.greedy_bridge_scarcity_penalty_hits: int = 0
 
-    def _build_graph(self) -> None:
-        """Build directed graph from orders and templates."""
+        self._build_graph(candidate_graph=candidate_graph)
+
+    def _build_graph(self, candidate_graph=None) -> None:
+        """Build directed graph from orders and templates.
+
+        Args:
+            candidate_graph: Optional pre-built candidate graph from pipeline.
+                              If provided, reuses it instead of building locally.
+                              This ensures Candidate Graph is built exactly once.
+        """
         # Index orders
         for _, row in self.orders_df.iterrows():
             oid = str(row["order_id"])
@@ -184,8 +212,19 @@ class TemplateEdgeGraph:
             else:
                 self.order_to_lines[oid] = ["big_roll", "small_roll"]
 
-        candidate_graph = build_candidate_graph(self.orders_df, self.tpl_df, self.cfg)
-        self.candidate_graph_diagnostics = dict(candidate_graph.diagnostics)
+        # ---- Use pre-built candidate graph if available (normal path) ----
+        if candidate_graph is not None:
+            self.candidate_graph_source = "pipeline"
+            self.candidate_graph_diagnostics = dict(getattr(candidate_graph, "diagnostics", {}) or {})
+        else:
+            # Fallback: build locally (legacy compat path)
+            self.candidate_graph_source = "builder_fallback"
+            candidate_graph = build_candidate_graph(self.orders_df, self.tpl_df, self.cfg)
+            self.candidate_graph_diagnostics = dict(candidate_graph.diagnostics)
+            print(
+                f"[APS][CandidateGraph][WARNING] candidate_graph built by TemplateEdgeGraph fallback "
+                f"(pipeline did not provide one). Consider passing it through transition_pack."
+            )
 
         # Build adjacency lists from normalized Candidate Graph edges
         if self.tpl_df.empty:
@@ -204,14 +243,29 @@ class TemplateEdgeGraph:
 
             # ---- Bridge edge type filtering ----
             edge_type = str(candidate_edge.edge_type or DIRECT_EDGE)
-            is_virtual = edge_type in (VIRTUAL_BRIDGE_EDGE, VIRTUAL_BRIDGE_FAMILY_EDGE)
-            if is_virtual and not self.allow_virtual:
+            is_virtual_family = (edge_type == VIRTUAL_BRIDGE_FAMILY_EDGE)
+            is_virtual_legacy = (edge_type == VIRTUAL_BRIDGE_EDGE)
+
+            # Guarded family policy: legacy virtual is ALWAYS blocked
+            if is_virtual_legacy:
                 self.filtered_virtual_bridge_edge_count += 1
-                continue  # Skip virtual bridge edge (both legacy and family)
+                continue
+
+            if is_virtual_family and not self.allow_virtual:
+                self.filtered_virtual_bridge_edge_count += 1
+                continue  # Skip family edge if allow_virtual=False
+
             if edge_type == REAL_BRIDGE_EDGE and not self.allow_real:
                 self.filtered_real_bridge_edge_count += 1
                 continue  # Skip real bridge edge
-            # DIRECT_EDGE is always allowed
+
+            # Guarded family: apply frontload eligibility check
+            if is_virtual_family and self.edge_policy == "direct_plus_real_plus_guarded_family":
+                from aps_cp_sat.model.candidate_graph_types import is_virtual_family_frontload_eligible
+                eligible, _ = is_virtual_family_frontload_eligible(candidate_edge, self.cfg, None)
+                if not eligible:
+                    self.filtered_virtual_bridge_edge_count += 1
+                    continue  # Skip ineligible family edge
 
             # Track accepted edge counts for diagnostics
             if edge_type == DIRECT_EDGE:
@@ -269,7 +323,18 @@ class TemplateEdgeGraph:
 
         Returns list of (successor_oid, template_row, edge_cost) tuples
         that are not yet used and can run on the specified line.
+
+        Budget Gate (family edge):
+        - If edge_type == VIRTUAL_BRIDGE_FAMILY_EDGE and guarded mode,
+          skip if line/segment budget is already exhausted.
         """
+        cfg_model = getattr(self.cfg, "model", None) if self.cfg else None
+        family_frontload = (
+            getattr(cfg_model, "virtual_family_frontload_enabled", False)
+            if cfg_model else False
+        )
+        budget_per_line = int(getattr(cfg_model, "virtual_family_budget_per_line", 3) if cfg_model else 3)
+
         candidates = []
         for next_oid, tpl_row in self.out_edges.get(current_oid, []):
             if next_oid in used_orders:
@@ -277,6 +342,17 @@ class TemplateEdgeGraph:
             edge_line = str(tpl_row.get("line", "big_roll"))
             if edge_line != line:
                 continue
+            edge_type = str(tpl_row.get("edge_type", "") or "")
+            is_family = (edge_type == VIRTUAL_BRIDGE_FAMILY_EDGE)
+
+            # Budget Gate 1: per-line family budget hard block
+            if is_family and family_frontload:
+                current_used = self.family_edge_used_per_line.get(line, 0)
+                if current_used >= budget_per_line:
+                    self.greedy_virtual_family_edge_rejects += 1
+                    self.greedy_virtual_family_budget_blocked_count += 1
+                    continue  # Budget exhausted: hard block before candidate list
+
             cost = self.edge_cost.get((current_oid, next_oid), 0)
             candidates.append((next_oid, tpl_row, cost))
         return candidates
@@ -330,16 +406,41 @@ class TemplateEdgeGraph:
 def _compute_chain_score(
     order_rec: dict,
     edge_cost: int,
+    edge_type: str = DIRECT_EDGE,
+    bridge_count: int = 0,
+    bridge_family: str = "",
+    cfg: PlannerConfig | None = None,
     due_rank_weight: float = 1000.0,
     priority_weight: float = 500.0,
     tons_weight: float = 1.0,
     cost_weight: float = 0.1,
-) -> float:
+    # ---- Future-aware context (guarded profile only) ----
+    future_successor_count: int = 0,
+    remaining_chain_capacity: int = 999,
+    bridge_scarcity_score: float = 0.0,
+) -> tuple[float, dict[str, int]]:
     """
     Compute composite score for chain extension decision.
 
     Higher score = better candidate.
+
+    Returns (score, penalty_hits) where penalty_hits tracks which future-aware
+    penalties were applied (for diagnostics, guarded profile only).
+
+    Family edge penalty (guarded profile only):
+    - DIRECT_EDGE: no penalty
+    - REAL_BRIDGE_EDGE: small penalty (bridge_count * 5)
+    - VIRTUAL_BRIDGE_FAMILY_EDGE: significant penalty (global_penalty +
+      bridge_count * extra_penalty + family_type_penalty +
+      future-aware penalties)
+
+    Future-aware penalties (guarded profile only):
+      future_bridgeability_penalty: penalize if few future successors (hard to bridge further)
+      tail_underfill_risk_penalty: penalize if near tail and may underfill
+      bridge_scarcity_preservation_penalty: penalize if using scarce bridge type
     """
+    penalty_hits: dict[str, int] = {}
+
     due_rank = int(order_rec.get("due_rank", 999) or 999)
     priority = int(order_rec.get("priority", 0) or 0)
     tons = float(order_rec.get("tons", 0) or 0)
@@ -356,7 +457,64 @@ def _compute_chain_score(
     # Edge cost: lower is better
     cost_score = cost_weight * max(0, 1000 - edge_cost)
 
-    return due_score + priority_score + tons_score + cost_score
+    base_score = due_score + priority_score + tons_score + cost_score
+
+    # ---- Family edge penalty: make family edges less preferred unless necessary ----
+    is_guarded_profile = False
+    if edge_type == VIRTUAL_BRIDGE_FAMILY_EDGE and cfg is not None:
+        model = getattr(cfg, "model", None)
+        if model is not None and getattr(model, "virtual_family_frontload_enabled", False):
+            is_guarded_profile = True
+            global_penalty = float(getattr(model, "virtual_family_frontload_global_penalty", 100.0))
+            extra_penalty = float(getattr(model, "virtual_family_frontload_local_penalty", 70.0))
+            # Family type penalty: GROUP_TRANSITION > MIXED > THICKNESS > WIDTH_GROUP
+            family_type_penalty = {"GROUP_TRANSITION": 40, "MIXED": 20, "THICKNESS": 10, "WIDTH_GROUP": 5}.get(
+                bridge_family, 10
+            )
+            base_score -= global_penalty + bridge_count * extra_penalty + family_type_penalty
+
+    # ---- Future-aware penalties (guarded profile only) ----
+    if is_guarded_profile:
+        # 1. future_bridgeability_penalty: penalize if few future successors
+        #    (hard to bridge further after this edge → don't consume scarce budget)
+        if future_successor_count <= 1:
+            future_bridge_penalty = 60.0
+            base_score -= future_bridge_penalty
+            penalty_hits["future_bridgeability_penalty"] = 1
+        elif future_successor_count <= 3:
+            future_bridge_penalty = 25.0
+            base_score -= future_bridge_penalty
+            penalty_hits["future_bridgeability_penalty"] = 1
+
+        # 2. tail_underfill_risk_penalty: penalize if near chain tail and may underfill
+        #    Remaining capacity ≤ 3 slots AND edge_type is family → higher underfill risk
+        if remaining_chain_capacity <= 3 and edge_type == VIRTUAL_BRIDGE_FAMILY_EDGE:
+            tail_penalty = 35.0
+            base_score -= tail_penalty
+            penalty_hits["tail_underfill_risk_penalty"] = 1
+
+        # 3. bridge_scarcity_preservation_penalty: penalize if using scarce bridge type
+        #    bridge_scarcity_score: higher = scarcer (inverted from count)
+        if bridge_scarcity_score > 0.5:
+            scarcity_penalty = bridge_scarcity_score * 30.0
+            base_score -= scarcity_penalty
+            penalty_hits["bridge_scarcity_preservation_penalty"] = 1
+
+    return base_score, penalty_hits
+
+
+def _bridge_family_type_from_row(tpl_row: dict) -> str:
+    """Derive bridge_family from a template row for family edge scoring."""
+    raw = str(tpl_row.get("bridge_family", "")).strip().upper()
+    if raw in {"WIDTH_GROUP", "THICKNESS", "GROUP_TRANSITION", "MIXED"}:
+        return raw
+    bridge_count = int(tpl_row.get("bridge_count", 0) or 0)
+    if bridge_count >= 3:
+        return "GROUP_TRANSITION"
+    elif bridge_count >= 2:
+        return "MIXED"
+    else:
+        return "WIDTH_GROUP"
 
 
 def _allowed_lines_for_order(raw_cap: str) -> set[str]:
@@ -411,8 +569,12 @@ def _build_single_chain(
     current_tons = float(graph.order_record.get(start_oid, {}).get("tons", 0) or 0)
     steel_groups = [str(graph.order_record.get(start_oid, {}).get("steel_group", "") or "")]
 
+    # Segment budget key: stable within the same greedy chain (use seed + line).
+    # Each chain gets its own segment scope; family budget per segment = 1.
+    segment_budget_key = f"{line}:{start_oid}"
+
     while True:
-        # Get valid successors
+        # Get valid successors (budget gate is applied inside get_valid_successors)
         successors = graph.get_valid_successors(current_oid, used_orders, line)
 
         # ---- Successor blocking: only block STILL-LOCKED quota orders ----
@@ -433,9 +595,48 @@ def _build_single_chain(
         cfg_model = getattr(graph.cfg, "model", None) if graph.cfg else None
         dual_reserve_enabled = getattr(cfg_model, "small_roll_dual_reserve_enabled", True) if cfg_model else True
         dual_reserve_penalty = int(getattr(cfg_model, "small_roll_dual_reserve_penalty", 15) if cfg_model else 15)
+
+        # ---- Compute future-aware context for scoring ----
+        # remaining_chain_capacity: estimated remaining orders based on ton capacity
+        avg_order_tons = 150.0  # heuristic
+        remaining_orders_est = max(1, int((campaign_ton_max - current_tons) / avg_order_tons))
+        remaining_chain_capacity = remaining_orders_est
+
+        # bridge_scarcity_score: inverse of remaining per-line family budget
+        # Higher score = scarcer = more penalty for using
+        guarded_enabled = getattr(cfg_model, "virtual_family_frontload_enabled", False) if cfg_model else False
+        if guarded_enabled:
+            per_line_budget = int(getattr(cfg_model, "virtual_family_budget_per_line", 4) if cfg_model else 4)
+            per_line_used = graph.family_edge_used_per_line.get(line, 0)
+            remaining_budget = max(0, per_line_budget - per_line_used)
+            # Score 0.0 = plenty left, score 1.0 = nearly exhausted
+            bridge_scarcity_score = 1.0 - (remaining_budget / max(1, per_line_budget))
+        else:
+            bridge_scarcity_score = 0.0
+
         for succ_oid, tpl_row, cost in successors:
             succ_rec = graph.order_record.get(succ_oid, {})
-            score = _compute_chain_score(succ_rec, cost)
+            edge_type = str(tpl_row.get("edge_type", DIRECT_EDGE))
+            bridge_count = int(tpl_row.get("bridge_count", 0) or 0)
+            bridge_family = _bridge_family_type_from_row(tpl_row)
+            score, penalty_hits = _compute_chain_score(
+                succ_rec, cost,
+                edge_type=edge_type,
+                bridge_count=bridge_count,
+                bridge_family=bridge_family,
+                cfg=graph.cfg,
+                future_successor_count=len(successors),
+                remaining_chain_capacity=remaining_chain_capacity,
+                bridge_scarcity_score=bridge_scarcity_score,
+            )
+
+            # Accumulate future-aware penalty hits into graph diagnostics
+            if penalty_hits.get("future_bridgeability_penalty"):
+                graph.greedy_future_bridgeability_penalty_hits += 1
+            if penalty_hits.get("tail_underfill_risk_penalty"):
+                graph.greedy_tail_underfill_risk_penalty_hits += 1
+            if penalty_hits.get("bridge_scarcity_preservation_penalty"):
+                graph.greedy_bridge_scarcity_penalty_hits += 1
 
             # ---- Dual-order small-roll reserve: penalize big_roll taking dual orders ----
             # If order has edges on BOTH lines, add a penalty on big_roll to leave some for small_roll
@@ -469,6 +670,29 @@ def _build_single_chain(
             if not fit_found:
                 break
 
+        # ---- Budget Gate 2: segment-level family budget hard block ----
+        # Check AFTER score selection but BEFORE extending.
+        # This prevents a high-score family edge from consuming the segment budget.
+        best_edge_type = str(best_tpl.get("edge_type", "") or "")
+        best_is_family = (best_edge_type == VIRTUAL_BRIDGE_FAMILY_EDGE)
+        if best_is_family and getattr(cfg_model, "virtual_family_frontload_enabled", False):
+            seg_budget = int(getattr(cfg_model, "virtual_family_budget_per_segment", 1) if cfg_model else 1)
+            seg_used = graph.family_edge_used_per_segment.get(segment_budget_key, 0)
+            if seg_used >= seg_budget:
+                # Segment budget exhausted: reject this family edge
+                graph.greedy_virtual_family_edge_rejects += 1
+                graph.greedy_virtual_family_budget_blocked_count += 1
+                # Try next-best non-family successor
+                non_family = [(s, o, t, c) for s, o, t, c in scored_successors[1:] if str(t.get("edge_type", "")) != VIRTUAL_BRIDGE_FAMILY_EDGE]
+                if non_family:
+                    best_score, best_succ, best_tpl, best_cost = non_family[0]
+                    succ_tons = float(graph.order_record.get(best_succ, {}).get("tons", 0) or 0)
+                    best_is_family = False
+                    if current_tons + succ_tons > campaign_ton_max:
+                        break  # Can't fit non-family either
+                else:
+                    break  # No acceptable non-family successor
+
         # Extend chain
         order_ids.append(best_succ)
         used_orders.add(best_succ)
@@ -477,6 +701,12 @@ def _build_single_chain(
         sg = str(graph.order_record.get(best_succ, {}).get("steel_group", "") or "")
         if sg and sg not in steel_groups:
             steel_groups.append(sg)
+
+        # ---- Count family edge usage AFTER successful selection ----
+        if best_is_family:
+            graph.family_edge_used_per_line[line] += 1
+            graph.family_edge_used_per_segment[segment_budget_key] += 1
+            graph.greedy_virtual_family_edge_uses += 1
 
     # Only return chain if it has at least 1 order
     if len(order_ids) >= 1:
@@ -765,6 +995,14 @@ def build_constructive_sequences(
         "filtered_virtual_bridge_edge_count": 0,
         "filtered_real_bridge_edge_count": 0,
         "constructive_edge_policy": "unknown",
+        # Guarded virtual family edge diagnostics
+        "greedy_virtual_family_edge_uses": 0,
+        "greedy_virtual_family_edge_rejects": 0,
+        "greedy_virtual_family_budget_blocked_count": 0,
+        # Future-aware penalty diagnostics (guarded profile)
+        "greedy_future_bridgeability_penalty_hits": 0,
+        "greedy_tail_underfill_risk_penalty_hits": 0,
+        "greedy_bridge_scarcity_penalty_hits": 0,
         # Dual-order small-roll reserve diagnostics
         "dual_orders_with_small_roll_option": 0,
         "dual_orders_reserved_from_big_roll": 0,
@@ -792,8 +1030,15 @@ def build_constructive_sequences(
             tpl_df = pd.DataFrame()
 
     # Build template edge graph
-    graph = TemplateEdgeGraph(orders_df, tpl_df, cfg)
+    # ---- Single Candidate Graph: reuse from pipeline if available ----
+    pre_built_cg = None
+    if isinstance(transition_pack, dict):
+        pre_built_cg = transition_pack.get("candidate_graph")
+    graph = TemplateEdgeGraph(orders_df, tpl_df, cfg, candidate_graph=pre_built_cg)
     graph._init_used_orders()
+
+    # Track single-build diagnostics in result
+    diagnostics["candidate_graph_source"] = graph.candidate_graph_source
     used_orders: set[str] = set()
     graph.set_used_orders(used_orders)
 
@@ -1419,6 +1664,9 @@ def build_constructive_sequences(
         f"final_dead_islands={diagnostics.get('final_dead_island_count', 0)}, "
         f"utilization={diagnostics['utilization_rate']:.2%}, "
         f"edge_policy={graph.edge_policy}, "
+        f"greedy_family_uses={graph.greedy_virtual_family_edge_uses}, "
+        f"greedy_family_rejects={graph.greedy_virtual_family_edge_rejects}, "
+        f"greedy_family_budget_blocked={graph.greedy_virtual_family_budget_blocked_count}, "
         f"accepted_direct={graph.accepted_direct_edge_count}, "
         f"accepted_real_bridge={graph.accepted_real_bridge_edge_count}, "
         f"accepted_virtual_family={graph.accepted_virtual_bridge_family_edge_count}, "
@@ -1463,6 +1711,16 @@ def build_constructive_sequences(
     diagnostics["accepted_real_bridge_edge_count"] = graph.accepted_real_bridge_edge_count
     diagnostics["accepted_virtual_bridge_family_edge_count"] = graph.accepted_virtual_bridge_family_edge_count
     diagnostics["constructive_edge_policy"] = graph.edge_policy
+    # Guarded family edge greedy diagnostics
+    diagnostics["greedy_virtual_family_edge_uses"] = getattr(graph, "greedy_virtual_family_edge_uses", 0)
+    diagnostics["greedy_virtual_family_edge_rejects"] = getattr(graph, "greedy_virtual_family_edge_rejects", 0)
+    diagnostics["greedy_virtual_family_budget_blocked_count"] = getattr(graph, "greedy_virtual_family_budget_blocked_count", 0)
+    diagnostics["greedy_virtual_family_edge_used_per_line"] = dict(getattr(graph, "family_edge_used_per_line", {}))
+    diagnostics["greedy_virtual_family_edge_used_per_segment"] = dict(getattr(graph, "family_edge_used_per_segment", {}))
+    # Future-aware penalty diagnostics (guarded profile only)
+    diagnostics["greedy_future_bridgeability_penalty_hits"] = getattr(graph, "greedy_future_bridgeability_penalty_hits", 0)
+    diagnostics["greedy_tail_underfill_risk_penalty_hits"] = getattr(graph, "greedy_tail_underfill_risk_penalty_hits", 0)
+    diagnostics["greedy_bridge_scarcity_penalty_hits"] = getattr(graph, "greedy_bridge_scarcity_penalty_hits", 0)
     diagnostics.update(graph.candidate_graph_diagnostics)
 
     return ConstructiveBuildResult(

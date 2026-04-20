@@ -57,6 +57,22 @@ class LocalInsertRequest:
         random_seed: Random seed for CP-SAT
         max_orders_in_subproblem: Hard cap on total orders in subproblem
             (if fixed + candidates exceeds this, the largest candidates are dropped)
+
+    Guarded virtual family request-level controls:
+        allow_guarded_virtual_family: If True, eligible VIRTUAL_BRIDGE_FAMILY_EDGE
+            arcs may enter the strict graph (on top of profile-level enable).
+            Defaults to False for backward compatibility.
+        virtual_family_budget_for_rebuild: Max number of family edges allowed in this
+            rebuild subproblem. 0 = no budget limit. Defaults to 0.
+        virtual_family_allowed_families: Family types allowed for this rebuild.
+            Empty list = all allowed (subject to other gates). Defaults to [].
+        virtual_family_max_bridge_count: Max bridge_count for allowed family edges.
+            0 = no limit. Defaults to 0.
+        prefer_guarded_virtual_family: If True, moderately reduce family penalty in
+            objective scoring (but never make family cheaper than real edges).
+            Used for family-repair-focused neighborhoods. Defaults to False.
+        guarded_virtual_family_reason: Human-readable reason for preferring family edges.
+            Used for diagnostics. Defaults to "".
     """
     line: str
     fixed_order_ids: List[str]
@@ -64,6 +80,13 @@ class LocalInsertRequest:
     time_limit_seconds: float = 5.0
     random_seed: int = 42
     max_orders_in_subproblem: int = 45
+    # Guarded virtual family request-level controls
+    allow_guarded_virtual_family: bool = False
+    virtual_family_budget_for_rebuild: int = 0
+    virtual_family_allowed_families: List[str] = field(default_factory=list)
+    virtual_family_max_bridge_count: int = 0
+    prefer_guarded_virtual_family: bool = False
+    guarded_virtual_family_reason: str = ""
 
 
 @dataclass
@@ -115,10 +138,21 @@ class _StrictTemplateGraph:
     Only edges that EXIST in the template DataFrame are included.
     No illegal edge creation, no fallback.
 
-    Bridge edge filtering (Route B):
+    Bridge edge filtering (Route RB / Route C):
+    - Route RB (mainline): VIRTUAL_BRIDGE_EDGE blocked, REAL_BRIDGE_EDGE allowed
+    - Route C (baseline): both VIRTUAL and REAL blocked, only DIRECT_EDGE allowed
     - If allow_virtual_bridge_edge_in_constructive is False, VIRTUAL_BRIDGE_EDGE arcs are blocked
     - If allow_real_bridge_edge_in_constructive is False, REAL_BRIDGE_EDGE arcs are blocked
     - DIRECT_EDGE is always allowed
+
+    Guarded virtual family (request-level control):
+    - Legacy VIRTUAL_BRIDGE_EDGE is ALWAYS blocked in guarded mode.
+    - VIRTUAL_BRIDGE_FAMILY_EDGE requires BOTH:
+        (a) Profile-level virtual_family_frontload_enabled = True
+        (b) Request-level allow_guarded_virtual_family = True
+        (c) Family in virtual_family_allowed_families (if non-empty)
+        (d) estimated_bridge_count_max <= virtual_family_max_bridge_count (if > 0)
+        (e) Rebuild budget not exhausted
     """
 
     def __init__(
@@ -127,10 +161,12 @@ class _StrictTemplateGraph:
         tpl_df: pd.DataFrame,
         cfg: PlannerConfig,
         line: str,
+        req: "LocalInsertRequest | None" = None,
     ):
         self.order_ids = order_ids
         self.line = line
         self.cfg = cfg
+        self.req = req
 
         # Map order_id -> index in subproblem
         self.idx_map: Dict[str, int] = {oid: i for i, oid in enumerate(order_ids)}
@@ -147,25 +183,53 @@ class _StrictTemplateGraph:
 
         # Arc filtering diagnostics
         self.virtual_bridge_arcs_blocked: int = 0
+        self.virtual_bridge_legacy_arcs_blocked: int = 0
         self.virtual_bridge_family_arcs_allowed: int = 0
         self.real_bridge_arcs_blocked: int = 0
         self.real_bridge_arcs_allowed: int = 0
         self.direct_arcs_allowed: int = 0
+        self.rebuild_guarded_virtual_family_allowed: bool = False
+        self.rebuild_virtual_family_candidate_count: int = 0
+        self.rebuild_virtual_family_arc_count: int = 0
+        self.rebuild_virtual_family_selected_count: int = 0
+        self.rebuild_virtual_family_budget_blocked_count: int = 0
+        # Request-level family budget tracking for THIS rebuild
+        self.rebuild_virtual_family_budget_for_rebuild: int = 0
+        self.rebuild_virtual_family_used_count: int = 0
 
-        # Determine edge policy string (Route C = direct_only)
+        # Request-level family controls (with defaults for backward compat)
+        self.req_allow_guarded_family: bool = getattr(req, "allow_guarded_virtual_family", False) if req else False
+        self.req_family_budget: int = int(getattr(req, "virtual_family_budget_for_rebuild", 0) if req else 0)
+        self.req_family_allowed: List[str] = list(getattr(req, "virtual_family_allowed_families", []) if req else [])
+        self.req_family_max_bridge: int = int(getattr(req, "virtual_family_max_bridge_count", 0) if req else 0)
+        # Family repair scoring preference (guarded profile)
+        self.req_prefer_guarded_family: bool = getattr(req, "prefer_guarded_virtual_family", False) if req else False
+        self.req_guarded_family_reason: str = str(getattr(req, "guarded_virtual_family_reason", "") if req else "")
+
+        # Determine edge policy string
         # Policy determines which arc types are allowed in local inserter:
-        #   direct_only           : DIRECT_EDGE only
-        #   direct_plus_real_bridge: DIRECT_EDGE + REAL_BRIDGE_EDGE
-        #   all_edges_allowed     : all three types (legacy virtual)
-        #   family_frontload      : DIRECT + REAL + VIRTUAL_BRIDGE_FAMILY_EDGE (future)
+        #   direct_only                          : DIRECT_EDGE only (Route C / baseline)
+        #   direct_plus_real_bridge              : DIRECT_EDGE + REAL_BRIDGE_EDGE (Route RB / mainline)
+        #   direct_plus_real_plus_guarded_family : DIRECT_EDGE + REAL_EDGE + eligible VIRTUAL_BRIDGE_FAMILY_EDGE (guarded)
+        #   all_edges_allowed                    : all three types (legacy/experimental)
+        #   family_frontload                     : DIRECT + REAL + VIRTUAL_BRIDGE_FAMILY_EDGE (old alias)
+        cfg_model = getattr(cfg, "model", None)
+        profile_family_enabled = (
+            getattr(cfg_model, "virtual_family_frontload_enabled", False)
+            if cfg_model else False
+        )
+        # Guarded family requires BOTH profile enable AND request-level allow
+        guarded_enabled = profile_family_enabled and self.req_allow_guarded_family
         if not self.allow_virtual and self.allow_real:
             self.edge_policy_used: str = "direct_plus_real_bridge"
         elif not self.allow_virtual and not self.allow_real:
             self.edge_policy_used = "direct_only"  # Route C: strictest mode
+        elif self.allow_virtual and self.allow_real and guarded_enabled:
+            self.edge_policy_used = "direct_plus_real_plus_guarded_family"
         elif self.allow_virtual and self.allow_real:
             self.edge_policy_used = "all_edges_allowed"
         elif self.allow_real:
-            self.edge_policy_used = "family_frontload"  # allow_virtual means family edge
+            self.edge_policy_used = "family_frontload"
         else:
             self.edge_policy_used = "virtual_only"
 
@@ -203,16 +267,75 @@ class _StrictTemplateGraph:
             is_virtual_family = (edge_type == "VIRTUAL_BRIDGE_FAMILY_EDGE")
             is_virtual_legacy = (edge_type == "VIRTUAL_BRIDGE_EDGE")
 
-            # ---- Bridge edge type filtering (Route B/C/Family) ----
-            # VIRTUAL_BRIDGE_EDGE and VIRTUAL_BRIDGE_FAMILY_EDGE are both
-            # controlled by allow_virtual flag (consistent with constructive builder)
-            is_virtual = is_virtual_legacy or is_virtual_family
-            if is_virtual and not self.allow_virtual:
+            # ---- Bridge edge type filtering (Route RB / Route C / guarded family) ----
+            # Guarded family policy: legacy VIRTUAL_BRIDGE_EDGE is ALWAYS blocked
+            if is_virtual_legacy:
+                self.virtual_bridge_legacy_arcs_blocked += 1
                 self.virtual_bridge_arcs_blocked += 1
-                continue  # Skip virtual bridge edge - do not create arc
+                continue  # Legacy virtual: always blocked in guarded mode
+
+            if is_virtual_family and not self.allow_virtual:
+                self.virtual_bridge_arcs_blocked += 1
+                continue  # Skip family edge if allow_virtual=False
+
             if edge_type == "REAL_BRIDGE_EDGE" and not self.allow_real:
                 self.real_bridge_arcs_blocked += 1
-                continue  # Skip real bridge edge - do not create arc
+                continue  # Skip real bridge edge
+
+            # Guarded family: apply request-level + profile-level eligibility checks
+            if is_virtual_family and self.edge_policy_used == "direct_plus_real_plus_guarded_family":
+                from aps_cp_sat.model.candidate_graph_types import is_virtual_family_frontload_eligible
+                # Build a minimal CandidateEdge from row for eligibility check
+                from aps_cp_sat.model.candidate_graph_types import CandidateEdge as _CE
+                bridge_family = str(row.get("bridge_family", "MIXED")).upper()
+                if bridge_family not in {"WIDTH_GROUP", "THICKNESS", "GROUP_TRANSITION", "MIXED"}:
+                    bridge_family = "MIXED"
+                estimated_count_min = int(row.get("estimated_bridge_count_min", bridge_count) or bridge_count)
+                estimated_count_max = int(row.get("estimated_bridge_count_max", bridge_count) or bridge_count)
+                requires_pc = bool(row.get("requires_pc_transition", False))
+                explain_payload = {
+                    "bridge_family": bridge_family,
+                    "estimated_bridge_count_min": estimated_count_min,
+                    "estimated_bridge_count_max": estimated_count_max,
+                    "requires_pc_transition": requires_pc,
+                    "virtual_tons": float(row.get("virtual_tons", 0.0) or 0.0),
+                }
+                edge_for_check = _CE(
+                    from_order_id=str(row.get("from_order_id", "")),
+                    to_order_id=str(row.get("to_order_id", "")),
+                    line=str(row.get("line", "big_roll")),
+                    edge_type=edge_type,
+                    bridge_family=bridge_family,
+                    estimated_bridge_count=bridge_count,
+                    estimated_bridge_count_min=estimated_count_min,
+                    estimated_bridge_count_max=estimated_count_max,
+                    requires_pc_transition=requires_pc,
+                    metadata={"explain_payload": explain_payload},
+                )
+                eligible, reason = is_virtual_family_frontload_eligible(edge_for_check, cfg, None)
+                if not eligible:
+                    self.virtual_bridge_arcs_blocked += 1
+                    continue  # Skip ineligible family edge
+
+                # ---- Request-level family filtering ----
+                # (a) Family allowlist
+                if self.req_family_allowed and bridge_family not in self.req_family_allowed:
+                    self.virtual_bridge_arcs_blocked += 1
+                    continue
+                # (b) Max bridge count gate
+                if self.req_family_max_bridge > 0 and estimated_count_max > self.req_family_max_bridge:
+                    self.virtual_bridge_arcs_blocked += 1
+                    continue
+                # (c) Rebuild budget gate
+                if self.req_family_budget > 0 and self.rebuild_virtual_family_used_count >= self.req_family_budget:
+                    self.rebuild_virtual_family_budget_blocked_count += 1
+                    self.virtual_bridge_arcs_blocked += 1
+                    continue
+
+                self.rebuild_guarded_virtual_family_allowed = True
+                self.rebuild_virtual_family_candidate_count += 1
+                self.rebuild_virtual_family_arc_count += 1
+
             # Track allowed edge counts for diagnostics
             if edge_type == "DIRECT_EDGE":
                 self.direct_arcs_allowed += 1
@@ -227,7 +350,7 @@ class _StrictTemplateGraph:
                 to_idx=to_idx,
                 cost=cost,
                 bridge_count=bridge_count,
-                is_virtual_bridge=is_virtual,
+                is_virtual_bridge=is_virtual_family,
                 tpl_row=dict(row),
             )
             self.edges.append(edge_info)
@@ -260,7 +383,15 @@ class _StrictTemplateGraph:
             "virtual_bridge_family_arcs_allowed": int(self.virtual_bridge_family_arcs_allowed),
             "real_bridge_arcs_blocked": int(self.real_bridge_arcs_blocked),
             "virtual_bridge_arcs_blocked": int(self.virtual_bridge_arcs_blocked),
+            "virtual_bridge_legacy_arcs_blocked": int(self.virtual_bridge_legacy_arcs_blocked),
             "edge_policy_used": str(self.edge_policy_used),
+            "rebuild_guarded_virtual_family_allowed": bool(self.rebuild_guarded_virtual_family_allowed),
+            "rebuild_virtual_family_candidate_count": int(self.rebuild_virtual_family_candidate_count),
+            "rebuild_virtual_family_arc_count": int(self.rebuild_virtual_family_arc_count),
+            "rebuild_virtual_family_selected_count": int(self.rebuild_virtual_family_selected_count),
+            "rebuild_virtual_family_budget_for_rebuild": int(self.req_family_budget),
+            "rebuild_virtual_family_budget_blocked_count": int(self.rebuild_virtual_family_budget_blocked_count),
+            "rebuild_virtual_family_used_count": int(self.rebuild_virtual_family_used_count),
         }
 
 
@@ -607,7 +738,7 @@ def solve_local_insertion_subproblem(
     if not isinstance(tpl_df, pd.DataFrame):
         tpl_df = pd.DataFrame()
 
-    graph = _StrictTemplateGraph(subproblem_ids, tpl_df, cfg, req.line)
+    graph = _StrictTemplateGraph(subproblem_ids, tpl_df, cfg, req.line, req=req)
     graph_diag = graph.diagnostics()
 
     # Check feasibility: at minimum, need at least one edge from fixed backbone
@@ -1032,6 +1163,21 @@ def solve_local_insertion_subproblem(
         except Exception:
             vb_count = 0
 
+        # Count selected family edges from the solution
+        try:
+            for (i, j), var in real_arc_vars.items():
+                if solver.Value(var) >= 1:
+                    edge_info = graph.get_edge_info(i, j)
+                    if edge_info is not None and edge_info.is_virtual_bridge:
+                        # Check if it's a family edge from tpl_row
+                        tpl_row = edge_info.tpl_row
+                        edge_type = str(tpl_row.get("edge_type", "") or "")
+                        if edge_type == "VIRTUAL_BRIDGE_FAMILY_EDGE":
+                            graph.rebuild_virtual_family_selected_count += 1
+                            graph.rebuild_virtual_family_used_count += 1
+        except Exception:
+            pass
+
         try:
             total_cost = int(solver.Value(cost_sum))
         except Exception:
@@ -1091,6 +1237,15 @@ def solve_local_insertion_subproblem(
             "real_bridge_arcs_allowed": graph.real_bridge_arcs_allowed,
             "direct_arcs_allowed": graph.direct_arcs_allowed,
             "edge_policy_used": graph.edge_policy_used,
+            "rebuild_guarded_virtual_family_allowed": graph.rebuild_guarded_virtual_family_allowed,
+            "rebuild_virtual_family_candidate_count": graph.rebuild_virtual_family_candidate_count,
+            "rebuild_virtual_family_arc_count": graph.rebuild_virtual_family_arc_count,
+            "rebuild_virtual_family_selected_count": graph.rebuild_virtual_family_selected_count,
+            "rebuild_virtual_family_budget_for_rebuild": graph.req_family_budget,
+            "rebuild_virtual_family_budget_blocked_count": graph.rebuild_virtual_family_budget_blocked_count,
+            "rebuild_virtual_family_used_count": graph.rebuild_virtual_family_used_count,
+            "rebuild_guarded_virtual_family_preferred": int(graph.req_prefer_guarded_family),
+            "rebuild_guarded_virtual_family_reason": str(graph.req_guarded_family_reason),
             **graph_diag,
         }
 
