@@ -41,15 +41,77 @@ class BlockALNSResult:
     # Per-neighborhood diagnostics
     neighborhood_diag: Dict[str, int] = field(default_factory=dict)
 
+    # Scoring diagnostics
+    plan_score_diag: Dict[str, Any] = field(default_factory=dict)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "iterations_attempted": self.iterations_attempted,
             "iterations_accepted": self.iterations_accepted,
             "total_runtime_seconds": self.total_runtime_seconds,
             "neighborhood_diag": dict(self.neighborhood_diag),
+            "plan_score_diag": dict(self.plan_score_diag),
             "final_master": self.final_master_result.to_dict(),
             "final_realization": self.final_realization_result.to_dict(),
         }
+
+
+# ----------------------------------------------------------------------
+# Scoring Function
+# ----------------------------------------------------------------------
+
+def evaluate_block_first_plan(
+    master_result: BlockMasterResult,
+    realization_result: BlockRealizationResult,
+    cfg: PlannerConfig,
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Evaluates the real schedule produced by the block-first plan.
+    Returns (score, diagnostics_dict).
+    """
+    score = 0.0
+    diag = {
+        "scoring_basis": "realized_schedule",
+        "selected_orders_count": len(master_result.selected_order_ids),
+    }
+
+    # Extract realized metrics
+    if realization_result.realized_schedule_df is not None and not realization_result.realized_schedule_df.empty:
+        df = realization_result.realized_schedule_df
+        scheduled_orders = int(df["order_id"].nunique()) if "order_id" in df.columns else len(df)
+        scheduled_tons = float(df["tons"].sum()) if "tons" in df.columns else 0.0
+    else:
+        scheduled_orders = 0
+        scheduled_tons = 0.0
+
+    diag["scheduled_orders_realized"] = scheduled_orders
+    diag["scheduled_tons_realized"] = scheduled_tons
+
+    # Positive items
+    score += scheduled_orders * 100.0
+    score += scheduled_tons * 0.1
+
+    # Negative items
+    slot_diag = master_result.slot_diag
+    underfilled_slots = slot_diag.get("underfilled_slot_count", 0)
+    diag["underfilled_slots"] = underfilled_slots
+    score -= underfilled_slots * 500.0
+
+    unassembled_blocks = slot_diag.get("unassembled_block_count", 0)
+    diag["unassembled_blocks"] = unassembled_blocks
+    score -= unassembled_blocks * 200.0
+
+    failed_boundaries = realization_result.block_realization_diag.get("failed_block_boundary_count", 0)
+    diag["failed_boundaries"] = failed_boundaries
+    score -= failed_boundaries * 1000.0
+
+    # Minor static items to guide search when major factors tie
+    avg_quality = master_result.diagnostics.get("avg_block_quality_in_selected", 0.0)
+    diag["avg_quality"] = avg_quality
+    score += avg_quality * 0.5
+
+    diag["final_score"] = score
+    return score, diag
 
 
 # ----------------------------------------------------------------------
@@ -58,41 +120,43 @@ class BlockALNSResult:
 
 
 def _neighborhood_swap(
-    selected_blocks: List[CandidateBlock],
+    master_result: BlockMasterResult,
     orders_by_id: Dict[str, Dict],
     rng: random.Random,
-) -> Tuple[List[CandidateBlock], str]:
+) -> Tuple[List[CandidateBlock], Dict[str, List[str]], str]:
     """
     BLOCK_SWAP: exchange positions of two blocks on the same line.
-    Returns (modified_blocks, neighborhood_name).
+    Returns (modified_blocks, preferred_block_order_by_line, neighborhood_name).
     """
-    by_line: Dict[str, List[CandidateBlock]] = {}
-    for b in selected_blocks:
-        by_line.setdefault(b.line, []).append(b)
+    selected_blocks = list(master_result.selected_blocks)
+    block_order = {k: list(v) for k, v in master_result.block_order_by_line.items()}
 
-    for line, blocks in by_line.items():
-        if len(blocks) < 2:
+    for line, b_ids in block_order.items():
+        if len(b_ids) < 2:
             continue
-        i, j = rng.sample(range(len(blocks)), 2)
-        # Swap: just swap the block IDs to change quality ordering
-        blocks[i], blocks[j] = blocks[j], blocks[i]
-        return list(selected_blocks), "BLOCK_SWAP"
+        i, j = rng.sample(range(len(b_ids)), 2)
+        # Swap block IDs in the line's order
+        b_ids[i], b_ids[j] = b_ids[j], b_ids[i]
+        return selected_blocks, block_order, "BLOCK_SWAP"
 
-    return list(selected_blocks), "BLOCK_SWAP"
+    return selected_blocks, block_order, "BLOCK_SWAP"
 
 
 def _neighborhood_replace(
-    selected_blocks: List[CandidateBlock],
+    master_result: BlockMasterResult,
     rejected_pool: List[CandidateBlock],
     orders_df: pd.DataFrame,
     cfg: PlannerConfig,
     rng: random.Random,
-) -> Tuple[List[CandidateBlock], str]:
+) -> Tuple[List[CandidateBlock], Dict[str, List[str]], str]:
     """
     BLOCK_REPLACE: replace a selected block with a rejected block.
     """
+    selected_blocks = list(master_result.selected_blocks)
+    block_order = {k: list(v) for k, v in master_result.block_order_by_line.items()}
+
     if not rejected_pool:
-        return list(selected_blocks), "BLOCK_REPLACE"
+        return selected_blocks, block_order, "BLOCK_REPLACE"
 
     # Try to replace the lowest-quality selected block
     sorted_selected = sorted(selected_blocks, key=lambda b: b.block_quality_score)
@@ -109,13 +173,22 @@ def _neighborhood_replace(
         if r.line == worst.line and not any(oid in used_orders for oid in r.order_ids)
     ]
     if not candidates:
-        return list(selected_blocks), "BLOCK_REPLACE"
+        return selected_blocks, block_order, "BLOCK_REPLACE"
 
     candidates.sort(key=lambda b: b.block_quality_score, reverse=True)
     replacement = candidates[0]
 
     result = [b if b is not worst else replacement for b in selected_blocks]
-    return result, "BLOCK_REPLACE"
+    
+    # Update block order
+    if worst.line in block_order:
+        try:
+            idx = block_order[worst.line].index(worst.block_id)
+            block_order[worst.line][idx] = replacement.block_id
+        except ValueError:
+            pass
+
+    return result, block_order, "BLOCK_REPLACE"
 
 
 def _neighborhood_split(
@@ -472,25 +545,18 @@ def run_block_alns(
     orders_by_id = {str(row.get("order_id", "")): dict(row) for _, row in orders_df.iterrows()}
 
     # Current best state
-    current_blocks = list(initial_master_result.selected_blocks)
-    current_score = (
-        sum(b.block_quality_score for b in current_blocks)
-        - sum(b.underfill_risk_score * 10 for b in current_blocks)
-        - sum(b.bridge_dependency_score * 5 for b in current_blocks)
-    )
+    current_master_result = initial_master_result
+    current_realization_result = initial_realization_result
+    current_score, current_diag = evaluate_block_first_plan(current_master_result, current_realization_result, cfg)
 
-    best_blocks = list(current_blocks)
+    best_master_result = current_master_result
+    best_realization_result = current_realization_result
     best_score = current_score
+    best_diag = current_diag
 
     nbd_diag = {n: 0 for n in enabled}
     attempts = 0
     accepted = 0
-
-    # Create pool with current blocks for re-running master
-    temp_pool = CandidateBlockPool(
-        blocks=list(current_blocks),
-        diagnostics=initial_pool.diagnostics,
-    )
 
     for rnd in range(rounds):
         # Pick random neighborhood
@@ -499,79 +565,81 @@ def run_block_alns(
         attempts += 1
 
         try:
+            trial_blocks = list(current_master_result.selected_blocks)
+            preferred_order = None
+
             # Apply neighborhood
             if nbd == "BLOCK_SWAP":
-                trial_blocks, _ = _neighborhood_swap(current_blocks, orders_by_id, rng)
+                trial_blocks, preferred_order, _ = _neighborhood_swap(current_master_result, orders_by_id, rng)
             elif nbd == "BLOCK_REPLACE":
-                trial_blocks, _ = _neighborhood_replace(
-                    current_blocks, list(initial_master_result.rejected_blocks),
+                trial_blocks, preferred_order, _ = _neighborhood_replace(
+                    current_master_result, list(initial_master_result.rejected_blocks),
                     orders_df, cfg, rng,
                 )
             elif nbd == "BLOCK_SPLIT":
-                trial_blocks, _ = _neighborhood_split(current_blocks, orders_by_id, cfg, rng)
+                trial_blocks, _ = _neighborhood_split(trial_blocks, orders_by_id, cfg, rng)
             elif nbd == "BLOCK_MERGE":
-                trial_blocks, _ = _neighborhood_merge(current_blocks, orders_by_id, cfg, rng)
+                trial_blocks, _ = _neighborhood_merge(trial_blocks, orders_by_id, cfg, rng)
             elif nbd == "BLOCK_BOUNDARY_REBALANCE":
                 trial_blocks, _ = _neighborhood_boundary_rebalance(
-                    current_blocks, orders_by_id, cfg, rng,
+                    trial_blocks, orders_by_id, cfg, rng,
                 )
             elif nbd == "BLOCK_INTERNAL_REBUILD":
                 trial_blocks, _ = _neighborhood_internal_rebuild(
-                    current_blocks, orders_df, transition_pack, cfg, rng,
+                    trial_blocks, orders_df, transition_pack, cfg, rng,
                 )
-            else:
-                trial_blocks = list(current_blocks)
 
-            # Score trial
-            trial_score = (
-                sum(b.block_quality_score for b in trial_blocks)
-                - sum(b.underfill_risk_score * 10 for b in trial_blocks)
-                - sum(b.bridge_dependency_score * 5 for b in trial_blocks)
+            # Re-evaluate the trial
+            temp_pool = CandidateBlockPool(
+                blocks=list(initial_pool.blocks) + [b for b in trial_blocks if b not in initial_pool.blocks],
+                diagnostics=initial_pool.diagnostics,
             )
+
+            trial_master_result = solve_block_master(
+                pool=temp_pool,
+                orders_df=orders_df,
+                cfg=cfg,
+                random_seed=random_seed + rnd,
+                preferred_block_order_by_line=preferred_order,
+            )
+
+            trial_realization_result = realize_selected_blocks(
+                master_result=trial_master_result,
+                orders_df=orders_df,
+                transition_pack=transition_pack,
+                cfg=cfg,
+                random_seed=random_seed + rnd,
+            )
+
+            # Score trial based on actual schedule
+            trial_score, trial_diag = evaluate_block_first_plan(trial_master_result, trial_realization_result, cfg)
 
             delta = trial_score - current_score
 
             if delta > accept_threshold:
-                current_blocks = trial_blocks
+                current_master_result = trial_master_result
+                current_realization_result = trial_realization_result
                 current_score = trial_score
                 accepted += 1
                 if trial_score > best_score:
-                    best_blocks = list(trial_blocks)
+                    best_master_result = trial_master_result
+                    best_realization_result = trial_realization_result
                     best_score = trial_score
+                    best_diag = trial_diag
 
         except Exception:
             # Skip failed neighborhood without crashing
             continue
 
-    # Rebuild master result from best blocks
-    temp_pool = CandidateBlockPool(
-        blocks=list(initial_pool.blocks) + [b for b in best_blocks if b not in initial_pool.blocks],
-        diagnostics=initial_pool.diagnostics,
-    )
-
-    final_master = solve_block_master(
-        pool=temp_pool,
-        orders_df=orders_df,
-        cfg=cfg,
-        random_seed=random_seed,
-    )
-
-    final_realization = realize_selected_blocks(
-        master_result=final_master,
-        orders_df=orders_df,
-        transition_pack=transition_pack,
-        cfg=cfg,
-        random_seed=random_seed,
-    )
-
     nbd_diag["block_alns_rounds_attempted"] = attempts
     nbd_diag["block_alns_rounds_accepted"] = accepted
 
     return BlockALNSResult(
-        final_master_result=final_master,
-        final_realization_result=final_realization,
+        final_master_result=best_master_result,
+        final_realization_result=best_realization_result,
         iterations_attempted=attempts,
         iterations_accepted=accepted,
         total_runtime_seconds=time.perf_counter() - t0,
         neighborhood_diag=nbd_diag,
+        plan_score_diag=best_diag,
     )

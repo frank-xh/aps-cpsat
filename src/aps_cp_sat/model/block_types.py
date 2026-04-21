@@ -233,3 +233,34 @@ class CandidateBlockPool:
             "orders_input_count": self.orders_input_count,
             "lines_covered": list(self.lines_covered),
         }
+
+
+@dataclass
+class BlockCampaignSlot:
+    """
+    A minimal semantic unit representing a slot/campaign built from assembled blocks.
+    """
+    line: str
+    slot_no: int
+    campaign_id: str
+    block_ids: List[str]
+    total_tons: float
+    gap_to_min_tons: float
+    remaining_to_max_tons: float
+    is_underfilled: bool
+    head_block_id: str
+    tail_block_id: str
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "line": self.line,
+            "slot_no": self.slot_no,
+            "campaign_id": self.campaign_id,
+            "block_ids": list(self.block_ids),
+            "total_tons": self.total_tons,
+            "gap_to_min_tons": self.gap_to_min_tons,
+            "remaining_to_max_tons": self.remaining_to_max_tons,
+            "is_underfilled": self.is_underfilled,
+            "head_block_id": self.head_block_id,
+            "tail_block_id": self.tail_block_id,
+        }

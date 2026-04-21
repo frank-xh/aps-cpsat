@@ -163,10 +163,10 @@ class ColdRollingPipeline:
         # ---- Allowed ALNS profiles (current production paths only) ----
         # Profile semantics:
         #   - constructive_lns_search: Production mainline (Route RB / direct_plus_real_bridge)
-        #   - constructive_lns_real_bridge_frontload: Alias of constructive_lns_search
-        #   - constructive_lns_direct_only_baseline: Regression baseline (Route C / direct_only)
-        #   - constructive_lns_virtual_guarded_frontload: Guarded virtual family experiment line
-        #   - block_first_guarded_search: Block-first experiment line (block → block master → realize → block ALNS)
+        #   - constructive_lns_real_bridge_frontload: Alias of mainline (Route RB)
+        #   - constructive_lns_direct_only_baseline: Diagnostic baseline (Route C)
+        #   - constructive_lns_virtual_guarded_frontload: Guarded virtual family experiment
+        #   - block_first_guarded_search: Block-first experiment line
         # NOTE: constructive_lns_bridge_family_master / debug_acceptance 已移出默认主路径，
         # 保留于 compat/experimental_disabled/ 或 debug-only，不进入默认生产守卫。
         _ALLOWED_ALNS_PROFILES = {
@@ -199,6 +199,28 @@ class ColdRollingPipeline:
             f"[APS][PROFILE_GUARD] illegal profile: {requested_profile}; "
             f"Only {sorted(_ALLOWED_ALNS_PROFILES)} are allowed in current engineering mode"
         )
+
+    def _assert_block_first_result(self, result: ColdRollingResult) -> None:
+        """
+        Hard verification that we ACTUALLY ran block_first
+        """
+        cfg = result.config
+        profile = getattr(cfg.model, "profile_name", "")
+        if profile != "block_first_guarded_search":
+            return
+
+        meta = result.engine_meta or {}
+        
+        actual_profile = meta.get("profile_name", "")
+        solver_path = meta.get("solver_path", "")
+        main_path = meta.get("main_path", "")
+        
+        if actual_profile != "block_first_guarded_search":
+            raise RuntimeError(f"[APS][block_first_verify] profile_name mismatch. Expected block_first_guarded_search, got {actual_profile}")
+        if solver_path != "block_first":
+            raise RuntimeError(f"[APS][block_first_verify] solver_path != block_first. Got {solver_path}")
+        if main_path != "block_first":
+            raise RuntimeError(f"[APS][block_first_verify] main_path != block_first. Got {main_path}")
 
     # =========================================================================
     # UNIFIED_ENGINE_META_FIELDS: unified口径的元数据字段
@@ -1042,1089 +1064,189 @@ class ColdRollingPipeline:
             "repair_bridge_filtered_ton_split_not_found": int(em.get("repair_bridge_filtered_ton_split_not_found", 0) or 0),
             "repair_bridge_filtered_ton_rescue_no_gain": int(em.get("repair_bridge_filtered_ton_rescue_no_gain", 0) or 0),
             "repair_bridge_filtered_ton_rescue_impossible": int(em.get("repair_bridge_filtered_ton_rescue_impossible", 0) or 0),
+            "repair_bridge_ton_rescue_pair_fail_width": int(em.get("repair_bridge_ton_rescue_pair_fail_width", 0) or 0),
+            "repair_bridge_ton_rescue_pair_fail_thickness": int(em.get("repair_bridge_ton_rescue_pair_fail_thickness", 0) or 0),
+            "repair_bridge_ton_rescue_pair_fail_temp": int(em.get("repair_bridge_ton_rescue_pair_fail_temp", 0) or 0),
+            "repair_bridge_ton_rescue_pair_fail_group": int(em.get("repair_bridge_ton_rescue_pair_fail_group", 0) or 0),
+            "repair_bridge_ton_rescue_pair_fail_template": int(em.get("repair_bridge_ton_rescue_pair_fail_template", 0) or 0),
+            "repair_bridge_ton_rescue_pair_fail_multi": int(em.get("repair_bridge_ton_rescue_pair_fail_multi", 0) or 0),
+            "repair_bridge_ton_rescue_pair_fail_unknown": int(em.get("repair_bridge_ton_rescue_pair_fail_unknown", 0) or 0),
             "bridgeability_route_suggestion": str(em.get("bridgeability_route_suggestion", "")),
             "bridgeability_census": em.get("bridgeability_census", {}),
             "bridgeability_census_items": em.get("bridgeability_census_items", []),
             # ---- Legacy virtual pilot: 已降级为单一总字段 ----
-            # 旧有 ~45 个 virtual_pilot 细项字段已从此处移除；只保留总字段
+            # 旧有 ~45 个 virtual_pilot 细项字段已从此处移除
             "conservative_apply_attempt_count": int(em.get("conservative_apply_attempt_count", 0) or 0),
             "conservative_apply_success_count": int(em.get("conservative_apply_success_count", 0) or 0),
             "conservative_apply_reject_count": int(em.get("conservative_apply_reject_count", 0) or 0),
+            "repair_bridge_pack_type": str(em.get("repair_bridge_pack_type", "")),
+            "repair_bridge_pack_keys": em.get("repair_bridge_pack_keys", []),
+            "repair_bridge_pack_line_keys": em.get("repair_bridge_pack_line_keys", []),
             "repair_only_real_bridge_used_segments": int(em.get("repair_only_real_bridge_used_segments", 0) or 0),
             "repair_only_real_bridge_used_orders": int(em.get("repair_only_real_bridge_used_orders", 0) or 0),
             "repair_only_real_bridge_not_entered_reason": str(em.get("repair_only_real_bridge_not_entered_reason", "")),
+            "underfilled_reconstruction_seconds": float(em.get("underfilled_reconstruction_seconds", 0.0) or 0.0),
             "repair_only_real_bridge_seconds": float(em.get("repair_only_real_bridge_seconds", 0.0) or 0.0),
         }
-
-        diagnostics["rules"] = {
-            spec.key.value: spec.zh_name
-            for spec in RULE_REGISTRY.export_visible_specs()
-        }
-        diagnostics["rule_semantics"] = {
-            "line_compatibility": "HARD",
-            "direct_transition_feasibility": "HARD",
-            "campaign_ton_max": "HARD",
-            "campaign_ton_min": "HARD",  # Changed from STRONG_SOFT to HARD
-            "unassigned_real_orders": "STRONG_SOFT",
-            "virtual_slab_usage_ratio": "STRONG_SOFT",
-            "reverse_width_count_total": "HARD",
-        }
-        if isinstance(em.get("joint_estimates"), dict) and em.get("joint_estimates"):
-            diagnostics["joint_estimates"] = dict(em["joint_estimates"])
-        if isinstance(em.get("feasibility_evidence"), dict) and em.get("feasibility_evidence"):
-            diagnostics["feasibility_evidence"] = dict(em["feasibility_evidence"])
-        if isinstance(em.get("slot_route_details"), list) and em.get("slot_route_details"):
-            diagnostics["slot_route_details"] = {f"slot_{idx}": item for idx, item in enumerate(em["slot_route_details"], start=1)}
-
-        raw_fail = em.get("failure_diagnostics")
-        if isinstance(raw_fail, dict) and raw_fail:
-            diagnostics["failure"] = raw_fail
-        template_debug = diagnostics.get("template", {})
-        known_template_seconds = float(template_debug.get("build_debug.__all__.preprocess_seconds", 0.0) or 0.0)
-        known_template_seconds += float(template_debug.get("build_debug.__all__.line_partition_seconds", 0.0) or 0.0)
-        known_template_seconds += float(template_debug.get("build_debug.__all__.template_pair_scan_seconds", 0.0) or 0.0)
-        known_template_seconds += float(template_debug.get("build_debug.__all__.bridge_check_seconds", 0.0) or 0.0)
-        known_template_seconds += float(template_debug.get("build_debug.__all__.template_prune_seconds", 0.0) or 0.0)
-        known_template_seconds += float(template_debug.get("build_debug.__all__.transition_pack_build_seconds", 0.0) or 0.0)
-        known_template_seconds += float(template_debug.get("build_debug.__all__.diagnostics_build_seconds", 0.0) or 0.0)
-        total_run_seconds = float(diagnostics.get("fallback", {}).get("total_run_seconds", 0.0) or 0.0)
-        accounted = known_template_seconds
-        accounted += float(diagnostics.get("fallback", {}).get("joint_master_seconds", 0.0) or 0.0)
-        accounted += float(diagnostics.get("fallback", {}).get("local_router_seconds", 0.0) or 0.0)
-        accounted += float(diagnostics.get("fallback", {}).get("fallback_total_seconds", 0.0) or 0.0)
-        ratio = float(accounted / max(1e-9, total_run_seconds)) if total_run_seconds > 0 else 0.0
-        diagnostics["fallback"]["timing_accounted_ratio"] = round(ratio, 4)
-        diagnostics["fallback"]["timing_gap_detected"] = bool(total_run_seconds > 0 and ratio < 0.85)
-        if diagnostics["fallback"]["timing_gap_detected"]:
-            diagnostics["fallback"]["timing_gap_hint"] = "unaccounted_runtime_outside_recorded_template_build_and_solve_stages"
-        return diagnostics
-
-    @staticmethod
-    def _evaluate_partial_acceptance(result: ColdRollingResult, orders_df: pd.DataFrame, validation_summary: dict | None = None) -> dict:
-        """
-        Evaluate if PARTIAL_SCHEDULE_WITH_DROPS can be accepted.
-
-        HARD RULE: Only accept partial results when ALL hard violations are ZERO.
-        This includes:
-        - campaign_ton_min_violation_count = 0 (slot tons >= 700)
-        - campaign_ton_max_violation_count = 0 (slot tons <= 2000)
-        - campaign_ton_hard_violation_count_total = 0
-        - direct_reverse_step_violation_count = 0
-        - virtual_attach_reverse_violation_count = 0
-        - period_reverse_count_violation_count = 0
-        - invalid_virtual_spec_count = 0
-        - bridge_count_violation_count = 0
-        - hard_violation_count_total = 0
-        """
-        dropped_df = result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else pd.DataFrame()
-        schedule_df = result.schedule_df if isinstance(result.schedule_df, pd.DataFrame) else pd.DataFrame()
-        # 按 unique order_id 统计 dropped/scheduled/total（dropped_df 中可能存在重复订单行）
-        total_orders = int(orders_df["order_id"].nunique()) if isinstance(orders_df, pd.DataFrame) and "order_id" in orders_df.columns else int(len(orders_df))
-        total_tons = float(orders_df["tons"].sum()) if isinstance(orders_df, pd.DataFrame) and "tons" in orders_df.columns else 0.0
-        dropped_order_count = int(dropped_df["order_id"].nunique()) if not dropped_df.empty and "order_id" in dropped_df.columns else int(len(dropped_df))
-        dropped_row_count = int(len(dropped_df))
-        dropped_tons = float(dropped_df["tons"].sum()) if "tons" in dropped_df.columns and not dropped_df.empty else 0.0
-        real_sched = schedule_df[~schedule_df["is_virtual"]] if isinstance(schedule_df, pd.DataFrame) and "is_virtual" in schedule_df.columns else schedule_df
-        scheduled_orders = int(real_sched["order_id"].nunique()) if isinstance(real_sched, pd.DataFrame) and not real_sched.empty and "order_id" in real_sched.columns else int(len(real_sched))
-        scheduled_tons = float(real_sched["tons"].sum()) if isinstance(real_sched, pd.DataFrame) and "tons" in real_sched.columns else 0.0
-        drop_ratio = float(dropped_order_count / max(1, total_orders))
-        drop_tons_ratio = float(dropped_tons / max(1e-9, total_tons)) if total_tons > 0 else 0.0
-        cfg = result.config.model
-
-        # Check hard violations from validation summary
-        vs = validation_summary or {}
-        hard_violation_count_total = int(vs.get("hard_violation_count_total", 0))
-        campaign_ton_hard_violation_count_total = int(vs.get("campaign_ton_hard_violation_count_total", 0))
-        campaign_ton_min_violation_count = int(vs.get("campaign_ton_min_violation_count", 0))
-        campaign_ton_max_violation_count = int(vs.get("campaign_ton_max_violation_count", 0))
-        direct_reverse_step_violation_count = int(vs.get("direct_reverse_step_violation_count", 0))
-        virtual_attach_reverse_violation_count = int(vs.get("virtual_attach_reverse_violation_count", 0))
-        period_reverse_count_violation_count = int(vs.get("period_reverse_count_violation_count", 0))
-        invalid_virtual_spec_count = int(vs.get("invalid_virtual_spec_count", 0))
-        bridge_count_violation_count = int(vs.get("bridge_count_violation_count", 0))
-
-        # HARD RULE: all hard violations must be zero
-        hard_violations_zero = (
-            hard_violation_count_total == 0
-            and campaign_ton_hard_violation_count_total == 0
-            and campaign_ton_min_violation_count == 0
-            and campaign_ton_max_violation_count == 0
-            and direct_reverse_step_violation_count == 0
-            and virtual_attach_reverse_violation_count == 0
-            and period_reverse_count_violation_count == 0
-            and invalid_virtual_spec_count == 0
-            and bridge_count_violation_count == 0
-        )
-
-        # Soft threshold checks
-        soft_threshold_passed = (
-            drop_ratio <= float(cfg.max_drop_ratio_for_partial)
-            and drop_tons_ratio <= float(cfg.max_drop_tons_ratio_for_partial)
-            and scheduled_orders >= int(cfg.min_scheduled_orders_for_partial)
-            and scheduled_tons >= float(cfg.min_scheduled_tons_for_partial)
-        )
-
-        # Combined: must have dropped orders, pass soft thresholds, AND have zero hard violations
-        passed = (
-            dropped_order_count > 0
-            and soft_threshold_passed
-            and hard_violations_zero
-        )
-
-        # Build block reason if not passed
-        block_reason = ""
-        if dropped_order_count == 0:
-            block_reason = "NO_DROPPED_ORDERS"
-        elif not soft_threshold_passed:
-            block_reason = "SOFT_THRESHOLD_NOT_MET"
-        elif not hard_violations_zero:
-            if hard_violation_count_total > 0:
-                block_reason = f"HARD_VIOLATIONS_EXIST:{hard_violation_count_total}"
-            elif campaign_ton_hard_violation_count_total > 0:
-                block_reason = f"CAMPAIGN_TON_VIOLATION:{campaign_ton_hard_violation_count_total}"
-            elif direct_reverse_step_violation_count > 0:
-                block_reason = f"DIRECT_REVERSE_VIOLATION:{direct_reverse_step_violation_count}"
-            elif virtual_attach_reverse_violation_count > 0:
-                block_reason = f"VIRTUAL_ATTACH_REVERSE_VIOLATION:{virtual_attach_reverse_violation_count}"
-            elif period_reverse_count_violation_count > 0:
-                block_reason = f"PERIOD_REVERSE_VIOLATION:{period_reverse_count_violation_count}"
-            elif invalid_virtual_spec_count > 0:
-                block_reason = f"INVALID_VIRTUAL_SPEC:{invalid_virtual_spec_count}"
+        for _k in _recon_keys:
+            if isinstance(cut_diags, dict) and _k in cut_diags:
+                updated_engine_meta[_k] = cut_diags.get(_k)
             else:
-                block_reason = "HARD_VIOLATIONS_UNKNOWN"
+                if _k in {"repair_bridge_pack_keys", "repair_bridge_pack_line_keys", "bridgeability_census_items"}:
+                    _default_val = []
+                elif _k == "bridgeability_census":
+                    _default_val = {}
+                elif _k in {"repair_bridge_pack_type", "bridgeability_route_suggestion"} or _k.endswith("_reason"):
+                    _default_val = ""
+                elif _k == "repair_bridge_pack_has_real_rows":
+                    _default_val = False
+                elif _k == "repair_bridge_boundary_band_enabled":
+                    _default_val = True
+                elif _k == "repair_bridge_endpoint_adjustment_enabled":
+                    _default_val = True
+                elif _k in {"repair_bridge_band_best_distance", "repair_bridge_best_adjustment_cost"}:
+                    _default_val = -1
+                elif _k.endswith("_seconds"):
+                    _default_val = 0.0
+                else:
+                    _default_val = 0
+                updated_engine_meta.setdefault(_k, _default_val)
 
-        return {
-            "partial_result_available": bool(dropped_order_count > 0),
-            "partial_acceptance_passed": bool(passed),
-            "partial_drop_ratio": drop_ratio,
-            "partial_drop_tons_ratio": drop_tons_ratio,
-            "scheduled_orders": scheduled_orders,
-            "scheduled_tons": scheduled_tons,
-            "hard_violations_zero": bool(hard_violations_zero),
-            "hard_violation_count_total": int(hard_violation_count_total),
-            "campaign_ton_hard_violation_count_total": int(campaign_ton_hard_violation_count_total),
-            "campaign_ton_min_violation_count": int(campaign_ton_min_violation_count),
-            "campaign_ton_max_violation_count": int(campaign_ton_max_violation_count),
-            "direct_reverse_step_violation_count": int(direct_reverse_step_violation_count),
-            "virtual_attach_reverse_violation_count": int(virtual_attach_reverse_violation_count),
-            "period_reverse_count_violation_count": int(period_reverse_count_violation_count),
-            "invalid_virtual_spec_count": int(invalid_virtual_spec_count),
-            "bridge_count_violation_count": int(bridge_count_violation_count),
-            "partial_acceptance_block_reason": str(block_reason),
-        }
+        # Final segment salvage diagnostics (from constructive_lns_master)
+        updated_engine_meta["final_segment_salvage_attempts"] = _int(lns_diag.get("final_segment_salvage_attempts"))
+        updated_engine_meta["final_segment_salvage_success_count"] = _int(lns_diag.get("final_segment_salvage_success_count"))
+        updated_engine_meta["final_segment_salvaged_piece_count"] = _int(lns_diag.get("final_segment_salvaged_piece_count"))
+        updated_engine_meta["final_segment_demoted_fragment_count"] = _int(lns_diag.get("final_segment_demoted_fragment_count"))
+        updated_engine_meta["final_segment_full_drop_count"] = _int(lns_diag.get("final_segment_full_drop_count"))
 
-    def run(self, req: ColdRollingRequest) -> ColdRollingResult:
-            run_t0 = perf_counter()
-            print(f"[APS][RUN_PATH_FINGERPRINT] PIPELINE_V2_20260416A")
-            # ---- Profile guard: enforce constructive_lns_search ----
-            req = self._enforce_constructive_lns_profile(req)
-            print(f"[APS][PROFILE_GUARD] effective_profile={req.config.model.profile_name}")
-            print(f"[APS][PROFILE_GUARD] effective_main_solver_strategy={req.config.model.main_solver_strategy}")
-            print(f"[APS][PROFILE_GUARD] joint_master_disabled=true")
-
-            # =========================================================================
-            # Branch: block_first vs. constructive_lns
-            # pipeline prepares data, dispatches to solve_master_model for execution
-            # =========================================================================
-            if req.config.model.main_solver_strategy == "block_first":
-                if _block_first_import_error is not None:
-                    raise ImportError(
-                        f"[APS][block_first] Failed to import block_first modules: {_block_first_import_error}"
-                    )
-                print(f"[APS][block_first] Starting block-first via solve_master_model")
-                print(f"[APS][block_first] profile_name={req.config.model.profile_name}")
-                print(
-                    f"[APS][block_first] block_generator_max_blocks_total={int(getattr(req.config.model, 'block_generator_max_blocks_total', 80))}"
-                )
-                print(
-                    f"[APS][block_first] block_alns_rounds={int(getattr(req.config.model, 'block_alns_rounds', 10))}"
-                )
-                print(f"[APS][block_first] prepared transition_pack and dispatching to solve_master_model")
-
-                # ---- Prepare orders and templates (same as constructive_lns) ----
-                orders_df = prepare_orders_for_model(req.orders_path, req.steel_info_path, req.config)
-                self._print_data_diagnostics(orders_df)
-
-                build_t0 = perf_counter()
-                transition_pack = build_transition_templates(orders_df, req.config)
-                transition_pack = self._attach_candidate_graph(orders_df, transition_pack, req.config)
-                template_build_seconds = perf_counter() - build_t0
-                self._print_template_diagnostics(transition_pack)
-                print(f"[APS][block_first] template_build_seconds={template_build_seconds:.3f}")
-
-                # ---- Dispatch to solve_master_model (single canonical block-first path) ----
-                schedule_df, rounds_df, dropped_df, engine_meta = solve_master_model(
-                    req, transition_pack=transition_pack, orders_df=orders_df
-                )
-
-                total_runtime = perf_counter() - run_t0
-
-                # ---- Build ColdRollingResult (pipeline adds its own timing) ----
-                result = ColdRollingResult(
-                    schedule_df=schedule_df,
-                    rounds_df=rounds_df,
-                    output_path=Path(req.output_path),
-                    dropped_df=dropped_df,
-                    engine_meta=engine_meta,
-                    config=req.config,
-                )
-
-                # ---- Decode phase (reuse existing decode) ----
-                result = decode_solution(result)
-                annotated_dropped = ColdRollingPipeline._annotate_dropped_orders(
-                    orders_df,
-                    result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else pd.DataFrame(),
-                    result.engine_meta or {},
-                )
-                result = replace(result, dropped_df=annotated_dropped)
-                updated_engine_meta = dict(result.engine_meta or {})
-                updated_engine_meta["total_runtime_seconds"] = total_runtime
-                result = replace(result, engine_meta=updated_engine_meta)
-                return result  # <-- EXIT block_first path here (dispatched to solve_master_model)
-
-            # =========================================================================
-            # constructive_lns path (existing)
-            # =========================================================================
-            print(f"[APS][constructive_lns] preparing transition templates for constructive graph search")
-            print(f"[APS][Profile] name={req.config.model.profile_name}")
-            if req.config.model.profile_name == "constructive_lns_debug_acceptance":
-                print(
-                    "[APS][debug_acceptance] using relaxed partial acceptance thresholds for validation only"
-                )
-            # Route B: Log bridge expansion mode to prevent future misdiagnosis
-            bridge_expansion_mode = str(getattr(req.config.model, "bridge_expansion_mode", "disabled"))
-            allow_virtual_bridge = bool(getattr(req.config.model, "allow_virtual_bridge_edge_in_constructive", False))
-            allow_real_bridge = bool(getattr(req.config.model, "allow_real_bridge_edge_in_constructive", False))
-            print(f"[APS][constructive_lns] bridge_expansion_mode={bridge_expansion_mode}")
-            print(f"[APS][constructive_lns] allow_virtual_bridge_edge_in_constructive={allow_virtual_bridge}")
-            print(f"[APS][constructive_lns] allow_real_bridge_edge_in_constructive={allow_real_bridge}")
-            constructive_edge_policy = "direct_only" if (not allow_virtual_bridge and not allow_real_bridge) else ("direct_plus_real_bridge" if not allow_virtual_bridge else "all_edges_allowed")
-            print(f"[APS][constructive_lns] constructive_edge_policy={constructive_edge_policy}")
-            self._print_config_snapshot(req.config)
-            if constructive_edge_policy == "direct_only":
-                print(f"[APS][constructive_lns] 路线C(direct_only): 只允许 DIRECT_EDGE, 禁用所有桥接边, 快速验证桥接展开是否为 official_exported 唯一障碍")
-            elif constructive_edge_policy == "direct_plus_real_bridge":
-                print(f"[APS][constructive_lns] 路线RB(direct_plus_real_bridge): 允许 DIRECT_EDGE + REAL_BRIDGE_EDGE, 禁用 VIRTUAL_BRIDGE_EDGE, bridge_expansion_mode={bridge_expansion_mode}")
-            else:
-                print(f"[APS][constructive_lns] edge_policy={constructive_edge_policy}, bridge_expansion_mode={bridge_expansion_mode}")
+        updated_engine_meta = self._ensure_unified_engine_meta(
+            updated_engine_meta,
+            result.config,
+            schedule_df=result.schedule_df if isinstance(result.schedule_df, pd.DataFrame) else pd.DataFrame(),
+            dropped_df=result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else pd.DataFrame(),
+            rounds_df=result.rounds_df if isinstance(result.rounds_df, pd.DataFrame) else pd.DataFrame(),
+        )
+        result = replace(result, engine_meta=updated_engine_meta, output_path=export_path)
+        em = result.engine_meta or {}
+        
+        # FINAL BLOCK_FIRST ASSERTION GATE
+        self._assert_block_first_result(result)
+        
+        self._print_result_snapshot(em)
+        diagnostics = self._build_run_diagnostics(orders_df, transition_pack, result)
+        diagnostics["validation_summary"] = dict(summary)
+        if bool(em.get("best_candidate_available", False)) and int(em.get("candidate_schedule_rows", 0) or 0) > 0:
             print(
-                f"[APS][Profile] unassigned_real={req.config.score.unassigned_real}, "
-                f"route_risk=({req.config.score.slot_isolation_risk_penalty},"
-                f"{req.config.score.slot_pair_gap_risk_penalty},{req.config.score.slot_span_risk_penalty}), "
-                f"slot_order_cap=({req.config.model.big_roll_slot_soft_order_cap},{req.config.model.small_roll_slot_soft_order_cap}), "
-                f"slot_order_hard_cap=({req.config.model.big_roll_slot_hard_order_cap},{req.config.model.small_roll_slot_hard_order_cap}), "
-                f"slot_order_penalty={req.config.score.slot_order_count_penalty}"
+                f"[APS][候选导出] candidate_schedule_available=True, rows={int(em.get('candidate_schedule_rows', 0))}, "
+                f"big_roll_rows={int(em.get('candidate_big_roll_rows', 0))}, "
+                f"small_roll_rows={int(em.get('candidate_small_roll_rows', 0))}"
             )
-            orders_df = prepare_orders_for_model(req.orders_path, req.steel_info_path, req.config)
-            self._print_data_diagnostics(orders_df)
+        print(
+            f"[APS][运行诊断] profile={req.config.model.profile_name}, "
+            f"engine={em.get('engine_used', 'unknown')}, main_path={em.get('main_path', 'unknown')}, "
+            f"local_router={em.get('local_routing_role', 'not_used')}, "
+            f"routing_feasible={routing_feasible}, "
+            f"validated_feasible={em.get('validated_feasible', False)}, "
+            f"acceptance={em.get('result_acceptance_status', 'UNKNOWN')}, "
+            f"master_candidate_status={em.get('master_candidate_status', 'UNKNOWN')}, "
+            f"acceptance_gate_reason={em.get('acceptance_gate_reason', 'UNKNOWN')}, "
+            f"validation_gate_reason={em.get('validation_gate_reason', 'UNKNOWN')}, "
+            f"official_solution_source={em.get('official_solution_source', 'NONE')}, "
+            f"failure_mode={em.get('failure_mode', '')}, "
+            f"evidence_level={em.get('evidence_level', 'OK')}, "
+            # Priority 4: Show failure source in diagnostics
+            f"adj_viols={em.get('adjacency_violation_cnt', 0)}, "
+            f"bridge_expand_viols={em.get('bridge_expand_violation_cnt', 0)}, "
+            f"failure_source={em.get('failure_source_summary', 'none')}, "
+            f"export_failed={em.get('export_failed_result_for_debug', False)}, "
+            f"analysis_on_failure={em.get('export_analysis_on_failure', False)}, "
+            f"exported={em.get('final_export_performed', False)}, "
+            f"official_exported={em.get('official_exported', False)}, "
+            f"analysis_exported={em.get('analysis_exported', False)}, "
+            f"result_usage={em.get('result_usage', 'UNKNOWN')}, "
+            f"dropped={diagnostics.get('unassigned', {}).get('count', 0)}, "
+            f"low_slots={diagnostics.get('slot', {}).get('low_slot_count', 0)}"
+        )
+        if str(em.get("result_acceptance_status", "")) == "PARTIAL_SCHEDULE_WITH_DROPS":
+            print("[APS][结果门槛] 本轮为部分可接受结果，已剔除部分高风险物料")
+        print(
+            f"[APS][耗时] template_build_seconds={em.get('template_build_seconds', 0.0):.3f}, "
+            f"joint_master_seconds={em.get('joint_master_seconds', 0.0):.3f}, "
+            f"local_router_seconds={em.get('local_router_seconds', 0.0):.3f}, "
+            f"fallback_total_seconds={em.get('fallback_total_seconds', 0.0):.3f}, "
+            f"total_run_seconds={em.get('total_run_seconds', 0.0):.3f}"
+        )
 
-            build_t0 = perf_counter()
-            transition_pack = build_transition_templates(orders_df, req.config)
-            transition_pack = self._attach_candidate_graph(orders_df, transition_pack, req.config)
-            template_build_seconds = perf_counter() - build_t0
-            self._print_template_diagnostics(transition_pack)
+        # ---- Final PHASE_TIMING summary ----
+        _tpl_sec = float(em.get("template_build_seconds", 0.0) or 0.0)
+        _cnstr_sec = float(em.get("constructive_build_seconds", 0.0) or 0.0)
+        _cut_sec = float(em.get("campaign_cutter_seconds", 0.0) or 0.0)
+        _lns_sec = float(em.get("lns_total_seconds", 0.0) or 0.0)
+        _dec_sec = float(em.get("decode_seconds", 0.0) or 0.0)
+        _tail_sec = float(em.get("tail_repair_seconds", 0.0) or 0.0)
+        _recut_sec = float(em.get("recut_seconds", 0.0) or 0.0)
+        _shift_sec = float(em.get("shift_seconds", 0.0) or 0.0)
+        _fill_sec = float(em.get("fill_seconds", 0.0) or 0.0)
+        _merge_sec = float(em.get("merge_seconds", 0.0) or 0.0)
+        print(
+            f"[APS][PHASE_TIMING] template={_tpl_sec:.3f}s, constructive={_cnstr_sec:.3f}s, "
+            f"cutter={_cut_sec:.3f}s, lns={_lns_sec:.3f}s, decode={_dec_sec:.3f}s, "
+            f"total={em.get('total_run_seconds', 0.0):.3f}s"
+        )
+        print(
+            f"[APS][CUTTER_TIMING] tail_repair={_tail_sec:.3f}s, "
+            f"recut={_recut_sec:.3f}s, shift={_shift_sec:.3f}s, "
+            f"fill={_fill_sec:.3f}s, merge={_merge_sec:.3f}s"
+        )
 
-            schedule_df, rounds_df, dropped_df, engine_meta = solve_master_model(req, transition_pack=transition_pack, orders_df=orders_df)
-            effective_cfg = engine_meta.get("effective_config", req.config) if isinstance(engine_meta, dict) else req.config
-            if isinstance(engine_meta, dict) and engine_meta.get("precheck_autorelax_applied") and effective_cfg is not req.config:
-                transition_pack = build_transition_templates(orders_df, effective_cfg)
-                transition_pack = self._attach_candidate_graph(orders_df, transition_pack, effective_cfg)
-            result = ColdRollingResult(
-                schedule_df=schedule_df,
-                rounds_df=rounds_df,
-                output_path=Path(req.output_path),
-                dropped_df=dropped_df,
-                engine_meta=engine_meta,
-                config=effective_cfg,
-            )
-
-            # ---- Decode phase ----
-            t_decode_start = perf_counter()
-            result = decode_solution(result)
-            decode_seconds = perf_counter() - t_decode_start
-            annotated_dropped = ColdRollingPipeline._annotate_dropped_orders(
-                orders_df,
-                result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else pd.DataFrame(),
-                result.engine_meta or {},
-            )
-            result = replace(result, dropped_df=annotated_dropped)
-
-            updated_engine_meta = dict(result.engine_meta or {})
-
-            # ---- Decode order mismatch acceptance gate (hard block) ----
-            # If decode introduced order corruption (seq != master_seq), the offending
-            # campaign has already been demoted in decode_solution. However, we must
-            # also mark the result as NOT OFFICIAL_READY and update acceptance gate.
-            decode_order_mismatch_count = int(updated_engine_meta.get("decode_order_mismatch_count", 0))
-            decode_order_integrity_ok = bool(decode_order_mismatch_count == 0)
-            updated_engine_meta["decode_order_integrity_ok"] = decode_order_integrity_ok
-            updated_engine_meta["decode_order_mismatch_count"] = decode_order_mismatch_count
-            if not decode_order_integrity_ok:
+        if bool(em.get("final_export_performed", False)):
+            if str(em.get("result_usage", "")) == "ANALYSIS_ONLY" and bool(em.get("best_candidate_available", False)):
                 print(
-                    f"[APS][decode_gate] HARD_BLOCK: decode_order_mismatch detected, "
-                    f"campaigns={updated_engine_meta.get('decode_order_mismatch_campaigns', [])}, "
-                    f"demoted_orders={updated_engine_meta.get('decode_demoted_order_count', 0)}"
+                    "[APS][候选导出] candidate_schedule_exported=True, "
+                    "candidate_line_summary_exported=True, candidate_violation_summary_exported=True"
                 )
-                # Record into acceptance gate diagnostics
-                updated_engine_meta["_decode_gate_block"] = True
-                updated_engine_meta["_decode_gate_block_reason"] = "DECODE_ORDER_MISMATCH"
-            else:
-                print(
-                    f"[APS][decode_gate] decode_order_integrity_ok=True, "
-                    f"decode_order_mismatch_count=0"
-                )
-                updated_engine_meta["_decode_gate_block"] = False
-
-            candidate_schedule_df = pd.DataFrame()
-            candidate_big_roll_df = pd.DataFrame()
-            candidate_small_roll_df = pd.DataFrame()
-            if bool(updated_engine_meta.get("best_candidate_available", False)):
-                best_candidate_joint = updated_engine_meta.get("best_candidate_joint")
-                best_candidate_source_orders = updated_engine_meta.get("best_candidate_source_orders_df")
-                candidate_schedule_df, candidate_big_roll_df, candidate_small_roll_df = decode_candidate_allocation(
-                    best_candidate_joint if isinstance(best_candidate_joint, dict) else {},
-                    best_candidate_source_orders if isinstance(best_candidate_source_orders, pd.DataFrame) else orders_df,
-                    candidate_dropped_df=result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else pd.DataFrame(),
-                    engine_meta=updated_engine_meta,
-                )
-                updated_engine_meta["candidate_schedule_df"] = candidate_schedule_df
-                updated_engine_meta["candidate_big_roll_df"] = candidate_big_roll_df
-                updated_engine_meta["candidate_small_roll_df"] = candidate_small_roll_df
-                updated_engine_meta["candidate_schedule_rows"] = int(len(candidate_schedule_df))
-                updated_engine_meta["candidate_big_roll_rows"] = int(len(candidate_big_roll_df))
-                updated_engine_meta["candidate_small_roll_rows"] = int(len(candidate_small_roll_df))
-                updated_engine_meta["candidate_line_summary_available"] = bool(not candidate_schedule_df.empty)
-            acceptance_before_gate = str(updated_engine_meta.get("result_acceptance_status", ""))
-            if acceptance_before_gate in {"BEST_SEARCH_CANDIDATE_ANALYSIS"}:
-                summary = validate_solution_summary(result, result.config.rule)
-                if result.schedule_df is None or result.schedule_df.empty:
-                    eq = {
-                        "template_pair_ok": bool(updated_engine_meta.get("template_pair_ok", False)),
-                        "adjacency_rule_ok": bool(updated_engine_meta.get("adjacency_rule_ok", False)),
-                        "bridge_expand_ok": bool(updated_engine_meta.get("bridge_expand_ok", False)),
-                    }
-                    routing_feasible = False
-                else:
-                    eq = validate_model_equivalence(
-                        result.schedule_df,
-                        transition_pack.get("templates") if isinstance(transition_pack, dict) else None,
-                    )
-                    routing_feasible = bool(
-                        eq.get("template_pair_ok", False)
-                        and eq.get("adjacency_rule_ok", False)
-                        and eq.get("bridge_expand_ok", False)
-                    )
-                updated_engine_meta["routing_feasible"] = bool(routing_feasible)
-                updated_engine_meta["routing_status"] = "OK" if routing_feasible else "ROUTING_INFEASIBLE"
-                updated_engine_meta["template_pair_ok"] = bool(eq.get("template_pair_ok", False))
-                updated_engine_meta["adjacency_rule_ok"] = bool(eq.get("adjacency_rule_ok", False))
-                updated_engine_meta["bridge_expand_ok"] = bool(eq.get("bridge_expand_ok", False))
-                # Priority 1: capture full eq breakdown for diagnostics
-                updated_engine_meta["adjacency_violation_cnt"] = int(eq.get("adjacency_violation_cnt", 0))
-                updated_engine_meta["bridge_expand_violation_cnt"] = int(eq.get("bridge_expand_violation_cnt", 0))
-                updated_engine_meta["chain_break_cnt"] = int(eq.get("chain_break_cnt", 0))
-                updated_engine_meta["bridge_path_expand_miss_cnt"] = int(eq.get("bridge_path_expand_miss_cnt", 0))
-                updated_engine_meta["template_miss_cnt"] = int(eq.get("template_miss_cnt", 0))
-                updated_engine_meta["result_acceptance_status"] = "BEST_SEARCH_CANDIDATE_ANALYSIS"
-                updated_engine_meta["result_usage"] = "ANALYSIS_ONLY"
-                updated_engine_meta["failure_mode"] = str(updated_engine_meta.get("failure_mode", "FAILED_ROUTING_SEARCH") or "FAILED_ROUTING_SEARCH")
-            elif str(updated_engine_meta.get("result_acceptance_status", "")).startswith("FAILED_") and (
-                result.schedule_df is None or result.schedule_df.empty
-            ):
-                summary = validate_solution_summary(result, result.config.rule)
-                # FAILED branch: schedule may be empty, but still call validate_model_equivalence
-                # to get full adjacency/bridge_expand violation breakdown for diagnostics
-                _failed_eq = validate_model_equivalence(
-                    result.schedule_df if result.schedule_df is not None else pd.DataFrame(),
-                    transition_pack.get("templates") if isinstance(transition_pack, dict) else None,
-                )
-                eq = {
-                    "template_pair_ok": bool(_failed_eq.get("template_pair_ok", False)),
-                    "adjacency_rule_ok": bool(_failed_eq.get("adjacency_rule_ok", False)),
-                    "bridge_expand_ok": bool(_failed_eq.get("bridge_expand_ok", False)),
-                    "adjacency_violation_cnt": int(_failed_eq.get("adjacency_violation_cnt", 0)),
-                    "bridge_expand_violation_cnt": int(_failed_eq.get("bridge_expand_violation_cnt", 0)),
-                    "chain_break_cnt": int(_failed_eq.get("chain_break_cnt", 0)),
-                    "bridge_path_expand_miss_cnt": int(_failed_eq.get("bridge_path_expand_miss_cnt", 0)),
-                    "template_miss_cnt": int(_failed_eq.get("template_miss_cnt", 0)),
-                    "hint_mismatch_cnt": int(_failed_eq.get("hint_mismatch_cnt", 0)),
-                }
-                routing_feasible = False
-            else:
-                summary = validate_solution_summary(result, result.config.rule)
-                eq = validate_model_equivalence(
-                    result.schedule_df,
-                    transition_pack.get("templates") if isinstance(transition_pack, dict) else None,
-                )
-                routing_feasible = bool(
-                    eq.get("template_pair_ok", False)
-                    and eq.get("adjacency_rule_ok", False)
-                    and eq.get("bridge_expand_ok", False)
-                )
-                updated_engine_meta["routing_feasible"] = bool(routing_feasible)
-                updated_engine_meta["routing_status"] = "OK" if routing_feasible else "ROUTING_INFEASIBLE"
-                updated_engine_meta["template_pair_ok"] = bool(eq.get("template_pair_ok", False))
-                updated_engine_meta["adjacency_rule_ok"] = bool(eq.get("adjacency_rule_ok", False))
-                updated_engine_meta["bridge_expand_ok"] = bool(eq.get("bridge_expand_ok", False))
-                if routing_feasible:
-                    partial_eval = self._evaluate_partial_acceptance(result, orders_df, validation_summary=summary)
-                    updated_engine_meta["partial_result_available"] = bool(partial_eval["partial_result_available"])
-                    updated_engine_meta["partial_acceptance_passed"] = bool(partial_eval["partial_acceptance_passed"])
-                    updated_engine_meta["partial_drop_ratio"] = float(partial_eval["partial_drop_ratio"])
-                    updated_engine_meta["partial_drop_tons_ratio"] = float(partial_eval["partial_drop_tons_ratio"])
-                    updated_engine_meta["hard_violation_count_total"] = int(partial_eval["hard_violation_count_total"])
-                    updated_engine_meta["campaign_ton_hard_violation_count_total"] = int(partial_eval["campaign_ton_hard_violation_count_total"])
-                    updated_engine_meta["partial_acceptance_block_reason"] = str(partial_eval.get("partial_acceptance_block_reason", ""))
-
-                    # HARD RULE: Only accept PARTIAL_SCHEDULE_WITH_DROPS when hard violations = 0
-                    # HARD RULE: decode_order_integrity_ok must be True for any OFFICIAL_* status
-                    _decode_ok = bool(updated_engine_meta.get("decode_order_integrity_ok", True))
-                    if isinstance(result.dropped_df, pd.DataFrame) and not result.dropped_df.empty and partial_eval["partial_acceptance_passed"]:
-                        updated_engine_meta["result_acceptance_status"] = "PARTIAL_SCHEDULE_WITH_DROPS"
-                        updated_engine_meta["failure_mode"] = "PARTIAL_SCHEDULE_WITH_DROPS"
-                        updated_engine_meta["result_usage"] = "PARTIAL_OFFICIAL"
-                    elif isinstance(result.dropped_df, pd.DataFrame) and not result.dropped_df.empty:
-                        # Distinguish: hard violations vs soft threshold failure
-                        hard_viols_zero = partial_eval.get("hard_violations_zero", True)
-                        block_reason = partial_eval.get("partial_acceptance_block_reason", "")
-                        if not hard_viols_zero:
-                            # routing feasible but hard violations exist
-                            updated_engine_meta["failure_mode"] = "FAILED_PARTIAL_ACCEPTANCE_HARD_VIOLATIONS"
-                            print(
-                                f"[APS][结果门槛] routing 已可行，但 hard violations 未通过 "
-                                f"({block_reason}), hard_violations={partial_eval['hard_violation_count_total']}, "
-                                f"结果降级为 BEST_SEARCH_CANDIDATE_ANALYSIS"
-                            )
-                        else:
-                            # routing feasible, no hard violations, but soft threshold not met
-                            updated_engine_meta["failure_mode"] = "FAILED_PARTIAL_ACCEPTANCE_SOFT_THRESHOLD_NOT_MET"
-                            print(
-                                f"[APS][结果门槛] routing 已可行，但 partial acceptance 软阈值未通过 "
-                                f"({block_reason}), hard_violations={partial_eval['hard_violation_count_total']}, "
-                                f"结果降级为 BEST_SEARCH_CANDIDATE_ANALYSIS"
-                            )
-                        updated_engine_meta["result_acceptance_status"] = "BEST_SEARCH_CANDIDATE_ANALYSIS"
-                        updated_engine_meta["result_usage"] = "ANALYSIS_ONLY"
-                    # HARD GATE: decode_order_integrity_ok must be True for OFFICIAL_FULL_SCHEDULE
-                    elif _decode_ok:
-                        updated_engine_meta["result_acceptance_status"] = "OFFICIAL_FULL_SCHEDULE"
-                        updated_engine_meta["failure_mode"] = ""
-                        updated_engine_meta["result_usage"] = "OFFICIAL"
-                    else:
-                        # decode mismatch but routing feasible: degrade to ANALYSIS_ONLY
-                        updated_engine_meta["result_acceptance_status"] = "BEST_SEARCH_CANDIDATE_ANALYSIS"
-                        updated_engine_meta["failure_mode"] = "FAILED_DECODE_ORDER_MISMATCH"
-                        updated_engine_meta["result_usage"] = "ANALYSIS_ONLY"
-                        print(
-                            f"[APS][decode_gate][acceptance] routing_feasible=True but decode_order_integrity_ok=False, "
-                            f"campaigns={updated_engine_meta.get('decode_order_mismatch_campaigns', [])}, "
-                            f"result degraded to BEST_SEARCH_CANDIDATE_ANALYSIS"
-                        )
-                else:
-                    updated_engine_meta["result_acceptance_status"] = "FAILED_ROUTING_SEARCH"
-                    updated_engine_meta["result_usage"] = "ANALYSIS_ONLY"
-            if bool(updated_engine_meta.get("hard_cap_not_enforced", False)):
-                updated_engine_meta["result_acceptance_status"] = "FAILED_IMPLEMENTATION_ERROR"
-                updated_engine_meta["failure_mode"] = "FAILED_IMPLEMENTATION_ERROR"
-        
-            # Priority 1: Always expose eq (validate_model_equivalence) violation breakdown to engine_meta
-            # This ensures full adjacency/bridge_expand diagnostics are available regardless of acceptance path
-            updated_engine_meta["adjacency_violation_cnt"] = int(eq.get("adjacency_violation_cnt", 0))
-            updated_engine_meta["bridge_expand_violation_cnt"] = int(eq.get("bridge_expand_violation_cnt", 0))
-            updated_engine_meta["chain_break_cnt"] = int(eq.get("chain_break_cnt", 0))
-            updated_engine_meta["bridge_path_expand_miss_cnt"] = int(eq.get("bridge_path_expand_miss_cnt", 0))
-            updated_engine_meta["template_miss_cnt"] = int(eq.get("template_miss_cnt", 0))
-            updated_engine_meta["hint_mismatch_cnt"] = int(eq.get("hint_mismatch_cnt", 0))
-            # bridge_expand_ok = (bridge_expand_violation_cnt == 0) and (bridge_path_expand_miss_cnt == 0)
-            updated_engine_meta["bridge_expand_ok"] = bool(
-                updated_engine_meta["bridge_expand_violation_cnt"] == 0
-                and updated_engine_meta["bridge_path_expand_miss_cnt"] == 0
+            t_export_start = perf_counter()
+            export_schedule_results(
+                final_df=result.schedule_df,
+                rounds_df=result.rounds_df,
+                dropped_df=result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else result.schedule_df.iloc[0:0].copy(),
+                output_path=str(result.output_path),
+                input_order_count=int(em.get("input_order_count", len(orders_df))),
+                rule=result.config.rule,
+                engine_used=str(em.get("engine_used", "unknown")),
+                fallback_used=bool(em.get("fallback_used", False)),
+                fallback_type=str(em.get("fallback_type", "")),
+                fallback_reason=str(em.get("fallback_reason", "")),
+                equivalence_summary=eq,
+                failure_diagnostics=diagnostics if diagnostics else (em.get("failure_diagnostics") if isinstance(em.get("failure_diagnostics"), dict) else summary),
+                engine_meta=em,
             )
-            # adjacency_rule_ok = adjacency_violation_cnt == 0
-            updated_engine_meta["adjacency_rule_ok"] = bool(updated_engine_meta["adjacency_violation_cnt"] == 0)
-        
-            # Priority 1: Merge eq violation breakdown into summary for unified gate checks
-            # This ensures hard_violations used in acceptance gate includes bridge_expand violations
-            summary["adjacency_violation_cnt"] = int(eq.get("adjacency_violation_cnt", 0))
-            summary["bridge_expand_violation_cnt"] = int(eq.get("bridge_expand_violation_cnt", 0))
-            summary["bridge_path_expand_miss_cnt"] = int(eq.get("bridge_path_expand_miss_cnt", 0))
-            summary["template_miss_cnt"] = int(eq.get("template_miss_cnt", 0))
-            # Priority 1: Merge decode order mismatch metadata into summary for gate diagnostics
-            summary["decode_order_integrity_ok"] = bool(updated_engine_meta.get("decode_order_integrity_ok", True))
-            summary["decode_order_mismatch_count"] = int(updated_engine_meta.get("decode_order_mismatch_count", 0))
-            summary["decode_order_mismatch_campaigns"] = list(updated_engine_meta.get("decode_order_mismatch_campaigns", []))
-            summary["decode_demoted_order_count"] = int(updated_engine_meta.get("decode_demoted_order_count", 0))
-        
-            # Priority 4: Failure source identification - propagate per-line violation counts from summary
-            updated_engine_meta["failure_source_line"] = str(summary.get("failure_source_line", ""))
-            updated_engine_meta["failure_source_max_violations"] = int(summary.get("failure_source_max_violations", 0))
-            updated_engine_meta["failure_source_summary"] = str(summary.get("failure_source_summary", "no_adjacency_violations"))
-            for k, v in summary.items():
-                if (
-                    k.endswith("_adjacency_violation_cnt")
-                    or k.endswith("_width_jump_violation_cnt")
-                    or k.endswith("_thickness_violation_cnt")
-                    or k.endswith("_temp_conflict_cnt")
-                    or k.endswith("_non_pc_direct_switch_cnt")
-                    or k.endswith("_real_orders")
-                    or k.endswith("_campaign_count")
-                ):
-                    updated_engine_meta[k] = v
-            # template_pair_ok already set in each branch
-        
-            acceptance_status = str(updated_engine_meta.get("result_acceptance_status", ""))
-        
-            # Priority 4: Clarify acceptance status fields
-            # master_candidate_status: status from master/feasibility solve
-            master_candidate_status = str(updated_engine_meta.get("best_candidate_search_status", "UNKNOWN"))
-            updated_engine_meta["master_candidate_status"] = master_candidate_status
-        
-            # Priority 1: Use summary hard_violation_count_total for all gate checks
-            # FIX: hard_violations was undefined, now properly sourced from validation summary
-            hard_violations = int(summary.get("hard_violation_count_total", 0))
-        
-            # validated_feasible: whether final validation passed (hard_violation_count_total = 0)
-            validated_feasible = bool(routing_feasible and hard_violations == 0)
-            updated_engine_meta["validated_feasible"] = validated_feasible
-        
-            # Priority 1: validated_feasible_candidate_available must be defined BEFORE acceptance_gate_reason
-            # This determines if the result can be used for optimize phase
-            validated_feasible_candidate_available = (
-                routing_feasible
-                and hard_violations == 0
-                and acceptance_status in {"OFFICIAL_FULL_SCHEDULE", "PARTIAL_SCHEDULE_WITH_DROPS"}
-            )
-            can_enter_optimize = bool(validated_feasible_candidate_available)
-            optimize_block_reason = ""
-            if not routing_feasible:
-                optimize_block_reason = "ROUTING_NOT_FEASIBLE"
-            elif hard_violations > 0:
-                optimize_block_reason = "HARD_VIOLATIONS_PRESENT"
-            elif not updated_engine_meta.get("partial_acceptance_passed", False):
-                optimize_block_reason = "PARTIAL_ACCEPTANCE_SOFT_THRESHOLD_NOT_MET"
-            elif acceptance_status not in {"OFFICIAL_FULL_SCHEDULE", "PARTIAL_SCHEDULE_WITH_DROPS"}:
-                optimize_block_reason = "PARTIAL_ACCEPTANCE_NOT_PASSED"
-        
-            # acceptance_gate_reason: why the result got its acceptance status
-            if acceptance_status == "OFFICIAL_FULL_SCHEDULE":
-                acceptance_gate_reason = "NO_DROP_HARD_VIOLATIONS_ZERO"
-            elif acceptance_status == "PARTIAL_SCHEDULE_WITH_DROPS":
-                acceptance_gate_reason = "HARD_VIOLATIONS_ZERO_DROP_WITHIN_THRESHOLD"
-            elif acceptance_status == "BEST_SEARCH_CANDIDATE_ANALYSIS":
-                if not routing_feasible:
-                    acceptance_gate_reason = "ROUTING_INFEASIBLE"
-                elif hard_violations > 0:
-                    acceptance_gate_reason = f"HARD_VIOLATIONS_EXIST:{hard_violations}"
-                elif not updated_engine_meta.get("partial_acceptance_passed", False):
-                    # routing feasible, no hard violations, but soft threshold not met
-                    acceptance_gate_reason = "PARTIAL_ACCEPTANCE_SOFT_THRESHOLD_NOT_MET"
-                elif not validated_feasible_candidate_available:
-                    acceptance_gate_reason = "PARTIAL_ACCEPTANCE_NOT_PASSED"
-                else:
-                    acceptance_gate_reason = "ANALYSIS_ONLY_MODE"
-            elif acceptance_status.startswith("FAILED_"):
-                acceptance_gate_reason = acceptance_status
-            else:
-                acceptance_gate_reason = "UNKNOWN"
-            updated_engine_meta["acceptance_gate_reason"] = acceptance_gate_reason
-
-            # validation_gate_reason: specific reason for validation pass/fail
-            if validated_feasible:
-                validation_gate_reason = "ALL_HARD_CONSTRAINTS_SATISFIED"
-            elif not routing_feasible:
-                validation_gate_reason = "ROUTING_FEASIBILITY_FAILED"
-            elif hard_violations > 0:
-                validation_gate_reason = f"HARD_VIOLATIONS:{hard_violations}"
-            else:
-                # routing feasible, no hard violations, but soft threshold failed
-                validation_gate_reason = "PARTIAL_ACCEPTANCE_SOFT_THRESHOLD_NOT_MET"
-            updated_engine_meta["validation_gate_reason"] = validation_gate_reason
-        
-            # Priority 1: print gate status AFTER all fields are set
-            print(
-                f"[APS][optimize_gate] validated_feasible={validated_feasible}, "
-                f"validated_feasible_candidate={validated_feasible_candidate_available}, "
-                f"can_enter_optimize={can_enter_optimize}, "
-                f"routing_feasible={routing_feasible}, "
-                f"hard_violations={hard_violations}, "
-                f"acceptance={acceptance_status}, "
-                f"master_candidate={master_candidate_status}, "
-                f"acceptance_gate_reason={acceptance_gate_reason}, "
-                f"validation_gate_reason={validation_gate_reason}, "
-                f"block_reason={optimize_block_reason or 'NONE'}"
-            )
-            updated_engine_meta["validated_feasible_candidate_available"] = bool(validated_feasible_candidate_available)
-            updated_engine_meta["can_enter_optimize"] = bool(can_enter_optimize)
-            updated_engine_meta["optimize_block_reason"] = str(optimize_block_reason)
-            # Phase tracking: feasibility always executed, optimize only if gate passes
-            updated_engine_meta["feasibility_phase_executed"] = True
-            updated_engine_meta["optimize_phase_executed"] = bool(can_enter_optimize)
-            # Official solution source: set by pipeline after validation gate
-            if acceptance_status in {"OFFICIAL_FULL_SCHEDULE", "PARTIAL_SCHEDULE_WITH_DROPS"}:
-                updated_engine_meta["official_solution_source"] = "FEASIBILITY_PHASE"
-            elif acceptance_status == "BEST_SEARCH_CANDIDATE_ANALYSIS":
-                updated_engine_meta["official_solution_source"] = "NONE"
-            if can_enter_optimize:
-                # Second solve: run optimize phase on top of validated feasible result
-                print(f"[APS][optimize_gate] Entering optimize phase (phase_mode=optimize_only)...")
-                from aps_cp_sat.model import solve_master_model as _solve_master_model
-                _build_t0 = perf_counter()
-                _transition_pack = build_transition_templates(orders_df, result.config)
-                _template_build_seconds = perf_counter() - _build_t0
-                opt_sched_df, opt_rounds_df, opt_dropped_df, opt_engine_meta = _solve_master_model(
-                    req,
-                    transition_pack=_transition_pack,
-                    orders_df=orders_df,
-                    phase_mode="optimize_only",
-                )
-                _opt_elapsed = perf_counter() - _build_t0
-                updated_engine_meta["optimize_phase_executed"] = True
-                updated_engine_meta["optimize_phase_improved_solution"] = False
-                updated_engine_meta["optimize_joint_master_seconds"] = float(opt_engine_meta.get("joint_master_seconds", 0.0) or 0.0)
-                updated_engine_meta["optimize_fallback_seconds"] = float(opt_engine_meta.get("fallback_total_seconds", 0.0) or 0.0)
-                updated_engine_meta["template_build_seconds"] = float(template_build_seconds) + _template_build_seconds + float(updated_engine_meta.get("template_build_seconds", 0.0) or 0.0)
-                # Validate optimize result
-                # ONLY accept optimize result when hard_violation_count_total == 0 (the single hard gate)
-                if isinstance(opt_sched_df, pd.DataFrame) and not opt_sched_df.empty:
-                    _opt_eq = validate_model_equivalence(opt_sched_df, _transition_pack.get("templates") if isinstance(_transition_pack, dict) else None)
-                    _opt_routing_feasible = bool(_opt_eq.get("template_pair_ok", False) and _opt_eq.get("adjacency_rule_ok", False) and _opt_eq.get("bridge_expand_ok", False))
-                    _opt_summary = validate_solution_summary(replace(result, schedule_df=opt_sched_df, dropped_df=opt_dropped_df), result.config.rule)
-                    _opt_hard_viol_total = int(_opt_summary.get("hard_violation_count_total", 0) or 0)
-                    _opt_campaign_hard_viol = int(_opt_summary.get("campaign_ton_hard_violation_count_total", 0) or 0)
-                    # Diagnostics for optimize validation
-                    updated_engine_meta["optimize_validation_hard_violation_count_total"] = _opt_hard_viol_total
-                    updated_engine_meta["optimize_validation_campaign_ton_hard_violation_count_total"] = _opt_campaign_hard_viol
-                    _opt_result_accepted = False
-                    if _opt_routing_feasible and _opt_hard_viol_total == 0:
-                        # Optimize succeeded: hard_violation_count_total == 0 is the ONLY acceptance gate
-                        result = replace(result, schedule_df=opt_sched_df, dropped_df=opt_dropped_df)
-                        updated_engine_meta["official_solution_source"] = "OPTIMIZE_PHASE"
-                        updated_engine_meta["optimize_phase_improved_solution"] = True
-                        _opt_result_accepted = True
-                        print(f"[APS][optimize_gate] Optimize succeeded: hard_viol_total={_opt_hard_viol_total}, campaign_hard_viol={_opt_campaign_hard_viol}")
-                    else:
-                        # Reject optimize result: keep pre-opt feasible result
-                        updated_engine_meta["official_solution_source"] = "FEASIBILITY_PHASE"
-                        updated_engine_meta["optimize_phase_improved_solution"] = False
-                        _reject_reason = "ROUTING_INFEASIBLE" if not _opt_routing_feasible else f"HARD_VIOLATIONS:{_opt_hard_viol_total}"
-                        print(f"[APS][optimize_gate] Optimize rejected: reason={_reject_reason}, hard_viol_total={_opt_hard_viol_total}, campaign_hard_viol={_opt_campaign_hard_viol}, keeping feasibility result")
-                    updated_engine_meta["optimize_result_accepted"] = _opt_result_accepted
-                    updated_engine_meta["optimize_result_rejected_due_to_hard_violations"] = bool(not _opt_result_accepted)
-                else:
-                    updated_engine_meta["optimize_validation_hard_violation_count_total"] = -1
-                    updated_engine_meta["optimize_validation_campaign_ton_hard_violation_count_total"] = -1
-                    updated_engine_meta["optimize_result_accepted"] = False
-                    updated_engine_meta["optimize_result_rejected_due_to_hard_violations"] = False
-                    print(f"[APS][optimize_gate] Optimize phase produced no schedule, keeping feasibility result")
-            updated_engine_meta["export_failed_result_for_debug"] = bool(result.config.model.export_failed_result_for_debug)
-            updated_engine_meta["export_analysis_on_failure"] = bool(result.config.model.export_analysis_on_failure)
-            updated_engine_meta["export_best_candidate_analysis"] = bool(result.config.model.export_best_candidate_analysis)
-            updated_engine_meta["template_build_seconds"] = float(template_build_seconds) + float(updated_engine_meta.get("template_build_seconds", 0.0) or 0.0)
-            export_path = result.output_path
-            final_export_performed = True
-            acceptance_status = str(updated_engine_meta.get("result_acceptance_status", ""))
-            official_exported = bool(routing_feasible and acceptance_status in {"OFFICIAL_FULL_SCHEDULE", "PARTIAL_SCHEDULE_WITH_DROPS"})
-            analysis_exported = False
-            result_usage = "OFFICIAL" if official_exported else "NOT_EXPORTED"
-            if not official_exported:
-                # Class C: routing feasible but partial acceptance failed
-                if not routing_feasible:
-                    # Class A: routing infeasible
-                    suffix = "_ROUTING_INFEASIBLE_NOT_PRODUCTION_READY"
-                    if bool(result.config.model.export_failed_result_for_debug):
-                        export_path = result.output_path.with_name(
-                            f"{result.output_path.stem}{suffix}{result.output_path.suffix}"
-                        )
-                        print(f"[APS][结果门槛] routing 不可行，结果仅按调试输出导出: {export_path}")
-                        analysis_exported = True
-                        official_exported = False
-                        result_usage = "ANALYSIS_ONLY"
-                    elif bool(result.config.model.export_analysis_on_failure):
-                        export_path = result.output_path.with_name(
-                            f"{result.output_path.stem}{suffix}{result.output_path.suffix}"
-                        )
-                        print(f"[APS][结果门槛] routing 不可行，结果按分析用途导出: {export_path}")
-                        analysis_exported = True
-                        official_exported = False
-                        result_usage = "ANALYSIS_ONLY"
-                    else:
-                        final_export_performed = False
-                        analysis_exported = False
-                        result_usage = "NOT_EXPORTED"
-                        print("[APS][结果门槛] routing 不可行，已禁止失败结果导出")
-                elif acceptance_status == "BEST_SEARCH_CANDIDATE_ANALYSIS":
-                    # Class B: routing feasible but partial acceptance failed
-                    suffix = "_PARTIAL_ACCEPTANCE_FAILED_ANALYSIS"
-                    if bool(result.config.model.export_best_candidate_analysis):
-                        export_path = result.output_path.with_name(
-                            f"{result.output_path.stem}_BEST_SEARCH_CANDIDATE_ANALYSIS{result.output_path.suffix}"
-                        )
-                        print(f"[APS][结果门槛] routing 已可行，但 partial acceptance 未通过，"
-                              f"结果降级为 BEST_SEARCH_CANDIDATE_ANALYSIS，该文件仅用于调优分析: {export_path}")
-                        analysis_exported = True
-                        official_exported = False
-                        result_usage = "ANALYSIS_ONLY"
-                    elif bool(result.config.model.export_analysis_on_failure):
-                        export_path = result.output_path.with_name(
-                            f"{result.output_path.stem}{suffix}{result.output_path.suffix}"
-                        )
-                        print(f"[APS][结果门槛] routing 已可行，但 partial acceptance 未通过，"
-                              f"结果按分析用途导出: {export_path}")
-                        analysis_exported = True
-                        official_exported = False
-                        result_usage = "ANALYSIS_ONLY"
-                    elif bool(result.config.model.export_failed_result_for_debug):
-                        export_path = result.output_path.with_name(
-                            f"{result.output_path.stem}{suffix}{result.output_path.suffix}"
-                        )
-                        print(f"[APS][结果门槛] routing 已可行，但 partial acceptance 未通过，"
-                              f"结果按调试用途导出: {export_path}")
-                        analysis_exported = True
-                        official_exported = False
-                        result_usage = "ANALYSIS_ONLY"
-                    else:
-                        final_export_performed = False
-                        analysis_exported = False
-                        result_usage = "NOT_EXPORTED"
-                        print("[APS][结果门槛] routing 已可行，但 partial acceptance 未通过，已禁止导出")
-                else:
-                    # routing_feasible=True, acceptance_status not official, and all export flags off
-                    final_export_performed = False
-                    official_exported = False
-                    analysis_exported = False
-                    result_usage = "NOT_EXPORTED"
-                    print("[APS][结果门槛] routing 已可行，但 acceptance 状态异常，已禁止导出")
-            else:
-                official_exported = True
-                analysis_exported = False
-                result_usage = str(updated_engine_meta.get("result_usage", "OFFICIAL"))
-            updated_engine_meta["final_export_performed"] = bool(final_export_performed)
-            updated_engine_meta["official_exported"] = bool(official_exported)
-            updated_engine_meta["analysis_exported"] = bool(analysis_exported)
-            updated_engine_meta["result_usage"] = str(result_usage)
-            # export_block_stage: which stage blocked the result from being official
-            if not routing_feasible:
-                updated_engine_meta["export_block_stage"] = "routing"
-            elif acceptance_status == "BEST_SEARCH_CANDIDATE_ANALYSIS":
-                updated_engine_meta["export_block_stage"] = "partial_acceptance"
-            else:
-                updated_engine_meta["export_block_stage"] = "none"
-            updated_engine_meta["total_run_seconds"] = float(perf_counter() - run_t0)
-            updated_engine_meta["decode_seconds"] = float(decode_seconds) if 'decode_seconds' in dir() else 0.0
-            # ---- Expose LNS phase timing from engine_meta ----
-            lns_engine_meta = updated_engine_meta.get("lns_engine_meta", {}) or {}
-            lns_diag = updated_engine_meta.get("lns_diagnostics", {}) or {}
-            cut_diags = lns_diag.get("campaign_cut_diags", {}) or {}
-            tail_summary = cut_diags.get("tail_rebalance_summary", {}) or {}
-            updated_engine_meta["constructive_build_seconds"] = float(lns_engine_meta.get("constructive_build_seconds", 0.0) or 0.0)
-            updated_engine_meta["campaign_cutter_seconds"] = float(lns_engine_meta.get("campaign_cutter_seconds", 0.0) or 0.0)
-            updated_engine_meta["lns_total_seconds"] = float(lns_engine_meta.get("lns_total_seconds", 0.0) or 0.0)
-            updated_engine_meta["tail_repair_seconds"] = float(tail_summary.get("tail_repair_seconds", 0.0) or 0.0)
-            updated_engine_meta["recut_seconds"] = float(tail_summary.get("recut_seconds", 0.0) or 0.0)
-            updated_engine_meta["shift_seconds"] = float(tail_summary.get("shift_seconds", 0.0) or 0.0)
-            updated_engine_meta["fill_seconds"] = float(tail_summary.get("fill_seconds", 0.0) or 0.0)
-            updated_engine_meta["merge_seconds"] = float(tail_summary.get("merge_seconds", 0.0) or 0.0)
-            updated_engine_meta["export_consistency_ok"] = True
-
-            # ---- Expose run_path_fingerprint fields from nested engine_meta ----
-            lns_engine_meta = updated_engine_meta.get("lns_engine_meta", {}) or {}
-            lns_diag = updated_engine_meta.get("lns_diagnostics", {}) or {}
-            cut_diags = lns_diag.get("campaign_cut_diags", {}) or {}
-            build_diags = lns_diag.get("constructive_build_diags", {}) or {}
-
-            def _int(v, default=0):
+            persist_enabled = str(os.getenv("APS_PERSIST_AFTER_EXPORT", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
+            updated_engine_meta["persistence_enabled"] = bool(persist_enabled)
+            if persist_enabled:
+                export_path_for_persist = Path(result.output_path)
+                run_code = str(em.get("run_code") or export_path_for_persist.stem)
+                updated_engine_meta["persisted_run_code"] = run_code
+                updated_engine_meta["persisted_result_file_path"] = str(export_path_for_persist)
+                print(f"[APS][PERSIST] enabled=True, run_code={run_code}, xlsx={export_path_for_persist}")
                 try:
-                    return int(v or default)
-                except (ValueError, TypeError):
-                    return default
-
-            def _str(v, default=""):
-                return str(v) if v is not None else default
-
-            # Run path fingerprints
-            updated_engine_meta["run_path_fingerprint_pipeline"] = _str(
-                updated_engine_meta.get("run_path_fingerprint_pipeline", "PIPELINE_V2_20260416A")
-            )
-            updated_engine_meta["run_path_fingerprint_constructive_builder"] = _str(
-                updated_engine_meta.get("run_path_fingerprint_constructive_builder", "CONSTRUCTIVE_SEQUENCE_BUILDER_V2_20260416A")
-            )
-            updated_engine_meta["run_path_fingerprint_campaign_cutter"] = _str(
-                updated_engine_meta.get("run_path_fingerprint_campaign_cutter", "")
-            )
-            updated_engine_meta["run_path_fingerprint_constructive_lns_master"] = _str(
-                lns_engine_meta.get("run_path_fingerprint_constructive_lns_master", "")
-            )
-
-            # Tail repair diagnostics (from campaign_cutter)
-            tail_summary = cut_diags.get("tail_rebalance_summary", {}) or {}
-            updated_engine_meta["tail_repair_recut_attempts"] = _int(tail_summary.get("tail_repair_recut_attempts"))
-            updated_engine_meta["tail_repair_recut_success"] = _int(tail_summary.get("tail_repair_recut_success"))
-            updated_engine_meta["tail_repair_shift_attempts"] = _int(tail_summary.get("tail_repair_shift_attempts"))
-            updated_engine_meta["tail_repair_shift_success"] = _int(tail_summary.get("tail_repair_shift_success"))
-            updated_engine_meta["tail_repair_fill_attempts"] = _int(tail_summary.get("tail_repair_fill_attempts"))
-            updated_engine_meta["tail_repair_fill_success"] = _int(tail_summary.get("tail_repair_fill_success"))
-            updated_engine_meta["tail_repair_merge_attempts"] = _int(tail_summary.get("tail_repair_merge_attempts"))
-            updated_engine_meta["tail_repair_merge_success"] = _int(tail_summary.get("tail_repair_merge_success"))
-
-            # Underfilled reconstruction / repair-only real bridge observability.
-            # Source of truth is campaign_cutter diagnostics; expose selected fields at top-level engine_meta.
-            _recon_keys = [
-                "underfilled_reconstruction_enabled",
-                "underfilled_reconstruction_attempts",
-                "underfilled_reconstruction_success",
-                "underfilled_reconstruction_blocks_tested",
-                "underfilled_reconstruction_blocks_skipped",
-                "underfilled_reconstruction_valid_before",
-                "underfilled_reconstruction_valid_after",
-                "underfilled_reconstruction_underfilled_before",
-                "underfilled_reconstruction_underfilled_after",
-                "underfilled_reconstruction_valid_delta",
-                "underfilled_reconstruction_underfilled_delta",
-                "underfilled_reconstruction_segments_salvaged",
-                "underfilled_reconstruction_orders_salvaged",
-                "underfilled_reconstruction_not_entered_reason",
-                "repair_only_real_bridge_enabled",
-                "repair_only_real_bridge_attempts",
-                "repair_only_real_bridge_success",
-                "repair_only_real_bridge_candidates_total",
-                "repair_only_real_bridge_candidates_kept",
-                "repair_only_real_bridge_filtered_direct_feasible",
-                "repair_only_real_bridge_filtered_pair_invalid",
-                "repair_only_real_bridge_filtered_ton_invalid",
-                "repair_only_real_bridge_filtered_score_worse",
-                "repair_only_real_bridge_filtered_bridge_limit_exceeded",
-                "repair_only_real_bridge_filtered_multiplicity_invalid",
-                "repair_only_real_bridge_filtered_bridge_path_not_real",
-                "repair_only_real_bridge_filtered_bridge_path_missing",
-                "repair_only_real_bridge_filtered_block_order_mismatch",
-                "repair_only_real_bridge_filtered_line_mismatch",
-                "repair_only_real_bridge_filtered_block_membership_mismatch",
-                "repair_only_real_bridge_filtered_bridge_path_payload_empty",
-                "repair_bridge_pack_has_real_rows",
-                "repair_bridge_pack_real_rows_total",
-                "repair_bridge_pack_virtual_rows_total",
-                "repair_bridge_raw_rows_total",
-                "repair_bridge_matched_rows_total",
-                "repair_bridge_kept_rows_total",
-                "repair_bridge_endpoint_key_mismatch_count",
-                "repair_bridge_field_name_mismatch_count",
-                "repair_bridge_inconsistency_count",
-                "repair_bridge_boundary_band_enabled",
-                "repair_bridge_band_pairs_tested",
-                "repair_bridge_band_hits",
-                "repair_bridge_single_point_hits",
-                "repair_bridge_band_only_hits",
-                "repair_bridge_band_best_distance",
-                "repair_bridge_endpoint_adjustment_enabled",
-                "repair_bridge_adjustments_generated",
-                "repair_bridge_adjustment_pairs_tested",
-                "repair_bridge_adjustment_hits",
-                "repair_bridge_adjustment_only_hits",
-                "repair_bridge_best_adjustment_cost",
-                "repair_bridge_candidates_matched",
-                "repair_bridge_candidates_rejected_pair_invalid",
-                "repair_bridge_candidates_rejected_ton_invalid",
-                "repair_bridge_candidates_rejected_score_worse",
-                "repair_bridge_candidates_accepted",
-                "repair_bridge_exact_invalid_pair_count",
-                "repair_bridge_frontier_mismatch_count",
-                "repair_bridge_pair_invalid_width",
-                "repair_bridge_pair_invalid_thickness",
-                "repair_bridge_pair_invalid_temp",
-                "repair_bridge_pair_invalid_group",
-                "repair_bridge_pair_invalid_unknown",
-                "repair_bridge_ton_rescue_attempts",
-                "repair_bridge_ton_rescue_success",
-                "repair_bridge_ton_rescue_windows_tested",
-                "repair_bridge_ton_rescue_valid_delta",
-                "repair_bridge_ton_rescue_underfilled_delta",
-                "repair_bridge_ton_rescue_scheduled_orders_delta",
-                "repair_bridge_filtered_ton_below_min_current_block",
-                "repair_bridge_filtered_ton_below_min_even_after_neighbor_expansion",
-                "repair_bridge_filtered_ton_above_max_after_expansion",
-                "repair_bridge_filtered_ton_split_not_found",
-                "repair_bridge_filtered_ton_rescue_no_gain",
-                "repair_bridge_filtered_ton_rescue_impossible",
-                "repair_bridge_ton_rescue_pair_fail_width",
-                "repair_bridge_ton_rescue_pair_fail_thickness",
-                "repair_bridge_ton_rescue_pair_fail_temp",
-                "repair_bridge_ton_rescue_pair_fail_group",
-                "repair_bridge_ton_rescue_pair_fail_template",
-                "repair_bridge_ton_rescue_pair_fail_multi",
-                "repair_bridge_ton_rescue_pair_fail_unknown",
-                "bridgeability_route_suggestion",
-                "bridgeability_census",
-                "bridgeability_census_items",
-                # ---- Legacy virtual pilot: 已降级为单一总字段 ----
-                # 旧有 ~45 个 virtual_pilot 细项字段已从此处移除
-                "conservative_apply_attempt_count",
-                "conservative_apply_success_count",
-                "conservative_apply_reject_count",
-                "repair_bridge_pack_type",
-                "repair_bridge_pack_keys",
-                "repair_bridge_pack_line_keys",
-                "repair_only_real_bridge_used_segments",
-                "repair_only_real_bridge_used_orders",
-                "repair_only_real_bridge_not_entered_reason",
-                "underfilled_reconstruction_seconds",
-                "repair_only_real_bridge_seconds",
-            ]
-            for _k in _recon_keys:
-                if isinstance(cut_diags, dict) and _k in cut_diags:
-                    updated_engine_meta[_k] = cut_diags.get(_k)
-                else:
-                    if _k in {"repair_bridge_pack_keys", "repair_bridge_pack_line_keys", "bridgeability_census_items"}:
-                        _default_val = []
-                    elif _k == "bridgeability_census":
-                        _default_val = {}
-                    elif _k in {"repair_bridge_pack_type", "bridgeability_route_suggestion"} or _k.endswith("_reason"):
-                        _default_val = ""
-                    elif _k == "repair_bridge_pack_has_real_rows":
-                        _default_val = False
-                    elif _k == "repair_bridge_boundary_band_enabled":
-                        _default_val = True
-                    elif _k == "repair_bridge_endpoint_adjustment_enabled":
-                        _default_val = True
-                    elif _k in {"repair_bridge_band_best_distance", "repair_bridge_best_adjustment_cost"}:
-                        _default_val = -1
-                    elif _k.endswith("_seconds"):
-                        _default_val = 0.0
-                    else:
-                        _default_val = 0
-                    updated_engine_meta.setdefault(_k, _default_val)
-
-            # Final segment salvage diagnostics (from constructive_lns_master)
-            updated_engine_meta["final_segment_salvage_attempts"] = _int(lns_diag.get("final_segment_salvage_attempts"))
-            updated_engine_meta["final_segment_salvage_success_count"] = _int(lns_diag.get("final_segment_salvage_success_count"))
-            updated_engine_meta["final_segment_salvaged_piece_count"] = _int(lns_diag.get("final_segment_salvaged_piece_count"))
-            updated_engine_meta["final_segment_demoted_fragment_count"] = _int(lns_diag.get("final_segment_demoted_fragment_count"))
-            updated_engine_meta["final_segment_full_drop_count"] = _int(lns_diag.get("final_segment_full_drop_count"))
-
-            updated_engine_meta = self._ensure_unified_engine_meta(
-                updated_engine_meta,
-                result.config,
-                schedule_df=result.schedule_df if isinstance(result.schedule_df, pd.DataFrame) else pd.DataFrame(),
-                dropped_df=result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else pd.DataFrame(),
-                rounds_df=result.rounds_df if isinstance(result.rounds_df, pd.DataFrame) else pd.DataFrame(),
-            )
-            result = replace(result, engine_meta=updated_engine_meta, output_path=export_path)
-            em = result.engine_meta or {}
-            self._print_result_snapshot(em)
-            diagnostics = self._build_run_diagnostics(orders_df, transition_pack, result)
-            diagnostics["validation_summary"] = dict(summary)
-            if bool(em.get("best_candidate_available", False)) and int(em.get("candidate_schedule_rows", 0) or 0) > 0:
-                print(
-                    f"[APS][候选导出] candidate_schedule_available=True, rows={int(em.get('candidate_schedule_rows', 0))}, "
-                    f"big_roll_rows={int(em.get('candidate_big_roll_rows', 0))}, "
-                    f"small_roll_rows={int(em.get('candidate_small_roll_rows', 0))}"
-                )
-            print(
-                f"[APS][运行诊断] profile={req.config.model.profile_name}, "
-                f"engine={em.get('engine_used', 'unknown')}, main_path={em.get('main_path', 'unknown')}, "
-                f"local_router={em.get('local_routing_role', 'not_used')}, "
-                f"routing_feasible={routing_feasible}, "
-                f"validated_feasible={em.get('validated_feasible', False)}, "
-                f"acceptance={em.get('result_acceptance_status', 'UNKNOWN')}, "
-                f"master_candidate_status={em.get('master_candidate_status', 'UNKNOWN')}, "
-                f"acceptance_gate_reason={em.get('acceptance_gate_reason', 'UNKNOWN')}, "
-                f"validation_gate_reason={em.get('validation_gate_reason', 'UNKNOWN')}, "
-                f"official_solution_source={em.get('official_solution_source', 'NONE')}, "
-                f"failure_mode={em.get('failure_mode', '')}, "
-                f"evidence_level={em.get('evidence_level', 'OK')}, "
-                # Priority 4: Show failure source in diagnostics
-                f"adj_viols={em.get('adjacency_violation_cnt', 0)}, "
-                f"bridge_expand_viols={em.get('bridge_expand_violation_cnt', 0)}, "
-                f"failure_source={em.get('failure_source_summary', 'none')}, "
-                f"export_failed={em.get('export_failed_result_for_debug', False)}, "
-                f"analysis_on_failure={em.get('export_analysis_on_failure', False)}, "
-                f"exported={em.get('final_export_performed', False)}, "
-                f"official_exported={em.get('official_exported', False)}, "
-                f"analysis_exported={em.get('analysis_exported', False)}, "
-                f"result_usage={em.get('result_usage', 'UNKNOWN')}, "
-                f"dropped={diagnostics.get('unassigned', {}).get('count', 0)}, "
-                f"low_slots={diagnostics.get('slot', {}).get('low_slot_count', 0)}"
-            )
-            if str(em.get("result_acceptance_status", "")) == "PARTIAL_SCHEDULE_WITH_DROPS":
-                print("[APS][结果门槛] 本轮为部分可接受结果，已剔除部分高风险物料")
-            print(
-                f"[APS][耗时] template_build_seconds={em.get('template_build_seconds', 0.0):.3f}, "
-                f"joint_master_seconds={em.get('joint_master_seconds', 0.0):.3f}, "
-                f"local_router_seconds={em.get('local_router_seconds', 0.0):.3f}, "
-                f"fallback_total_seconds={em.get('fallback_total_seconds', 0.0):.3f}, "
-                f"total_run_seconds={em.get('total_run_seconds', 0.0):.3f}"
-            )
-
-            # ---- Final PHASE_TIMING summary ----
-            _tpl_sec = float(em.get("template_build_seconds", 0.0) or 0.0)
-            _cnstr_sec = float(em.get("constructive_build_seconds", 0.0) or 0.0)
-            _cut_sec = float(em.get("campaign_cutter_seconds", 0.0) or 0.0)
-            _lns_sec = float(em.get("lns_total_seconds", 0.0) or 0.0)
-            _dec_sec = float(em.get("decode_seconds", 0.0) or 0.0)
-            _tail_sec = float(em.get("tail_repair_seconds", 0.0) or 0.0)
-            _recut_sec = float(em.get("recut_seconds", 0.0) or 0.0)
-            _shift_sec = float(em.get("shift_seconds", 0.0) or 0.0)
-            _fill_sec = float(em.get("fill_seconds", 0.0) or 0.0)
-            _merge_sec = float(em.get("merge_seconds", 0.0) or 0.0)
-            print(
-                f"[APS][PHASE_TIMING] template={_tpl_sec:.3f}s, constructive={_cnstr_sec:.3f}s, "
-                f"cutter={_cut_sec:.3f}s, lns={_lns_sec:.3f}s, decode={_dec_sec:.3f}s, "
-                f"total={em.get('total_run_seconds', 0.0):.3f}s"
-            )
-            print(
-                f"[APS][CUTTER_TIMING] tail_repair={_tail_sec:.3f}s, "
-                f"recut={_recut_sec:.3f}s, shift={_shift_sec:.3f}s, "
-                f"fill={_fill_sec:.3f}s, merge={_merge_sec:.3f}s"
-            )
-
-            if bool(em.get("final_export_performed", False)):
-                if str(em.get("result_usage", "")) == "ANALYSIS_ONLY" and bool(em.get("best_candidate_available", False)):
-                    print(
-                        "[APS][候选导出] candidate_schedule_exported=True, "
-                        "candidate_line_summary_exported=True, candidate_violation_summary_exported=True"
+                    if persist_run_analysis_from_excel is None:
+                        raise RuntimeError("persist_run_analysis_from_excel unavailable; install analysis platform dependencies")
+                    if not export_path_for_persist.exists():
+                        raise FileNotFoundError(str(export_path_for_persist))
+                    persisted_run_id = persist_run_analysis_from_excel(
+                        xlsx_path=str(export_path_for_persist),
+                        run_code=run_code,
                     )
-                t_export_start = perf_counter()
-                export_schedule_results(
-                    final_df=result.schedule_df,
-                    rounds_df=result.rounds_df,
-                    dropped_df=result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else result.schedule_df.iloc[0:0].copy(),
-                    output_path=str(result.output_path),
-                    input_order_count=int(em.get("input_order_count", len(orders_df))),
-                    rule=result.config.rule,
-                    engine_used=str(em.get("engine_used", "unknown")),
-                    fallback_used=bool(em.get("fallback_used", False)),
-                    fallback_type=str(em.get("fallback_type", "")),
-                    fallback_reason=str(em.get("fallback_reason", "")),
-                    equivalence_summary=eq,
-                    failure_diagnostics=diagnostics if diagnostics else (em.get("failure_diagnostics") if isinstance(em.get("failure_diagnostics"), dict) else summary),
-                    engine_meta=em,
-                )
-                persist_enabled = str(os.getenv("APS_PERSIST_AFTER_EXPORT", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
-                updated_engine_meta["persistence_enabled"] = bool(persist_enabled)
-                if persist_enabled:
-                    export_path_for_persist = Path(result.output_path)
-                    run_code = str(em.get("run_code") or export_path_for_persist.stem)
-                    updated_engine_meta["persisted_run_code"] = run_code
-                    updated_engine_meta["persisted_result_file_path"] = str(export_path_for_persist)
-                    print(f"[APS][PERSIST] enabled=True, run_code={run_code}, xlsx={export_path_for_persist}")
-                    try:
-                        if persist_run_analysis_from_excel is None:
-                            raise RuntimeError("persist_run_analysis_from_excel unavailable; install analysis platform dependencies")
-                        if not export_path_for_persist.exists():
-                            raise FileNotFoundError(str(export_path_for_persist))
-                        persisted_run_id = persist_run_analysis_from_excel(
-                            xlsx_path=str(export_path_for_persist),
-                            run_code=run_code,
-                        )
-                        updated_engine_meta["persistence_success"] = True
-                        updated_engine_meta["persisted_run_id"] = int(persisted_run_id)
-                        print(f"[APS][PERSIST] success=True, run_id={persisted_run_id}")
-                    except Exception as ex:
-                        updated_engine_meta["persistence_success"] = False
-                        updated_engine_meta["persistence_error"] = str(ex)
-                        print(f"[APS][PERSIST] success=False, error={ex}")
-            result_writer_seconds = perf_counter() - t_export_start
-            updated_engine_meta["result_writer_seconds"] = float(result_writer_seconds)
-            print(f"[APS][PHASE_TIMING] result_writer={result_writer_seconds:.3f}s")
-            result = replace(result, engine_meta=updated_engine_meta)
-            return result
-
+                    updated_engine_meta["persistence_success"] = True
+                    updated_engine_meta["persisted_run_id"] = int(persisted_run_id)
+                    print(f"[APS][PERSIST] success=True, run_id={persisted_run_id}")
+                except Exception as ex:
+                    updated_engine_meta["persistence_success"] = False
+                    updated_engine_meta["persistence_error"] = str(ex)
+                    print(f"[APS][PERSIST] success=False, error={ex}")
+        result_writer_seconds = perf_counter() - t_export_start
+        updated_engine_meta["result_writer_seconds"] = float(result_writer_seconds)
+        print(f"[APS][PHASE_TIMING] result_writer={result_writer_seconds:.3f}s")
+        result = replace(result, engine_meta=updated_engine_meta)
+        return result

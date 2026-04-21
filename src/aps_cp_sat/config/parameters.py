@@ -840,33 +840,27 @@ def build_profile_config(
                 "virtual_family_frontload_require_family_budget": True,
                 "virtual_family_budget_per_line": 4,
                 "virtual_family_budget_per_segment": 2,
-                # ---- Block generator configuration ----
+                # ---- Block generator configuration (Sub-block validation version) ----
                 "block_generator_target_blocks": 2000,
                 "block_generator_time_limit_seconds": 15.0,
-                "block_generator_max_blocks_per_line": 30,
-                "block_generator_max_blocks_total": 80,
-                "block_generator_max_seed_per_bucket": 8,
+                "block_generator_max_blocks_per_line": 60,
+                "block_generator_max_blocks_total": 160,
+                "block_generator_max_seed_per_bucket": 12,
                 # ---- Block generator: candidate block (pool) threshold ----
-                # These control which blocks enter the candidate POOL.
-                # Can be looser than target_tons_min to allow small blocks
-                # for merge / boundary rebalance / block internal rebuild.
-                "block_generator_candidate_tons_min": 300.0,
-                "block_generator_candidate_tons_target": 700.0,
-                "block_generator_candidate_tons_max": 2000.0,
+                "block_generator_candidate_tons_min": 120.0,
+                "block_generator_candidate_tons_target": 220.0,
+                "block_generator_candidate_tons_max": 450.0,
                 # ---- Block generator: ideal target block threshold ----
-                # These represent the IDEAL final block target.
-                # Used for quality scoring, preference, and final campaign validation.
-                # DO NOT CHANGE the final campaign validation to use candidate_tons_*.
-                "block_generator_target_tons_min": 700.0,
-                "block_generator_target_tons_target": 1200.0,
-                "block_generator_target_tons_max": 2000.0,
-                "block_generator_max_orders_per_block": 20,
+                "block_generator_target_tons_min": 180.0,
+                "block_generator_target_tons_target": 320.0,
+                "block_generator_target_tons_max": 500.0,
+                "block_generator_max_orders_per_block": 12,
                 "block_generator_allow_guarded_family": True,
                 "block_generator_allow_real_bridge": True,
                 "block_generator_allow_mixed_bridge_potential": True,
-                "block_generator_max_family_edges_per_block": 2,
-                "block_generator_max_real_bridge_edges_per_block": 2,
-                "block_generator_max_bridge_count_per_block": 2,
+                "block_generator_max_family_edges_per_block": 1,
+                "block_generator_max_real_bridge_edges_per_block": 1,
+                "block_generator_max_bridge_count_per_block": 1,
                 # ---- Directional clustering weights ----
                 "directional_cluster_width_weight": 1.0,
                 "directional_cluster_thickness_weight": 1.0,
@@ -879,8 +873,8 @@ def build_profile_config(
                 "directional_cluster_mixed_bridge_potential_bonus": 0.3,
                 # ---- Block ALNS configuration ----
                 "block_alns_enabled": True,
-                "block_alns_rounds": 6,
-                "block_alns_early_stop_no_improve_rounds": 2,
+                "block_alns_rounds": 8,
+                "block_alns_early_stop_no_improve_rounds": 3,
                 "block_alns_swap_enabled": True,
                 "block_alns_replace_enabled": True,
                 "block_alns_split_enabled": True,
@@ -889,7 +883,7 @@ def build_profile_config(
                 "block_alns_internal_rebuild_enabled": True,
                 "block_alns_accept_threshold": 0.0,
                 # ---- Block master configuration ----
-                "block_master_slot_buffer": 2,
+                "block_master_slot_buffer": 3,
                 "block_master_greedy": True,
                 "block_master_max_conflict_skip": 5,
                 "block_master_prefer_quality_score": True,

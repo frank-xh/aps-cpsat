@@ -37,6 +37,11 @@ class SolveConfig:
     max_orders: int = 720
     rounds: int = 4
     time_limit_seconds: float = 20.0
+    
+    # Validation/experiment fields
+    profile_name: str = "constructive_lns_search"
+    main_solver_strategy: str | None = None
+    
     # 主模型编排参数：控制外层编排复杂度，默认保持轻量。
     master_profile_count: int = 2
     master_seed_count: int = 2
@@ -1944,6 +1949,7 @@ def _build_schedule_legacy_impl(
 
 def _to_planner_config(config: SolveConfig | object | None):
     from aps_cp_sat.config import ModelConfig, PlannerConfig, RuleConfig, ScoreConfig
+    from aps_cp_sat.config.parameters import build_profile_config
 
     if isinstance(config, PlannerConfig):
         return config
@@ -1952,6 +1958,33 @@ def _to_planner_config(config: SolveConfig | object | None):
         return PlannerConfig()
 
     if isinstance(config, SolveConfig):
+        # 1. If user explicitly provided a specific profile_name, use it.
+        # Fallback to default (which will be mapped to constructive_lns_search by pipeline)
+        # only if profile_name is empty or "default".
+        profile = str(config.profile_name).strip() if config.profile_name else ""
+        if profile and profile != "default":
+            # Build full profile config
+            cfg = build_profile_config(
+                profile,
+                validation_mode=bool(config.validation_mode),
+                production_compatibility_mode=bool(config.production_compatibility_mode)
+            )
+            
+            # 2. Check main_solver_strategy constraint if explicitly requested
+            if config.main_solver_strategy:
+                if config.main_solver_strategy != cfg.model.main_solver_strategy:
+                    raise ValueError(
+                        f"[APS][SolveConfig] Strategy mismatch: "
+                        f"Requested profile '{profile}' uses '{cfg.model.main_solver_strategy}', "
+                        f"but explicitly asked for main_solver_strategy='{config.main_solver_strategy}'"
+                    )
+            
+            # Apply SolveConfig overrides on top of the built profile
+            cfg.model.max_orders = int(config.max_orders)
+            cfg.model.time_limit_seconds = float(config.time_limit_seconds)
+            return cfg
+
+        # If no explicit profile requested, fall back to old ad-hoc mapping
         model = ModelConfig(
             max_orders=int(config.max_orders),
             rounds=int(config.rounds),

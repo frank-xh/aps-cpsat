@@ -22,7 +22,7 @@ import random
 import pandas as pd
 
 from aps_cp_sat.config import PlannerConfig
-from aps_cp_sat.model.block_types import CandidateBlock, CandidateBlockPool
+from aps_cp_sat.model.block_types import CandidateBlock, CandidateBlockPool, BlockCampaignSlot
 from aps_cp_sat.model.block_master import BlockMasterResult
 
 
@@ -211,6 +211,21 @@ def _generate_mixed_bridge_candidates(
 
     return candidates[:max_attempts]
 
+def _check_inter_block_boundary(
+    prev_tail_id: str,
+    cur_head_id: str,
+    graph_edges: List[Dict[str, Any]],
+) -> str:
+    """
+    Check boundary between two blocks.
+    Returns edge type: DIRECT_EDGE, REAL_BRIDGE_EDGE, or UNRESOLVED
+    """
+    edges = [e for e in graph_edges if str(e.get("from_order_id", "")) == prev_tail_id and str(e.get("to_order_id", "")) == cur_head_id]
+    if any(str(e.get("edge_type", "")) == "DIRECT_EDGE" for e in edges):
+        return "DIRECT_EDGE"
+    if any(str(e.get("edge_type", "")) == "REAL_BRIDGE_EDGE" for e in edges):
+        return "REAL_BRIDGE_EDGE"
+    return "UNRESOLVED"
 
 def realize_selected_blocks(
     master_result: BlockMasterResult,
@@ -222,23 +237,7 @@ def realize_selected_blocks(
     """
     Realize selected blocks into a schedule DataFrame.
 
-    For each selected block:
-    1. Order orders within the block using internal edges
-    2. Generate mixed bridge candidates at hotspots (block-internal only)
-    3. Choose the best realization
-    4. Build schedule rows
-
-    Parameters
-    ----------
-    master_result: Result from solve_block_master
-    orders_df: Full orders DataFrame
-    transition_pack: Template transition pack (for graph edges)
-    cfg: PlannerConfig
-    random_seed: Random seed
-
-    Returns
-    -------
-    BlockRealizationResult with realized schedule DataFrame
+    Uses campaign_slots from master_result to output real slot semantics.
     """
     rng = random.Random(random_seed)
 
@@ -270,103 +269,180 @@ def realize_selected_blocks(
         "block_realized_count": 0,
         "block_realization_failed": 0,
         "orders_in_realized_blocks": 0,
+        "failed_block_boundary_count": 0,
+        "failed_boundary_pairs": [],
+        "realization_failed_slot_ids": [],
+        "used_campaign_slots_fallback": False,
     }
 
-    # Orders already in selected blocks
-    selected_order_set = set(master_result.selected_order_ids)
+    # Identify whether we use slots or fallback
+    slots_to_process = master_result.campaign_slots
+    if not slots_to_process:
+        diag_counters["used_campaign_slots_fallback"] = True
+        # Fallback: create fake slots (one per line)
+        slots_to_process = []
+        for line, b_ids in master_result.block_order_by_line.items():
+            slots_to_process.append(
+                BlockCampaignSlot(
+                    line=line,
+                    slot_no=1,
+                    campaign_id=f"{line}__slot_1_fb",
+                    block_ids=b_ids,
+                    total_tons=0,
+                    gap_to_min_tons=0,
+                    remaining_to_max_tons=0,
+                    is_underfilled=False,
+                    head_block_id=b_ids[0] if b_ids else "",
+                    tail_block_id=b_ids[-1] if b_ids else "",
+                )
+            )
 
-    # Process each selected block
-    for block in master_result.selected_blocks:
-        ordered_ids = _order_within_block(block, graph_edges, orders_by_id, rng)
+    block_obj_by_id = {b.block_id: b for b in master_result.selected_blocks}
 
-        # Generate mixed bridge candidates
-        mixed_candidates = _generate_mixed_bridge_candidates(
-            block=block,
-            ordered_ids=ordered_ids,
-            graph_edges=graph_edges,
-            orders_by_id=orders_by_id,
-            cfg=cfg,
-            rng=rng,
-        )
+    # Tracking line sequence
+    global_sequence_on_line = {"big_roll": 0, "small_roll": 0}
 
-        diag_counters["mixed_bridge_attempt_count"] += len(mixed_candidates)
-
-        # Apply mixed bridge candidates (accept all with positive score)
-        applied_mixed: Dict[str, str] = {}  # from -> to with mixed type
-        for mc in mixed_candidates:
-            score = float(mc.get("score", 0))
-            if score > 0:
-                applied_mixed[f"{mc['from_order_id']}->{mc['to_order_id']}"] = str(mc.get("mixed_form", ""))
-
-        # Build block-level schedule rows
-        block_seq = 0
-        block_dropped = []
-
-        for seq_pos, oid in enumerate(ordered_ids):
-            order = orders_by_id.get(oid)
-            if order is None:
-                block_dropped.append(oid)
+    # Process each slot
+    for slot in slots_to_process:
+        sequence_in_slot = 0
+        slot_failed = False
+        prev_block_tail_id = None
+        
+        for block_in_slot_index, block_id in enumerate(slot.block_ids, start=1):
+            if block_id not in block_obj_by_id:
+                continue
+            block = block_obj_by_id[block_id]
+            ordered_ids = _order_within_block(block, graph_edges, orders_by_id, rng)
+            
+            if not ordered_ids:
+                diag_counters["block_realization_failed"] += 1
+                slot_failed = True
                 continue
 
-            # Determine edge type for this position
-            edge_type = "DIRECT_EDGE"
-            edge_key = ""
-            mixed_applied = False
-            if seq_pos > 0:
-                edge_key = f"{ordered_ids[seq_pos - 1]}->{oid}"
-                if edge_key in applied_mixed:
-                    edge_type = applied_mixed[edge_key]
-                    mixed_applied = True
-                else:
-                    # Check original edges
-                    for e in graph_edges:
-                        if (str(e.get("from_order_id", "")) == ordered_ids[seq_pos - 1]
-                           and str(e.get("to_order_id", "")) == oid):
-                            edge_type = str(e.get("edge_type", "DIRECT_EDGE"))
-                            break
+            # Check boundary with previous block in the same slot
+            boundary_edge_type = None
+            inter_block_boundary_before = False
+            boundary_from_block_id = None
+            boundary_to_block_id = None
+            
+            if prev_block_tail_id is not None:
+                cur_head_id = ordered_ids[0]
+                boundary_edge_type = _check_inter_block_boundary(prev_block_tail_id, cur_head_id, graph_edges)
+                inter_block_boundary_before = True
+                boundary_from_block_id = slot.block_ids[block_in_slot_index - 2]
+                boundary_to_block_id = block.block_id
+                
+                if boundary_edge_type == "UNRESOLVED":
+                    diag_counters["failed_block_boundary_count"] += 1
+                    diag_counters["failed_boundary_pairs"].append(f"{prev_block_tail_id}->{cur_head_id}")
+                    slot_failed = True
 
-            row = {
-                "order_id": oid,
-                "sequence_in_block": seq_pos,
-                "block_id": block.block_id,
-                "block_line": block.line,
-                "block_seq": block_seq,
-                "tons": float(order.get("tons", 0)),
-                "width": float(order.get("width", 0)),
-                "thickness": float(order.get("thickness", 0)),
-                "steel_group": str(order.get("steel_group", "")),
-                "temp_min": float(order.get("temp_min", 0)),
-                "temp_max": float(order.get("temp_max", 0)),
-                "edge_type": edge_type,
-                "mixed_bridge_applied": mixed_applied,
-            }
-            schedule_rows.append(row)
-            block_seq += 1
+            # Generate mixed bridge candidates
+            mixed_candidates = _generate_mixed_bridge_candidates(
+                block=block,
+                ordered_ids=ordered_ids,
+                graph_edges=graph_edges,
+                orders_by_id=orders_by_id,
+                cfg=cfg,
+                rng=rng,
+            )
 
-        if len(ordered_ids) > 0:
-            diag_counters["mixed_bridge_success_count"] += len(applied_mixed)
-            diag_counters["block_realized_count"] += 1
-            diag_counters["orders_in_realized_blocks"] += len(ordered_ids)
-            block.is_realized = True
-            block.scheduled_order_ids = list(ordered_ids)
-            realized_blocks.append(block)
-        else:
-            diag_counters["block_realization_failed"] += 1
+            diag_counters["mixed_bridge_attempt_count"] += len(mixed_candidates)
+
+            # Apply mixed bridge candidates (accept all with positive score)
+            applied_mixed: Dict[str, str] = {}  # from -> to with mixed type
+            for mc in mixed_candidates:
+                score = float(mc.get("score", 0))
+                if score > 0:
+                    applied_mixed[f"{mc['from_order_id']}->{mc['to_order_id']}"] = str(mc.get("mixed_form", ""))
+
+            # Build block-level schedule rows
+            for seq_pos, oid in enumerate(ordered_ids):
+                order = orders_by_id.get(oid)
+                if order is None:
+                    continue
+
+                # Determine edge type for this position
+                edge_type = "DIRECT_EDGE"
+                mixed_applied = False
+                
+                if seq_pos == 0 and inter_block_boundary_before:
+                    edge_type = boundary_edge_type
+                elif seq_pos > 0:
+                    edge_key = f"{ordered_ids[seq_pos - 1]}->{oid}"
+                    if edge_key in applied_mixed:
+                        edge_type = applied_mixed[edge_key]
+                        mixed_applied = True
+                    else:
+                        # Check original edges
+                        for e in graph_edges:
+                            if (str(e.get("from_order_id", "")) == ordered_ids[seq_pos - 1]
+                               and str(e.get("to_order_id", "")) == oid):
+                                edge_type = str(e.get("edge_type", "DIRECT_EDGE"))
+                                break
+
+                # Line sequence updates
+                line = slot.line
+                global_sequence_on_line[line] += 1
+                sequence_in_slot += 1
+
+                row = {
+                    "order_id": oid,
+                    "assigned_line": slot.line,
+                    "assigned_slot": slot.slot_no,
+                    "campaign_id": slot.campaign_id,
+                    "block_id": block.block_id,
+                    "block_in_slot_index": block_in_slot_index,
+                    "sequence_in_block": seq_pos + 1,
+                    "sequence_in_slot": sequence_in_slot,
+                    "global_sequence_on_line": global_sequence_on_line[line],
+                    "selected_edge_type": edge_type,
+                    "tons": float(order.get("tons", 0)),
+                    "width": float(order.get("width", 0)),
+                    "thickness": float(order.get("thickness", 0)),
+                    "steel_group": str(order.get("steel_group", "")),
+                    "temp_min": float(order.get("temp_min", 0)),
+                    "temp_max": float(order.get("temp_max", 0)),
+                    "mixed_bridge_applied": mixed_applied,
+                    # Boundary outputs
+                    "inter_block_boundary_before": inter_block_boundary_before if seq_pos == 0 else False,
+                    "boundary_from_block_id": boundary_from_block_id if seq_pos == 0 else None,
+                    "boundary_to_block_id": boundary_to_block_id if seq_pos == 0 else None,
+                    "boundary_edge_type": boundary_edge_type if seq_pos == 0 else None,
+                }
+                schedule_rows.append(row)
+
+            if len(ordered_ids) > 0:
+                diag_counters["mixed_bridge_success_count"] += len(applied_mixed)
+                diag_counters["block_realized_count"] += 1
+                diag_counters["orders_in_realized_blocks"] += len(ordered_ids)
+                block.is_realized = True
+                block.scheduled_order_ids = list(ordered_ids)
+                realized_blocks.append(block)
+                prev_block_tail_id = ordered_ids[-1]
+
+        if slot_failed:
+            diag_counters["realization_failed_slot_ids"].append(slot.campaign_id)
 
     # Build DataFrames
     schedule_df = pd.DataFrame(schedule_rows) if schedule_rows else pd.DataFrame()
 
-    # Dropped orders: orders in selected blocks but not in schedule
-    scheduled_set = set(schedule_df["order_id"]) if not schedule_df.empty else set()
+    # Use dropped_order_ids directly from master_result
+    all_order_ids = set(str(oid) for oid in orders_df["order_id"])
+    dropped_order_ids_set = set(master_result.dropped_order_ids)
+    
+    # In case some orders were dropped during realization (e.g. not found)
+    if not schedule_df.empty:
+        scheduled_set = set(schedule_df["order_id"])
+        additional_drops = [oid for oid in master_result.selected_order_ids if oid not in scheduled_set]
+        dropped_order_ids_set.update(additional_drops)
+        
     dropped = [
         orders_by_id[oid]
-        for oid in selected_order_set
-        if oid not in scheduled_set and oid in orders_by_id
+        for oid in dropped_order_ids_set
+        if oid in orders_by_id
     ]
     dropped_df = pd.DataFrame(dropped) if dropped else pd.DataFrame()
-
-    diag_counters["mixed_bridge_gain_dropped"] = 0  # Can't recover from block realization
-    diag_counters["mixed_bridge_gain_underfilled"] = 0
 
     # Block quality in realized
     if realized_blocks:

@@ -839,6 +839,17 @@ def _build_meta(
     drop_due_to_capacity_count: int = 0,
     drop_due_to_low_priority_count: int = 0,
     drop_due_to_master_unassigned_count: int = 0,
+    # Block first fields
+    exported_from_alns_final: bool = False,
+    effective_selected_blocks_count: int = 0,
+    effective_assigned_slot_count: int = 0,
+    effective_campaign_count: int = 0,
+    effective_dropped_order_count: int = 0,
+    final_realized_order_count: int = 0,
+    final_realized_tons: float = 0.0,
+    realized_order_coverage_final: float = 0.0,
+    selected_order_coverage_pre_assembly: float = 0.0,
+    final_realized_schedule_rows: int = 0,
 ) -> dict:
     joint_estimates = joint_estimates or {}
     slot_route_details = slot_route_details or []
@@ -924,6 +935,22 @@ def _build_meta(
         "drop_due_to_capacity_count": int(drop_due_to_capacity_count),
         "drop_due_to_low_priority_count": int(drop_due_to_low_priority_count),
         "drop_due_to_master_unassigned_count": int(drop_due_to_master_unassigned_count),
+        # Block-first fields
+        "exported_from_alns_final": bool(exported_from_alns_final),
+        "effective_selected_blocks_count": int(effective_selected_blocks_count),
+        "effective_assigned_slot_count": int(effective_assigned_slot_count),
+        "effective_campaign_count": int(effective_campaign_count),
+        "effective_dropped_order_count": int(effective_dropped_order_count),
+        # Realized final metrics
+        "final_realized_order_count": int(final_realized_order_count),
+        "final_realized_tons": float(final_realized_tons),
+        "realized_order_coverage_final": float(realized_order_coverage_final),
+        "selected_order_coverage_pre_assembly": float(selected_order_coverage_pre_assembly),
+        "final_realized_schedule_rows": int(final_realized_schedule_rows),
+        # Compatibility aliases mapping to final realized
+        "assigned_count": int(final_realized_order_count),
+        "assigned_tons": float(final_realized_tons),
+        "selected_order_coverage": float(realized_order_coverage_final),  # Redefine old alias to mean final realized coverage
         # Fixed drop priority order (do not change)
         "drop_priority_order": "GLOBAL_ISO > TON_WINDOW > NO_FEASIBLE_LINE > BRIDGE_NOT_SUPPORTED > ISO > LOW_PRIORITY > OUTLIER > OTHER",
     }
@@ -958,7 +985,7 @@ def solve_master_model(
         #   - constructive_lns_direct_only_baseline: 回归基线 (Route C / direct_only)
         #   - constructive_lns_virtual_guarded_frontload: 受控 virtual family 实验线
         #   - block_first_guarded_search: block-first 主路径 (block_generator -> block_master -> block_realizer -> block_alns)
-        # 其他 alias / 实验线 / debug profile 已从主路径移除。
+        # 其他 alias /实验线 / debug profile 已从主路径移除。
         allowed_engineering_profiles = {
             "constructive_lns_search",
             "constructive_lns_direct_only_baseline",
@@ -1080,43 +1107,85 @@ def solve_master_model(
 
             total_seconds = perf_counter() - t0
 
-            # Build schedule_df from realization
+            # Determine effective results to export
+            if alns_result.iterations_accepted > 0 and alns_result.final_master_result is not None and alns_result.final_realization_result is not None:
+                effective_master_result = alns_result.final_master_result
+                effective_realization_result = alns_result.final_realization_result
+                exported_from_alns_final = True
+            else:
+                effective_master_result = master_result
+                effective_realization_result = realization_result
+                exported_from_alns_final = False
+
+            # Final Realized Metrics Computation
+            realized_df = effective_realization_result.realized_schedule_df
+            if realized_df is not None and not realized_df.empty:
+                final_realized_order_count = int(realized_df["order_id"].nunique()) if "order_id" in realized_df.columns else len(realized_df)
+                final_realized_tons = float(realized_df["tons"].sum()) if "tons" in realized_df.columns else 0.0
+                final_realized_order_ids = set(realized_df["order_id"].tolist()) if "order_id" in realized_df.columns else set()
+                final_realized_schedule_rows = len(realized_df)
+            else:
+                final_realized_order_count = 0
+                final_realized_tons = 0.0
+                final_realized_order_ids = set()
+                final_realized_schedule_rows = 0
+
+            total_orders = len(orders_df)
+            realized_order_coverage_final = float(final_realized_order_count / max(1, total_orders))
+            selected_order_coverage_pre_assembly = float(len(effective_master_result.selected_order_ids) / max(1, total_orders))
+
+            # Build schedule_df from effective realization
             schedule_df = pd.DataFrame()
-            if realization_result.realized_schedule_df is not None and not realization_result.realized_schedule_df.empty:
-                schedule_df = realization_result.realized_schedule_df.copy()
-                schedule_df = schedule_df.rename(columns={
-                    "order_id": "order_id",
-                    "sequence_in_block": "master_seq",
-                    "block_id": "block_id",
-                    "block_line": "assigned_line",
-                    "edge_type": "selected_edge_type",
-                    "tons": "tons",
-                })
+            if realized_df is not None and not realized_df.empty:
+                schedule_df = realized_df.copy()
+                
+                # Make sure essential columns are present
+                for col in ["order_id", "block_id", "assigned_line", "assigned_slot", 
+                           "campaign_id", "block_in_slot_index", "sequence_in_block", 
+                           "sequence_in_slot", "global_sequence_on_line", 
+                           "selected_edge_type", "boundary_edge_type"]:
+                    if col not in schedule_df.columns:
+                        schedule_df[col] = None
+
+                # Keep sequence_in_block and also populate master_seq
+                if "sequence_in_block" in schedule_df.columns:
+                    schedule_df["master_seq"] = schedule_df["sequence_in_block"]
+                else:
+                    schedule_df["sequence_in_block"] = None
+                    schedule_df["master_seq"] = None
+
                 # Add required columns
                 schedule_df["is_unassigned"] = 0
-                schedule_df["assigned_slot"] = 1  # Block realization uses slot=1 per block
                 schedule_df["force_break_before"] = 0
                 schedule_df["selected_template_id"] = ""
                 schedule_df["selected_bridge_path"] = ""
 
-            # Build dropped_df
+            # Build dropped_df from effective master & realized mismatch
             dropped_df = pd.DataFrame()
-            if master_result.dropped_order_ids:
-                all_order_ids = set(str(oid) for oid in orders_df["order_id"])
-                dropped_order_ids_set = set(master_result.dropped_order_ids)
+            all_order_ids = set(str(oid) for oid in orders_df["order_id"])
+
+            # Orders are dropped if they weren't selected OR if they were selected but didn't make it to realized schedule
+            dropped_order_ids_set = set(effective_master_result.dropped_order_ids)
+            additional_drops = [oid for oid in effective_master_result.selected_order_ids if oid not in final_realized_order_ids]
+            dropped_order_ids_set.update(additional_drops)
+
+            effective_dropped_order_count = len(dropped_order_ids_set)
+
+            if dropped_order_ids_set:
                 dropped_records = [
                     dict(row) for _, row in orders_df.iterrows()
                     if str(row["order_id"]) in dropped_order_ids_set
                 ]
                 for rec in dropped_records:
-                    rec["drop_reason"] = "NOT_SELECTED_IN_BLOCKS"
+                    rec["drop_reason"] = "NOT_SELECTED_IN_BLOCKS_OR_SLOTS"
                     rec["dominant_drop_reason"] = "BLOCK_COMPETITION_LOSS"
                     rec["secondary_reasons"] = "BLOCK_FIRST_MASTER"
                 dropped_df = pd.DataFrame(dropped_records)
 
             # Build engine_meta
-            diag = master_result.diagnostics
-            block_real_diag = realization_result.block_realization_diag
+            diag = effective_master_result.diagnostics
+            slot_diag = effective_master_result.slot_diag
+            block_real_diag = effective_realization_result.block_realization_diag
             block_alns_diag = alns_result.neighborhood_diag
 
             engine_meta = {
@@ -1124,18 +1193,21 @@ def solve_master_model(
                 "main_path": "block_first",
                 "profile_name": profile_name,
                 "engine_used": "block_first_new_skeleton",
-                "assigned_count": len(master_result.selected_order_ids),
-                "unassigned_count": len(master_result.dropped_order_ids),
+                "assigned_count": final_realized_order_count,  # Mapped to final realized
+                "unassigned_count": effective_dropped_order_count,
                 # Block generation metrics
                 "generated_blocks_total": block_pool.diagnostics.get("generated_blocks_total", len(block_pool.blocks)),
                 "generated_blocks_by_line": block_pool.diagnostics.get("generated_blocks_by_line", {}),
                 "generated_blocks_by_mode": block_pool.diagnostics.get("generated_blocks_by_mode", {}),
                 # Block master metrics
-                "selected_blocks_count": len(master_result.selected_blocks),
-                "selected_order_coverage": diag.get("selected_order_coverage", 0),
-                "block_master_dropped_count": diag.get("block_master_dropped_count", 0),
+                "selected_blocks_count": len(effective_master_result.selected_blocks),
+                "selected_order_coverage_pre_assembly": selected_order_coverage_pre_assembly,
+                "block_master_dropped_count": effective_dropped_order_count,
                 "avg_block_quality_in_selected": diag.get("avg_block_quality_in_selected", 0.0),
                 "avg_block_tons_in_selected": diag.get("avg_block_tons_in_selected", 0.0),
+                # Slot assembly metrics
+                "assembled_slot_count": slot_diag.get("assembled_slot_count", 0),
+                "underfilled_slot_count": slot_diag.get("underfilled_slot_count", 0),
                 # Block realization metrics
                 "block_realized_count": block_real_diag.get("block_realized_count", 0),
                 "orders_in_realized_blocks": block_real_diag.get("orders_in_realized_blocks", 0),
@@ -1150,6 +1222,19 @@ def solve_master_model(
                 "block_realization_seconds": realizer_seconds,
                 "block_alns_seconds": alns_seconds,
                 "total_block_first_seconds": total_seconds,
+                # Export status
+                "exported_from_alns_final": exported_from_alns_final,
+                "effective_selected_blocks_count": len(effective_master_result.selected_blocks),
+                "effective_assigned_slot_count": slot_diag.get("assembled_slot_count", 0),
+                "effective_campaign_count": slot_diag.get("assembled_slot_count", 0),
+                "effective_dropped_order_count": effective_dropped_order_count,
+                # Final realized metrics
+                "final_realized_order_count": final_realized_order_count,
+                "final_realized_tons": final_realized_tons,
+                "realized_order_coverage_final": realized_order_coverage_final,
+                "selected_order_coverage": realized_order_coverage_final,  # Compatibility
+                "final_realized_schedule_rows": final_realized_schedule_rows,
+                "assigned_tons": final_realized_tons,  # Compatibility
                 # Architecture markers
                 "used_local_routing": False,
                 "local_routing_role": "block_first_new_skeleton",
@@ -1163,8 +1248,8 @@ def solve_master_model(
             }
 
             print(
-                f"[APS][block_first] Complete: {engine_meta['assigned_count']} orders assigned, "
-                f"{engine_meta['unassigned_count']} dropped, "
+                f"[APS][block_first] Complete: {final_realized_order_count} orders realized, "
+                f"{effective_dropped_order_count} dropped, "
                 f"total_time={total_seconds:.2f}s"
             )
 

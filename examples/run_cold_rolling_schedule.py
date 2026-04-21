@@ -6,7 +6,9 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
+# Add src to path to ensure we are running the latest code
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
