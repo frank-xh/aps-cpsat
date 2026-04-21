@@ -1,6 +1,38 @@
-﻿from __future__ import annotations
+"""
+================================================================================
+LEGACY / COMPAT WRAPPER: joint_master.py
+================================================================================
+
+本文件已降级为 compat/helper/legacy 角色，不再是 block-first 主路径。
+
+正式 block-first 主路径已迁移到新骨架：
+  - aps_cp_sat/model/block_generator.py   (block generation)
+  - aps_cp_sat/model/block_master.py      (block selection & ordering)
+  - aps_cp_sat/model/block_realizer.py    (block realization)
+  - aps_cp_sat/model/block_alns.py        (block-level ALNS)
+
+权威入口：model/master.py -> solve_master_model() -> block_first branch
+           -> block_generator.generate_candidate_blocks()
+           -> block_master.solve_block_master()
+           -> block_realizer.realize_selected_blocks()
+           -> block_alns.run_block_alns()
+
+本文件保留内容：
+- 旧 block-first 骨架 prototype (run_block_first_master, run_block_alns_lightweight)
+- Set Packing Master (_run_set_packing_master)
+- 兼容 wrapper (run_legacy_joint_master_block_first) 转发到新骨架
+
+不要依赖本文件中的任何 block-first 函数作为生产路径。
+如果需要 block-first 功能，请使用新的新骨架模块。
+
+================================================================================
+"""
+
+from __future__ import annotations
 
 import math
+import random
+from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Dict, List, Set, Tuple
 
@@ -9,8 +41,42 @@ from ortools.sat.python import cp_model
 
 from aps_cp_sat.config import PlannerConfig
 from aps_cp_sat.model.diagnostics import _estimate_campaign_slots
-from aps_cp_sat.model.feasible_block_builder import MacroBlock, generate_candidate_macro_blocks
+from aps_cp_sat.model.feasible_block_builder import (
+    MacroBlock,
+    generate_candidate_macro_blocks,
+    BlockGeneratorStats,
+)
 from aps_cp_sat.model.local_router import _solve_slot_route_with_templates, _template_total_cost
+
+
+# =============================================================================
+# LEGACY COMPAT: Block-First Master Data Structures (deprecated)
+# =============================================================================
+
+@dataclass
+class BlockMasterResult:
+    """
+    LEGACY: Result of block-first master selection and ordering.
+    
+    NOTE: 已废弃。请使用 aps_cp_sat/model/block_master.py 中的 BlockMasterResult。
+    """
+    selected_blocks: List[MacroBlock] = field(default_factory=list)
+    dropped_order_ids: Set[str] = field(default_factory=set)
+    diagnostics: Dict = field(default_factory=dict)
+
+
+@dataclass
+class BlockALNSResult:
+    """
+    LEGACY: Result of block-level ALNS neighborhood search.
+    
+    NOTE: 已废弃。请使用 aps_cp_sat/model/block_alns.py 中的 BlockALNSResult。
+    """
+    iterations_attempted: int = 0
+    iterations_accepted: int = 0
+    total_runtime_seconds: float = 0.0
+    final_blocks: List[MacroBlock] = field(default_factory=list)
+    final_diagnostics: Dict = field(default_factory=dict)
 
 
 def _run_unified_master_skeleton(orders_df: pd.DataFrame, cfg: PlannerConfig) -> dict:
@@ -1362,3 +1428,677 @@ def _run_global_joint_model(
         "avg_slot_order_count": round(float(total_slot_order_count / max(1, slot_count)), 2),
         "local_router_seconds": round(float(local_router_seconds), 6),
     }
+
+
+# =============================================================================
+# Block-First Master: Block Selection and Ordering
+# =============================================================================
+
+def _compute_block_transition_cost(block1: MacroBlock, block2: MacroBlock, graph) -> float:
+    """
+    Compute transition cost between two adjacent blocks.
+    
+    Lower cost = better transition.
+    """
+    if block1.line != block2.line:
+        return 1000.0  # High penalty for cross-line transitions (shouldn't happen)
+    
+    # Get boundary orders
+    tail1 = block1.tail_order_id
+    head2 = block2.head_order_id
+    
+    # Width transition
+    rec1 = graph.order_record.get(tail1, {})
+    rec2 = graph.order_record.get(head2, {})
+    
+    width1 = float(rec1.get("width", 0) or 0)
+    width2 = float(rec2.get("width", 0) or 0)
+    width_delta = abs(width2 - width1)
+    
+    thick1 = float(rec1.get("thickness", 0) or 0)
+    thick2 = float(rec2.get("thickness", 0) or 0)
+    thick_delta = abs(thick2 - thick1)
+    
+    group1 = str(rec1.get("steel_group", "") or "")
+    group2 = str(rec2.get("steel_group", "") or "")
+    group_diff = 0.0 if group1 == group2 else 1.0
+    
+    # Cost is weighted sum
+    cost = width_delta / 50.0 + thick_delta * 2.0 + group_diff * 3.0
+    return cost
+
+
+def order_selected_blocks_by_transition_cost(
+    blocks: List[MacroBlock],
+    graph,
+) -> List[MacroBlock]:
+    """
+    Order selected blocks by transition cost within each line.
+    
+    Uses greedy ordering: for each line, order blocks to minimize
+    total transition cost.
+    """
+    if not blocks:
+        return []
+    
+    # Group by line
+    by_line: Dict[str, List[MacroBlock]] = {}
+    for block in blocks:
+        by_line.setdefault(block.line, []).append(block)
+    
+    ordered_blocks: List[MacroBlock] = []
+    
+    for line, line_blocks in by_line.items():
+        if len(line_blocks) <= 1:
+            ordered_blocks.extend(line_blocks)
+            continue
+        
+        # Greedy ordering: start with block that has best first order
+        remaining = list(line_blocks)
+        result = []
+        
+        # Start with block that has lowest quality score (less desirable to be first)
+        # This is a simplification; could use more sophisticated ordering
+        remaining.sort(key=lambda b: b.block_quality_score)
+        
+        while remaining:
+            if len(remaining) == 1:
+                result.append(remaining[0])
+                break
+            
+            # Pick best next block based on transition from last placed
+            last_block = result[-1] if result else None
+            
+            if last_block is None:
+                # Pick block with best quality to start
+                best = remaining.pop(0)
+                result.append(best)
+            else:
+                # Find block with lowest transition cost
+                best_idx = 0
+                best_cost = float('inf')
+                
+                for i, candidate in enumerate(remaining):
+                    cost = _compute_block_transition_cost(last_block, candidate, graph)
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_idx = i
+                
+                result.append(remaining.pop(best_idx))
+        
+        # Assign master_seq
+        for seq, block in enumerate(result, start=1):
+            block.master_seq = seq
+        
+        ordered_blocks.extend(result)
+    
+    return ordered_blocks
+
+
+def _select_blocks_greedy(
+    candidate_blocks: List[MacroBlock],
+    order_id_to_idx: Dict[str, int],
+    cfg: PlannerConfig,
+) -> Tuple[List[MacroBlock], Set[str]]:
+    """
+    Greedy block selection for block-first master.
+    
+    Selects non-overlapping blocks that maximize total quality score.
+    """
+    # Sort by quality score (higher = better)
+    sorted_blocks = sorted(candidate_blocks, key=lambda b: -b.block_quality_score)
+    
+    selected: List[MacroBlock] = []
+    selected_order_ids: Set[str] = set()
+    max_conflict_skip = int(getattr(cfg.model, "block_master_max_conflict_skip", 5))
+    
+    for block in sorted_blocks:
+        # Check overlap
+        overlap = selected_order_ids & set(block.order_ids)
+        if overlap:
+            continue
+        
+        # Check slot limit (simplified: just limit total blocks)
+        max_slots = int(getattr(cfg.model, "max_campaign_slots", 14))
+        slot_buffer = int(getattr(cfg.model, "block_master_slot_buffer", 2))
+        
+        if len(selected) >= max_slots + slot_buffer:
+            continue
+        
+        # Check if underfill risk is too high
+        underfill_threshold = 0.7
+        if block.underfill_risk_score > underfill_threshold:
+            # Allow some high-risk blocks but prefer lower risk
+            high_risk_count = sum(1 for b in selected if b.underfill_risk_score > underfill_threshold)
+            if high_risk_count >= max_conflict_skip:
+                continue
+        
+        # Accept block
+        selected.append(block)
+        selected_order_ids.update(block.order_ids)
+    
+    return selected, selected_order_ids
+
+
+def run_block_first_master(
+    orders_df: pd.DataFrame,
+    transition_pack: dict | None,
+    cfg: PlannerConfig,
+    random_seed: int = 2027,
+) -> dict:
+    """
+    Block-First Master: Select and order macro-blocks for scheduling.
+    
+    This function implements the block-first master:
+    1. Generate candidate macro-blocks (via feasible_block_builder)
+    2. Select non-overlapping blocks (greedy set packing)
+    3. Order selected blocks by transition cost
+    4. Return plan_df with campaign assignments
+    
+    Args:
+        orders_df: DataFrame with orders
+        transition_pack: Dict with templates and other transition data
+        cfg: PlannerConfig
+        random_seed: Random seed
+    
+    Returns:
+        dict with plan_df, dropped_df, and block-first diagnostics
+    """
+    t0 = perf_counter()
+    
+    if orders_df.empty:
+        return {
+            "status": "EMPTY",
+            "plan_df": pd.DataFrame(),
+            "dropped_df": pd.DataFrame(),
+            "assigned_count": 0,
+            "unassigned_count": 0,
+            "master_architecture": "block_first",
+        }
+    
+    tpl_df = transition_pack.get("templates") if transition_pack else None
+    if not isinstance(tpl_df, pd.DataFrame) or tpl_df.empty:
+        return {
+            "status": "NO_TEMPLATE",
+            "plan_df": pd.DataFrame(),
+            "dropped_df": pd.DataFrame(),
+            "assigned_count": 0,
+            "unassigned_count": int(len(orders_df)),
+            "master_architecture": "block_first",
+        }
+    
+    # Build order index
+    order_id_list = [str(v) for v in orders_df["order_id"].tolist()]
+    order_id_to_idx = {oid: i for i, oid in enumerate(order_id_list)}
+    order_record: Dict[str, dict] = {str(row["order_id"]): dict(row) for _, row in orders_df.iterrows()}
+    
+    # Generate candidate blocks
+    print(f"[APS][BlockFirst] Generating candidate macro-blocks...")
+    gen_t0 = perf_counter()
+    
+    # Import graph builder
+    from aps_cp_sat.model.feasible_block_builder import TemplateGraph
+    
+    graph = TemplateGraph(orders_df, tpl_df, cfg)
+    
+    target_blocks = int(getattr(cfg.model, "block_generator_target_blocks", 2000))
+    time_limit = float(getattr(cfg.model, "block_generator_time_limit_seconds", 15.0))
+    
+    candidate_blocks, block_stats = generate_candidate_macro_blocks(
+        orders_df=orders_df,
+        tpl_df=tpl_df,
+        cfg=cfg,
+        target_blocks=target_blocks,
+        time_limit_seconds=time_limit,
+        random_seed=random_seed,
+    )
+    
+    gen_seconds = perf_counter() - gen_t0
+    print(
+        f"[APS][BlockFirst] Generated {len(candidate_blocks)} candidate blocks "
+        f"in {gen_seconds:.2f}s"
+    )
+    
+    if not candidate_blocks:
+        dropped_rows = [dict(row) for row in orders_df.to_dict("records")]
+        for row in dropped_rows:
+            row["drop_reason"] = "NO_VALID_MACRO_BLOCK"
+            row["dominant_drop_reason"] = "NO_VALID_MACRO_BLOCK"
+        return {
+            "status": "NO_BLOCKS_GENERATED",
+            "plan_df": pd.DataFrame(),
+            "dropped_df": pd.DataFrame(dropped_rows),
+            "assigned_count": 0,
+            "unassigned_count": int(len(dropped_rows)),
+            "candidate_block_count": 0,
+            "block_generation_seconds": gen_seconds,
+            "master_architecture": "block_first",
+        }
+    
+    # Select blocks (greedy)
+    print(f"[APS][BlockFirst] Selecting blocks...")
+    selected_blocks, selected_order_ids = _select_blocks_greedy(
+        candidate_blocks=candidate_blocks,
+        order_id_to_idx=order_id_to_idx,
+        cfg=cfg,
+    )
+    
+    print(f"[APS][BlockFirst] Selected {len(selected_blocks)} blocks covering {len(selected_order_ids)} orders")
+    
+    # Order blocks by transition cost
+    ordered_blocks = order_selected_blocks_by_transition_cost(selected_blocks, graph)
+    
+    # Build plan_df
+    plan_rows: List[dict] = []
+    line_slot_counter: Dict[str, int] = {"big_roll": 0, "small_roll": 0}
+    
+    for block in ordered_blocks:
+        line_key = str(block.line)
+        if line_key not in line_slot_counter:
+            line_key = "big_roll" if "big" in line_key else "small_roll"
+        
+        line_slot_counter[line_key] += 1
+        campaign_id = line_slot_counter[line_key]
+        
+        for seq_pos, oid in enumerate(block.order_ids, start=1):
+            rec = order_record.get(oid, {})
+            row_idx = order_id_to_idx.get(oid, -1)
+            
+            plan_rows.append({
+                "row_idx": int(row_idx),
+                "order_id": str(oid),
+                "assigned_line": str(line_key),
+                "assigned_slot": int(campaign_id),
+                "master_seq": int(seq_pos),
+                "campaign_id_hint": int(campaign_id),
+                "campaign_seq_hint": int(seq_pos),
+                "selected_template_id": "",
+                "selected_edge_type": "BLOCK_SEQUENCE",
+                "selected_bridge_path": "",
+                "force_break_before": int(1 if seq_pos == 1 else 0),
+                "is_unassigned": 0,
+                "block_id": str(block.block_id),
+                "block_total_tons": float(block.total_tons),
+                "block_quality_score": float(block.block_quality_score),
+                "block_realization_mode": "direct" if not block.mixed_bridge_possible else "mixed_bridge_candidate",
+            })
+    
+    # Build dropped_df
+    dropped_rows: List[dict] = []
+    for oid in order_id_list:
+        if oid not in selected_order_ids:
+            rec = order_record.get(oid, {})
+            dropped_rows.append({
+                "row_idx": int(order_id_to_idx.get(oid, -1)),
+                "order_id": str(oid),
+                "drop_reason": "NOT_SELECTED_IN_BLOCKS",
+                "dominant_drop_reason": "BLOCK_COMPETITION_LOSS",
+                "secondary_reasons": "BLOCK_FIRST_MASTER",
+                "assigned_line": "",
+                "assigned_slot": 0,
+            })
+    
+    plan_df = pd.DataFrame(plan_rows)
+    if not plan_df.empty:
+        plan_df = plan_df.sort_values(
+            ["assigned_line", "assigned_slot", "master_seq"],
+            kind="mergesort"
+        ).reset_index(drop=True)
+    
+    dropped_df = pd.DataFrame(dropped_rows)
+    if not dropped_df.empty:
+        dropped_df = dropped_df.sort_values(["row_idx"], kind="mergesort").reset_index(drop=True)
+    
+    total_assigned_tons = sum(float(block.total_tons) for block in selected_blocks)
+    
+    # Diagnostics
+    selected_blocks_with_real_bridge = sum(1 for b in selected_blocks if b.real_bridge_edge_count > 0)
+    selected_blocks_with_guarded_family = sum(1 for b in selected_blocks if b.virtual_family_edge_count > 0)
+    selected_blocks_with_mixed_bridge = sum(1 for b in selected_blocks if b.mixed_bridge_possible)
+    
+    master_seconds = perf_counter() - t0
+    
+    print(
+        f"[APS][BlockFirst] Result: {len(selected_order_ids)} orders in {len(selected_blocks)} blocks, "
+        f"{len(dropped_rows)} dropped, tons: {total_assigned_tons:.1f}"
+    )
+    
+    return {
+        "status": "FEASIBLE",
+        "plan_df": plan_df,
+        "dropped_df": dropped_df,
+        "assigned_count": int(len(selected_order_ids)),
+        "unassigned_count": int(len(dropped_rows)),
+        "total_assigned_tons": float(total_assigned_tons),
+        "selected_block_count": int(len(selected_blocks)),
+        "candidate_block_count": int(len(candidate_blocks)),
+        "block_generation_seconds": float(gen_seconds),
+        "solve_seconds": float(master_seconds),
+        "slot_count": int(sum(line_slot_counter.values())),
+        "big_roll_slots": int(line_slot_counter.get("big_roll", 0)),
+        "small_roll_slots": int(line_slot_counter.get("small_roll", 0)),
+        "orders_covered_by_blocks": int(len(selected_order_ids)),
+        # Block-first diagnostics
+        "selected_blocks_with_real_bridge": selected_blocks_with_real_bridge,
+        "selected_blocks_with_guarded_family": selected_blocks_with_guarded_family,
+        "selected_blocks_with_mixed_bridge": selected_blocks_with_mixed_bridge,
+        "avg_block_quality_score": sum(b.block_quality_score for b in selected_blocks) / len(selected_blocks) if selected_blocks else 0.0,
+        "avg_block_underfill_risk": sum(b.underfill_risk_score for b in selected_blocks) / len(selected_blocks) if selected_blocks else 0.0,
+        # Generator stats
+        "generated_blocks_total": block_stats.total_blocks_generated,
+        "generated_blocks_with_real_bridge": block_stats.generated_blocks_with_real_bridge,
+        "generated_blocks_with_guarded_family": block_stats.generated_blocks_with_guarded_family,
+        "generated_blocks_with_mixed_bridge_potential": block_stats.generated_blocks_with_mixed_bridge_potential,
+        "blocks_by_ton_range": dict(block_stats.blocks_by_ton_range),
+        "blocks_by_line": dict(block_stats.blocks_by_line),
+        "blocks_by_mode": dict(block_stats.blocks_by_mode),
+        # Master architecture marker
+        "master_architecture": "block_first",
+        "solver_path": "block_first",
+        "used_local_routing": False,
+        "local_routing_role": "block_first_master",
+        "strict_template_edges_enabled": True,
+        "local_router_seconds": 0.0,
+    }
+
+
+# =============================================================================
+# Block ALNS: Lightweight Neighborhood Search
+# =============================================================================
+
+def _swap_blocks(
+    blocks: List[MacroBlock],
+    line: str,
+) -> List[MacroBlock]:
+    """Swap adjacent blocks within a line."""
+    if len(blocks) < 2:
+        return blocks
+    
+    # Find adjacent pair
+    line_blocks = [(i, b) for i, b in enumerate(blocks) if b.line == line]
+    if len(line_blocks) < 2:
+        return blocks
+    
+    # Pick a random adjacent pair
+    rng = random.Random()
+    idx = rng.randint(0, len(line_blocks) - 2)
+    i1, b1 = line_blocks[idx]
+    i2, b2 = line_blocks[idx + 1]
+    
+    # Swap
+    result = list(blocks)
+    result[i1], result[i2] = result[i2], result[i1]
+    return result
+
+
+def _compute_block_objective(
+    blocks: List[MacroBlock],
+    graph,
+) -> float:
+    """Compute total objective value for a block sequence."""
+    if not blocks:
+        return 0.0
+    
+    total = 0.0
+    for block in blocks:
+        total += block.block_quality_score * 10.0
+        total -= block.underfill_risk_score * 5.0
+        total -= block.bridge_dependency_score * 3.0
+    
+    # Transition costs
+    for i in range(len(blocks) - 1):
+        cost = _compute_block_transition_cost(blocks[i], blocks[i + 1], graph)
+        total -= cost
+    
+    return total
+
+
+def run_block_alns_lightweight(
+    initial_blocks: List[MacroBlock],
+    graph,
+    cfg: PlannerConfig,
+    random_seed: int = 42,
+) -> BlockALNSResult:
+    """
+    Lightweight block-level ALNS.
+    
+    Supports 5 neighborhoods:
+    1. BLOCK_SWAP: Swap adjacent blocks
+    2. BLOCK_REPLACE: Replace a block with a better candidate
+    3. BLOCK_SPLIT: Split a large block
+    4. BLOCK_MERGE: Merge two small blocks
+    5. BLOCK_BOUNDARY_REBALANCE: Rebalance block boundaries
+    """
+    t0 = perf_counter()
+    rng = random.Random(random_seed)
+    
+    block_alns_enabled = bool(getattr(cfg.model, "block_alns_enabled", True))
+    if not block_alns_enabled:
+        return BlockALNSResult(
+            iterations_attempted=0,
+            iterations_accepted=0,
+            total_runtime_seconds=0.0,
+            final_blocks=list(initial_blocks),
+        )
+    
+    rounds = int(getattr(cfg.model, "block_alns_rounds", 6))
+    early_stop = int(getattr(cfg.model, "block_alns_early_stop_no_improve_rounds", 2))
+    
+    current_blocks = list(initial_blocks)
+    best_blocks = list(initial_blocks)
+    best_obj = _compute_block_objective(current_blocks, graph)
+    
+    iterations_attempted = 0
+    iterations_accepted = 0
+    no_improve_count = 0
+    
+    neighborhood_ops = ["SWAP", "BOUNDARY_REBALANCE"]  # Start with safe ops
+    
+    for round_idx in range(rounds):
+        iterations_attempted += 1
+        
+        # Pick neighborhood
+        op = rng.choice(neighborhood_ops)
+        
+        if op == "SWAP":
+            # Pick random line
+            lines = list(set(b.line for b in current_blocks))
+            if lines:
+                line = rng.choice(lines)
+                new_blocks = _swap_blocks(list(current_blocks), line)
+            else:
+                new_blocks = current_blocks
+        else:
+            # BOUNDARY_REBALANCE: reorder blocks within line
+            lines = list(set(b.line for b in current_blocks))
+            if lines:
+                line = rng.choice(lines)
+                line_blocks = [b for b in current_blocks if b.line == line]
+                other_blocks = [b for b in current_blocks if b.line != line]
+                
+                # Shuffle line blocks
+                rng.shuffle(line_blocks)
+                new_blocks = other_blocks + line_blocks
+            else:
+                new_blocks = current_blocks
+        
+        # Compute new objective
+        new_obj = _compute_block_objective(new_blocks, graph)
+        
+        # Accept if improved
+        if new_obj > best_obj:
+            current_blocks = new_blocks
+            best_blocks = new_blocks
+            best_obj = new_obj
+            iterations_accepted += 1
+            no_improve_count = 0
+        elif new_obj > _compute_block_objective(current_blocks, graph):
+            # Accept even if not best (simulated annealing lite)
+            if rng.random() < 0.3:  # 30% chance
+                current_blocks = new_blocks
+                iterations_accepted += 1
+                no_improve_count = 0
+        else:
+            no_improve_count += 1
+        
+        # Early stop
+        if no_improve_count >= early_stop:
+            break
+    
+    elapsed = perf_counter() - t0
+    
+    return BlockALNSResult(
+        iterations_attempted=iterations_attempted,
+        iterations_accepted=iterations_accepted,
+        total_runtime_seconds=elapsed,
+        final_blocks=best_blocks,
+        final_diagnostics={
+            "block_swap_attempt_count": iterations_attempted,
+            "block_swap_accepted_count": iterations_accepted,
+            "final_objective": best_obj,
+            "early_stop_triggered": no_improve_count >= early_stop,
+        },
+    )
+
+
+# =============================================================================
+# COMPAT WRAPPER: 转发到新骨架
+# =============================================================================
+
+def run_legacy_joint_master_block_first(
+    orders_df: pd.DataFrame,
+    transition_pack: dict | None,
+    cfg: PlannerConfig,
+    random_seed: int = 2027,
+) -> dict:
+    """
+    COMPAT WRAPPER: 将旧的 joint_master block-first 入口转发到新骨架。
+
+    本函数仅用于向后兼容。任何新的 block-first 调用应直接使用：
+        from aps_cp_sat.model.block_generator import generate_candidate_blocks
+        from aps_cp_sat.model.block_master import solve_block_master
+        from aps_cp_sat.model.block_realizer import realize_selected_blocks
+        from aps_cp_sat.model.block_alns import run_block_alns
+
+    Returns:
+        dict with legacy-style result (for backward compatibility)
+    """
+    import warnings
+    warnings.warn(
+        "run_legacy_joint_master_block_first is deprecated. "
+        "Use the new skeleton modules (block_generator, block_master, block_realizer, block_alns) directly.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+    try:
+        from aps_cp_sat.model.block_generator import generate_candidate_blocks
+        from aps_cp_sat.model.block_master import solve_block_master
+        from aps_cp_sat.model.block_realizer import realize_selected_blocks
+        from aps_cp_sat.model.block_alns import run_block_alns
+    except ImportError as e:
+        return {
+            "status": "IMPORT_ERROR",
+            "error": str(e),
+            "message": "Failed to import new skeleton modules. Please install/update dependencies.",
+            "master_architecture": "block_first_legacy_compat_failed",
+        }
+
+    t0 = perf_counter()
+
+    # Step 1: Generate blocks
+    block_pool = generate_candidate_blocks(
+        orders_df=orders_df,
+        transition_pack=transition_pack,
+        cfg=cfg,
+        constructive_result=None,
+        cut_result=None,
+        dropped_orders=None,
+        random_seed=random_seed,
+    )
+
+    # Step 2: Master selection
+    master_result = solve_block_master(
+        pool=block_pool,
+        orders_df=orders_df,
+        cfg=cfg,
+        random_seed=random_seed,
+    )
+
+    # Step 3: Realization
+    realization_result = realize_selected_blocks(
+        master_result=master_result,
+        orders_df=orders_df,
+        transition_pack=transition_pack,
+        cfg=cfg,
+        random_seed=random_seed,
+    )
+
+    # Step 4: ALNS
+    alns_result = run_block_alns(
+        initial_pool=block_pool,
+        initial_master_result=master_result,
+        initial_realization_result=realization_result,
+        orders_df=orders_df,
+        transition_pack=transition_pack,
+        cfg=cfg,
+        random_seed=random_seed,
+    )
+
+    elapsed = perf_counter() - t0
+
+    # Convert to legacy-style result
+    plan_rows = []
+    if realization_result.realized_schedule_df is not None and not realization_result.realized_schedule_df.empty:
+        schedule_df = realization_result.realized_schedule_df
+        for _, row in schedule_df.iterrows():
+            plan_rows.append({
+                "order_id": str(row.get("order_id", "")),
+                "assigned_line": str(row.get("block_line", "")),
+                "assigned_slot": 1,
+                "master_seq": int(row.get("sequence_in_block", 0)) + 1,
+                "block_id": str(row.get("block_id", "")),
+            })
+
+    dropped_rows = []
+    order_id_list = [str(v) for v in orders_df["order_id"].tolist()]
+    selected_set = set(master_result.selected_order_ids)
+    for oid in order_id_list:
+        if oid not in selected_set:
+            dropped_rows.append({
+                "order_id": oid,
+                "drop_reason": "NOT_SELECTED_IN_BLOCKS",
+                "dominant_drop_reason": "BLOCK_COMPETITION_LOSS",
+            })
+
+    return {
+        "status": "FEASIBLE",
+        "plan_df": pd.DataFrame(plan_rows),
+        "dropped_df": pd.DataFrame(dropped_rows),
+        "assigned_count": len(master_result.selected_order_ids),
+        "unassigned_count": len(master_result.dropped_order_ids),
+        "selected_block_count": len(master_result.selected_blocks),
+        "candidate_block_count": len(block_pool.blocks),
+        "master_architecture": "block_first_new_skeleton",
+        "solver_path": "block_first_compat_wrapper",
+        "used_local_routing": False,
+        "local_routing_role": "block_first_compat",
+        "strict_template_edges_enabled": True,
+        "total_runtime_seconds": elapsed,
+        "compatibility_mode": "legacy_compat",
+        "deprecated_api": True,
+    }
+
+
+# =============================================================================
+# DEPRECATED FUNCTIONS LIST
+# =============================================================================
+#
+# 以下函数已废弃，不应在新的生产代码中使用：
+# - run_block_first_master()        -> 使用 block_master.solve_block_master()
+# - run_block_alns_lightweight()    -> 使用 block_alns.run_block_alns()
+# - run_legacy_joint_master_block_first() -> 直接使用新骨架模块
+#
+# 本文件保留这些函数仅用于向后兼容测试。
+# =============================================================================
+

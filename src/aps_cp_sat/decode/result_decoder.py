@@ -14,10 +14,15 @@ def _encoded_virtual_count(encoded: str) -> int:
 
 
 def _is_constructive_lns_path(df: pd.DataFrame, meta: dict) -> bool:
-    """Detect if df comes from the constructive_lns path (not joint_master)."""
+    """Detect if df comes from the constructive_lns or block_first path (not joint_master)."""
     if str(meta.get("engine_used", "")) == "constructive_lns":
         return True
     if str(meta.get("main_path", "")) == "constructive_lns":
+        return True
+    # block_first uses a lightweight path (no materialize_master_plan needed)
+    if str(meta.get("solver_path", "")) == "block_first":
+        return True
+    if str(meta.get("main_solver_strategy", "")) == "block_first":
         return True
     # Fallback: constructive_lns planned_df always has campaign_id_hint but no campaign_id
     if "campaign_id_hint" in df.columns and "campaign_id" not in df.columns:

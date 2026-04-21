@@ -772,6 +772,205 @@ def build_profile_config(
         )
         return PlannerConfig(rule=base_rule, model=model, score=score)
 
+    # -------------------------------------------------------------------------
+    # Block-First experiment line (block-first guard experiment)
+    #
+    # Profile semantics:
+    #   block_first_guarded_search:
+    #       main_solver_strategy = "block_first"
+    #       allow_real_bridge_edge_in_constructive = True
+    #       allow_virtual_bridge_edge_in_constructive = True (guarded family only)
+    #       bridge_expansion_mode = "disabled"
+    #       virtual_family_frontload_enabled = True
+    #       repair_only_real_bridge_enabled = True
+    #       repair_only_virtual_bridge_enabled = False
+    #
+    # Key difference from constructive_lns_virtual_guarded_frontload:
+    #   - NOT order-first (chain → segment → repair)
+    #   - INSTEAD block-first (candidate blocks → block master → block realize → block ALNS)
+    #   - Bridge/mixed-bridge happen INSIDE each block, not in global graph
+    # -------------------------------------------------------------------------
+    if profile == "block_first_guarded_search":
+        score = ScoreConfig(
+            **{
+                **base_score.__dict__,
+                "slot_order_count_penalty": 0,
+                "unassigned_real": 0,
+                "virtual_bridge_penalty": 200,
+                "real_bridge_penalty": 40,
+            }
+        )
+        model = ModelConfig(
+            **{
+                **base_model.__dict__,
+                "profile_name": "block_first_guarded_search",
+                # ---- Block-first master strategy ----
+                "main_solver_strategy": "block_first",
+                # LNS parameters (for block ALNS, not order ALNS)
+                "rounds": 10,
+                "constructive_lns_rounds": 10,
+                "lns_early_stop_no_improve_rounds": 3,
+                "lns_max_total_rounds": 10,
+                "lns_min_rounds_before_early_stop": 4,
+                "constructive_destroy_ratio_min": 0.20,
+                "constructive_destroy_ratio_max": 0.35,
+                "constructive_subproblem_max_orders": 40,
+                "constructive_enable_cp_sat_repair": True,
+                # ---- Bridge edge policy: same as guarded frontload ----
+                "allow_virtual_bridge_edge_in_constructive": True,
+                "allow_real_bridge_edge_in_constructive": True,
+                "bridge_expansion_mode": "disabled",
+                "repair_only_real_bridge_enabled": True,
+                "repair_only_virtual_bridge_enabled": False,
+                "repair_only_virtual_bridge_pilot_enabled": False,
+                # ---- Guarded virtual family (block context) ----
+                "virtual_family_frontload_enabled": True,
+                "virtual_family_frontload_global_topk_per_from": 3,
+                "virtual_family_frontload_global_max_edges_total": 360,
+                "virtual_family_frontload_repair_max_edges_total": 900,
+                "virtual_family_frontload_allowed_families": ["WIDTH_GROUP", "THICKNESS", "GROUP_TRANSITION"],
+                "virtual_family_frontload_max_bridge_count": 2,
+                "virtual_family_frontload_only_when_underfill_or_drop_pressure": True,
+                "virtual_family_frontload_min_block_tons": 80.0,
+                "virtual_family_frontload_max_block_tons": 450.0,
+                "virtual_family_frontload_alns_only_extra_topk": 4,
+                "virtual_family_frontload_local_cpsat_only": False,
+                "virtual_family_frontload_global_penalty": 100.0,
+                "virtual_family_frontload_local_penalty": 70.0,
+                "virtual_family_frontload_require_family_budget": True,
+                "virtual_family_budget_per_line": 4,
+                "virtual_family_budget_per_segment": 2,
+                # ---- Block generator configuration ----
+                "block_generator_target_blocks": 2000,
+                "block_generator_time_limit_seconds": 15.0,
+                "block_generator_max_blocks_per_line": 30,
+                "block_generator_max_blocks_total": 80,
+                "block_generator_max_seed_per_bucket": 8,
+                # ---- Block generator: candidate block (pool) threshold ----
+                # These control which blocks enter the candidate POOL.
+                # Can be looser than target_tons_min to allow small blocks
+                # for merge / boundary rebalance / block internal rebuild.
+                "block_generator_candidate_tons_min": 300.0,
+                "block_generator_candidate_tons_target": 700.0,
+                "block_generator_candidate_tons_max": 2000.0,
+                # ---- Block generator: ideal target block threshold ----
+                # These represent the IDEAL final block target.
+                # Used for quality scoring, preference, and final campaign validation.
+                # DO NOT CHANGE the final campaign validation to use candidate_tons_*.
+                "block_generator_target_tons_min": 700.0,
+                "block_generator_target_tons_target": 1200.0,
+                "block_generator_target_tons_max": 2000.0,
+                "block_generator_max_orders_per_block": 20,
+                "block_generator_allow_guarded_family": True,
+                "block_generator_allow_real_bridge": True,
+                "block_generator_allow_mixed_bridge_potential": True,
+                "block_generator_max_family_edges_per_block": 2,
+                "block_generator_max_real_bridge_edges_per_block": 2,
+                "block_generator_max_bridge_count_per_block": 2,
+                # ---- Directional clustering weights ----
+                "directional_cluster_width_weight": 1.0,
+                "directional_cluster_thickness_weight": 1.0,
+                "directional_cluster_temp_weight": 0.8,
+                "directional_cluster_group_weight": 1.2,
+                "directional_cluster_due_weight": 0.6,
+                "directional_cluster_tons_fill_weight": 1.0,
+                "directional_cluster_real_bridge_bonus": 0.8,
+                "directional_cluster_guarded_family_bonus": 0.5,
+                "directional_cluster_mixed_bridge_potential_bonus": 0.3,
+                # ---- Block ALNS configuration ----
+                "block_alns_enabled": True,
+                "block_alns_rounds": 6,
+                "block_alns_early_stop_no_improve_rounds": 2,
+                "block_alns_swap_enabled": True,
+                "block_alns_replace_enabled": True,
+                "block_alns_split_enabled": True,
+                "block_alns_merge_enabled": True,
+                "block_alns_boundary_rebalance_enabled": True,
+                "block_alns_internal_rebuild_enabled": True,
+                "block_alns_accept_threshold": 0.0,
+                # ---- Block master configuration ----
+                "block_master_slot_buffer": 2,
+                "block_master_greedy": True,
+                "block_master_max_conflict_skip": 5,
+                "block_master_prefer_quality_score": True,
+                # ---- Mixed bridge (block-internal only, NOT global) ----
+                "mixed_bridge_in_block_enabled": True,
+                "mixed_bridge_allowed_forms": ["REAL_TO_GUARDED", "GUARDED_TO_REAL"],
+                "mixed_bridge_allowed_hotspots": ["underfill", "group_switch", "bridge_dependency", "width_tension"],
+                "mixed_bridge_max_attempts_per_block": 10,
+                # ---- Repair bridge (same as guarded frontload) ----
+                "virtual_bridge_pilot_max_blocks_per_run": 15,
+                "virtual_bridge_pilot_max_per_block": 1,
+                "virtual_bridge_pilot_max_virtual_tons": 30.0,
+                "virtual_bridge_pilot_penalty": 1000000.0,
+                "virtual_bridge_pilot_only_when_endpoint_class": ["HAS_ENDPOINT_EDGE", "BAND_TOO_NARROW"],
+                "virtual_bridge_pilot_only_when_dominant_fail": ["THICKNESS_RULE_FAIL", "WIDTH_RULE_FAIL", "GROUP_SWITCH_FAIL", "MULTI_RULE_FAIL"],
+                "repair_only_bridge_max_per_segment": 1,
+                "repair_only_bridge_cost_penalty": 100000.0,
+                "repair_bridge_left_band_k": 3,
+                "repair_bridge_right_band_k": 3,
+                "repair_bridge_band_max_pairs_per_split": 9,
+                "repair_bridge_left_trim_max": 2,
+                "repair_bridge_right_trim_max": 2,
+                "repair_bridge_endpoint_adjustment_limit_per_split": 9,
+                "repair_bridge_adjustment_enable_left_trim": True,
+                "repair_bridge_adjustment_enable_right_trim": True,
+                "repair_bridge_adjustment_enable_swap": False,
+                "repair_bridge_ton_rescue_max_neighbor_blocks": 6,
+                "repair_bridge_ton_rescue_enable_backward": True,
+                "repair_bridge_ton_rescue_enable_forward": True,
+                "repair_bridge_ton_rescue_enable_bidirectional": True,
+                "repair_bridge_ton_rescue_max_orders_per_window": 50,
+                "repair_bridge_ton_rescue_max_failed_windows_after_min": 2,
+                "strict_template_edges": True,
+                "allow_fallback": False,
+                "allow_legacy_fallback": False,
+                "enableSemanticFallback": False,
+                "enableScaleDownFallback": False,
+                "enableStructureFallback": False,
+                "enableLegacyFallback": False,
+                "validation_mode": bool(validation_mode),
+                "time_limit_seconds": 60.0,
+                "min_real_schedule_ratio": 0.90,
+                "master_profile_count": 1,
+                "master_seed_count": 1,
+                "max_campaign_slots": 14,
+                "min_campaign_slots": 6,
+                "big_roll_slot_soft_order_cap": 20,
+                "small_roll_slot_soft_order_cap": 24,
+                "export_failed_result_for_debug": True,
+                "tail_rebalance_enabled": True,
+                "tail_rebalance_max_pullback_orders": 8,
+                "tail_rebalance_max_pullback_tons10": 2500,
+                "tail_rebalance_accept_if_prev_stays_above_min": True,
+                "max_tail_repair_windows_per_line": 12,
+                "max_tail_repair_windows_total": 24,
+                "max_recut_cutpoints_per_window": 12,
+                "max_fill_candidates_per_tail": 20,
+                "tail_repair_gap_to_min_limit": 220.0,
+                "tail_fill_from_dropped_enabled": True,
+                "tail_fill_gap_to_min_limit": 220.0,
+                "tail_fill_accept_partial_progress": True,
+                "tail_fill_max_inserts_per_tail": 2,
+                "tail_fill_second_pass_gap_limit": 30.0,
+                "small_roll_dual_reserve_enabled": True,
+                "small_roll_dual_reserve_penalty": 15,
+                "small_roll_dual_reserve_bucket_enabled": True,
+                "small_roll_dual_reserve_bucket_ratio": 0.45,
+                "small_roll_dual_reserve_bucket_max_orders": 120,
+                "small_roll_seed_first_enabled": True,
+                "small_roll_seed_min_orders": 20,
+                "small_roll_seed_min_tons10": 5000,
+                "small_roll_dual_reserve_quota_enabled": True,
+                "small_roll_dual_reserve_quota_min_orders": 25,
+                "small_roll_dual_reserve_quota_min_tons10": 6000,
+                "small_roll_dual_reserve_quota_max_orders": 60,
+                "small_roll_dual_reserve_quota_max_tons10": 14000,
+                "big_roll_dual_release_after_small_seed": True,
+            }
+        )
+        return PlannerConfig(rule=base_rule, model=model, score=score)
+
     model = base_model
     if bool(validation_mode):
         model = ModelConfig(

@@ -82,10 +82,13 @@ class ConstructiveBuildResult:
     chains_by_line: Dictionary mapping line name to list of ConstructiveChain
     dropped_seed_orders: List of orders that could not be placed in any chain
     diagnostics: Build statistics and diagnostics
+    repair_family_edges: Aggregated repair pool of family edges from all lines,
+        for use by ALNS / local rebuild in guarded family mode.
     """
     chains_by_line: Dict[str, List[ConstructiveChain]] = field(default_factory=dict)
     dropped_seed_orders: List[dict] = field(default_factory=list)
     diagnostics: Dict = field(default_factory=dict)
+    repair_family_edges: List = field(default_factory=list)  # CandidateEdge list
 
     def get_all_chains(self) -> List[ConstructiveChain]:
         """Get all chains across all lines."""
@@ -147,6 +150,8 @@ class TemplateEdgeGraph:
         # candidate_graph_source: "pipeline" = reused from pipeline (normal)
         #                          "builder_fallback" = built locally by TemplateEdgeGraph
         self.candidate_graph_source: str = "builder_fallback"
+        # Full CandidateGraphBuildResult (for accessing repair_family_edges)
+        self.candidate_graph_result = None
 
         # ---- Small roll dual-order reserve: per-line degree tracking ----
         self.big_deg: Dict[str, int] = {}
@@ -215,11 +220,13 @@ class TemplateEdgeGraph:
         # ---- Use pre-built candidate graph if available (normal path) ----
         if candidate_graph is not None:
             self.candidate_graph_source = "pipeline"
+            self.candidate_graph_result = candidate_graph
             self.candidate_graph_diagnostics = dict(getattr(candidate_graph, "diagnostics", {}) or {})
         else:
             # Fallback: build locally (legacy compat path)
             self.candidate_graph_source = "builder_fallback"
             candidate_graph = build_candidate_graph(self.orders_df, self.tpl_df, self.cfg)
+            self.candidate_graph_result = candidate_graph
             self.candidate_graph_diagnostics = dict(candidate_graph.diagnostics)
             print(
                 f"[APS][CandidateGraph][WARNING] candidate_graph built by TemplateEdgeGraph fallback "
@@ -1723,10 +1730,18 @@ def build_constructive_sequences(
     diagnostics["greedy_bridge_scarcity_penalty_hits"] = getattr(graph, "greedy_bridge_scarcity_penalty_hits", 0)
     diagnostics.update(graph.candidate_graph_diagnostics)
 
+    # Collect repair_family_edges from candidate_graph_result for ALNS/local rebuild
+    _cgr = getattr(graph, "candidate_graph_result", None)
+    _repair_family_edges: list = []
+    if _cgr is not None:
+        _repair_family_edges = list(getattr(_cgr, "repair_family_edges", []) or [])
+    diagnostics["repair_family_edges_count"] = len(_repair_family_edges)
+
     return ConstructiveBuildResult(
         chains_by_line=chains_by_line,
         dropped_seed_orders=dropped_seed_orders,
         diagnostics=diagnostics,
+        repair_family_edges=_repair_family_edges,
     )
 
 

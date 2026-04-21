@@ -1267,6 +1267,7 @@ def _select_neighborhood(
     strategy: NeighborhoodType,
     segments: List[CampaignSegment],
     dropped_by_reason: Dict[str, List[str]],
+    orders_df: pd.DataFrame,
     rand: random.Random,
     cfg: PlannerConfig,
     underfilled_bias_segs: Optional[List[CampaignSegment]] = None,
@@ -1346,11 +1347,43 @@ def _select_neighborhood(
             scored.append((score, seg))
 
         elif strategy == NeighborhoodType.HIGH_DROP_PRESSURE:
-            drop_count = 0
-            for reason, oids in dropped_by_reason.items():
-                drop_count += len(oids)
-            pressure = drop_count
+            # True local drop pressure: segment-specific based on nearby recoverable dropped orders
+            pressure_info = _compute_segment_drop_pressure(seg, dropped_by_reason, orders_df, cfg)
+            pressure = pressure_info["drop_pressure_score"]
             scored.append((pressure, seg))
+
+        elif strategy == NeighborhoodType.WIDTH_TENSION_HOTSPOT:
+            # Score by width range: larger range = higher hotspot tension
+            if len(seg.order_ids) >= 2:
+                widths = []
+                for oid in seg.order_ids:
+                    if oid in orders_df.set_index("order_id").index:
+                        widths.append(float(orders_df.set_index("order_id").loc[oid].get("width", 0) or 0))
+                width_range = max(widths) - min(widths) if widths else 0.0
+                scored.append((width_range, seg))
+            else:
+                scored.append((0.0, seg))
+
+        elif strategy == NeighborhoodType.GROUP_SWITCH_HOTSPOT:
+            # Score by group switch count within segment
+            if len(seg.order_ids) >= 2:
+                groups = []
+                for oid in seg.order_ids:
+                    if oid in orders_df.set_index("order_id").index:
+                        groups.append(str(orders_df.set_index("order_id").loc[oid].get("steel_group", "") or ""))
+                switch_count = sum(1 for i in range(len(groups) - 1) if groups[i] != groups[i + 1])
+                scored.append((switch_count, seg))
+            else:
+                scored.append((0.0, seg))
+
+        elif strategy == NeighborhoodType.BRIDGE_DEPENDENT_SEGMENT:
+            # Score by how underfilled + bridge edge dependent the segment is
+            ton_min = float(cfg.rule.campaign_ton_min)
+            gap = max(0.0, ton_min - seg.total_tons)
+            # Also prefer segments with many orders (more candidates to disrupt)
+            order_count_factor = len(seg.order_ids) / 10.0
+            score = gap + order_count_factor
+            scored.append((score, seg))
 
         elif strategy == NeighborhoodType.TAIL_REBALANCE:
             # Pick segments that are closest to ton_min (tail candidates).
@@ -1445,13 +1478,397 @@ def _destroy_orders_from_segments(
     return new_segments, remaining_removed
 
 
-def _compute_destroy_count(segments: List[CampaignSegment], rand: random.Random) -> int:
-    """Compute how many orders to destroy (20%~35% of segment orders)."""
+def _compute_destroy_count(
+    segments: List[CampaignSegment],
+    rand: random.Random,
+    hotspot_strength: float = 0.0,
+) -> int:
+    """
+    Compute how many orders to destroy (20%~35% of segment orders).
+
+    Args:
+        segments: Selected segments for destruction.
+        rand: Random generator.
+        hotspot_strength: [0,1] factor that biases destroy count upward when hotspots are strong.
+            - hotspot_strength=0 → use lower end (20%)
+            - hotspot_strength=1 → use upper end (35%)
+    """
     total = sum(len(s.order_ids) for s in segments if s.is_valid)
     if total == 0:
         return 0
-    frac = rand.uniform(0.20, 0.35)
+    base_frac = 0.20 + hotspot_strength * 0.15  # 0.20~0.35
+    frac = rand.uniform(base_frac, min(0.35, base_frac + 0.05))
     return max(1, int(total * frac))
+
+
+# ---------------------------------------------------------------------------
+# Helper: Segment local drop-pressure scoring
+# ---------------------------------------------------------------------------
+
+def _compute_segment_drop_pressure(
+    seg: CampaignSegment,
+    dropped_by_reason: Dict[str, List[str]],
+    orders_df: pd.DataFrame,
+    cfg: PlannerConfig,
+) -> dict:
+    """
+    Compute true local drop-pressure for a segment.
+
+    Returns a dict with:
+      - drop_pressure_score: combined score (higher = more pressure)
+      - nearby_dropped_count: dropped orders with compatible line capability
+      - same_line_capable_dropped_count: dropped orders on same line
+      - width_compatible_dropped_count: width-delta within 250 of segment avg
+      - group_compatible_or_bridgeable_count: same steel_group or bridgeable
+      - tons_recoverable_estimate: estimated tonnage recoverable
+      - segment_avg_width: average width of orders in segment
+    """
+    if orders_df.empty:
+        return {
+            "drop_pressure_score": 0.0,
+            "nearby_dropped_count": 0,
+            "same_line_capable_dropped_count": 0,
+            "width_compatible_dropped_count": 0,
+            "group_compatible_or_bridgeable_count": 0,
+            "tons_recoverable_estimate": 0.0,
+            "segment_avg_width": 0.0,
+        }
+
+    # Build order lookups
+    order_lookup = orders_df.set_index("order_id")
+    seg_oids = seg.order_ids
+
+    # Segment properties
+    seg_recs = {}
+    for oid in seg_oids:
+        if oid in order_lookup.index:
+            seg_recs[oid] = dict(order_lookup.loc[oid])
+
+    seg_avg_width = 0.0
+    seg_widths = [float(r.get("width", 0) or 0) for r in seg_recs.values()]
+    if seg_widths:
+        seg_avg_width = sum(seg_widths) / len(seg_widths)
+
+    seg_line_cap = set()
+    for r in seg_recs.values():
+        cap = str(r.get("line_capability", "dual") or "dual").lower()
+        if cap in ("big_roll", "dual"):
+            seg_line_cap.add("big_roll")
+        if cap in ("small_roll", "dual"):
+            seg_line_cap.add("small_roll")
+
+    seg_groups = {str(r.get("steel_group", "") or "") for r in seg_recs.values()}
+
+    # Collect all dropped orders
+    all_dropped = []
+    for oids in dropped_by_reason.values():
+        all_dropped.extend(oids)
+
+    nearby = 0
+    same_line = 0
+    width_compat = 0
+    group_compat = 0
+    tons_est = 0.0
+
+    WIDTH_WINDOW = 250.0  # width delta tolerance
+    for oid in all_dropped:
+        if oid not in order_lookup.index:
+            continue
+        rec = dict(order_lookup.loc[oid])
+
+        # 1. Line capability compatibility
+        drop_cap = str(rec.get("line_capability", "dual") or "dual").lower()
+        drop_line_ok = False
+        if drop_cap in ("big_roll", "dual") and "big_roll" in seg_line_cap:
+            drop_line_ok = True
+        if drop_cap in ("small_roll", "dual") and "small_roll" in seg_line_cap:
+            drop_line_ok = True
+
+        if drop_line_ok:
+            nearby += 1
+        else:
+            continue  # skip incompatible line
+
+        # 2. Same line
+        if seg.line == "big_roll" and drop_cap in ("big_roll", "dual"):
+            same_line += 1
+        elif seg.line == "small_roll" and drop_cap in ("small_roll", "dual"):
+            same_line += 1
+
+        # 3. Width compatibility (within window)
+        drop_width = float(rec.get("width", 0) or 0)
+        if abs(drop_width - seg_avg_width) <= WIDTH_WINDOW and seg_avg_width > 0:
+            width_compat += 1
+
+        # 4. Group compatibility or bridgeable
+        drop_group = str(rec.get("steel_group", "") or "")
+        if drop_group in seg_groups:
+            group_compat += 1
+        else:
+            # Check if bridgeable (different groups but compatible thickness range)
+            seg_thicks = [float(r.get("thickness", 0) or 0) for r in seg_recs.values() if float(r.get("thickness", 0) or 0) > 0]
+            drop_thick = float(rec.get("thickness", 0) or 0)
+            if seg_thicks and drop_thick > 0:
+                thick_range = max(seg_thicks) - min(seg_thicks)
+                if abs(drop_thick - (sum(seg_thicks) / len(seg_thicks))) <= thick_range * 0.5:
+                    group_compat += 1  # bridgeable via thickness compatibility
+
+        # 5. Tonnage estimate
+        tons_est += float(rec.get("tons", 0) or 0)
+
+    # Combined pressure score
+    # Weight: nearby_dropped (0.4) + same_line (0.3) + width_compat (0.2) + group (0.1)
+    score = (
+        nearby * 0.4
+        + same_line * 0.3
+        + width_compat * 0.2
+        + group_compat * 0.1
+    )
+
+    return {
+        "drop_pressure_score": score,
+        "nearby_dropped_count": nearby,
+        "same_line_capable_dropped_count": same_line,
+        "width_compatible_dropped_count": width_compat,
+        "group_compatible_or_bridgeable_count": group_compat,
+        "tons_recoverable_estimate": tons_est,
+        "segment_avg_width": seg_avg_width,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Helper: Hotspot destroy candidates
+# ---------------------------------------------------------------------------
+
+def _collect_hotspot_destroy_candidates(
+    seg: CampaignSegment,
+    neighborhood: NeighborhoodType,
+    orders_df: pd.DataFrame,
+    orders_to_remove_count: int,
+    rand: random.Random,
+    drop_pressure_info: Optional[dict] = None,
+) -> Tuple[List[str], dict]:
+    """
+    Collect hotspot-driven destroy candidates for a segment.
+
+    Instead of uniform random sampling from middle orders, this focuses
+    destruction around the business-defined "hotspot center" of each neighborhood.
+
+    Returns:
+        (candidate_order_ids, hotspot_diag)
+    """
+    hotspot_diag: dict = {
+        "hotspot_type": neighborhood.value,
+        "hotspot_center_order_id": "",
+        "hotspot_window_size": 0,
+        "hotspot_candidates": [],
+        "hotspot_random_backfill_count": 0,
+    }
+
+    if orders_df.empty or not seg.order_ids or len(seg.order_ids) <= 2:
+        return [], hotspot_diag
+
+    order_lookup = orders_df.set_index("order_id")
+    seg_oids = list(seg.order_ids)
+    n = len(seg_oids)
+
+    # Build per-order metadata
+    def get_rec(oid: str) -> dict:
+        if oid in order_lookup.index:
+            return dict(order_lookup.loc[oid])
+        return {}
+
+    # ---- Identify hotspot center and window ----
+    hotspot_center_idx = -1
+    hotspot_window_start = 1  # default: middle orders only
+    hotspot_window_end = n - 1
+
+    if neighborhood == NeighborhoodType.LOW_FILL_SEGMENT:
+        # Hotspot: near tail (end), where gap_to_min is largest
+        # Prefer destroying last 2-4 middle orders (not anchors)
+        hotspot_window_start = max(1, n - 4)
+        hotspot_window_end = n - 1
+        hotspot_center_idx = seg_oids[min(n - 2, n - 1)] if seg_oids else ""
+
+    elif neighborhood == NeighborhoodType.HIGH_DROP_PRESSURE:
+        # Hotspot: position where width/group most matches dropped pool
+        dp_info = drop_pressure_info or {}
+        seg_avg_w = dp_info.get("segment_avg_width", 0.0)
+        # Find position where order width is closest to segment avg width
+        best_idx = 1
+        best_diff = float("inf")
+        for i, oid in enumerate(seg_oids):
+            rec = get_rec(oid)
+            w = float(rec.get("width", 0) or 0)
+            diff = abs(w - seg_avg_w) if seg_avg_w > 0 else float("inf")
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = i
+        hotspot_center_idx = seg_oids[best_idx] if seg_oids else ""
+        hotspot_window_start = max(1, best_idx - 1)
+        hotspot_window_end = min(n - 1, best_idx + 2)
+
+    elif neighborhood == NeighborhoodType.TAIL_REBALANCE:
+        # Hotspot: last 2-3 middle orders (tail anchor stays, but near-tail is soft)
+        hotspot_window_start = max(1, n - 3)
+        hotspot_window_end = n - 1
+        hotspot_center_idx = seg_oids[n - 2] if seg_oids and n > 1 else ""
+
+    elif neighborhood == NeighborhoodType.GROUP_SWITCH_HOTSPOT:
+        # Hotspot: group switch edge in segment
+        # Find the position with most group transitions
+        switch_positions = []
+        for i in range(n - 1):
+            rec_i = get_rec(seg_oids[i])
+            rec_j = get_rec(seg_oids[i + 1])
+            g_i = str(rec_i.get("steel_group", "") or "")
+            g_j = str(rec_j.get("steel_group", "") or "")
+            if g_i != g_j:
+                switch_positions.append(i + 1)  # index after the switch
+        if switch_positions:
+            hotspot_center_idx = seg_oids[min(switch_positions, key=lambda x: abs(x - len(seg_oids) // 2))]
+            # Window: ±1 around switch position
+            center_pos = switch_positions[0]
+            hotspot_window_start = max(1, center_pos - 1)
+            hotspot_window_end = min(n - 1, center_pos + 2)
+        else:
+            # No switch found: use last third
+            hotspot_window_start = max(1, n * 2 // 3)
+            hotspot_window_end = n - 1
+            hotspot_center_idx = seg_oids[hotspot_window_start]
+
+    elif neighborhood == NeighborhoodType.WIDTH_TENSION_HOTSPOT:
+        # Hotspot: largest width delta position
+        max_delta = 0.0
+        max_delta_pos = n // 2
+        for i in range(n - 1):
+            rec_i = get_rec(seg_oids[i])
+            rec_j = get_rec(seg_oids[i + 1])
+            w_i = float(rec_i.get("width", 0) or 0)
+            w_j = float(rec_j.get("width", 0) or 0)
+            delta = abs(w_i - w_j)
+            if delta > max_delta:
+                max_delta = delta
+                max_delta_pos = i + 1
+        hotspot_center_idx = seg_oids[max_delta_pos] if seg_oids else ""
+        hotspot_window_start = max(1, max_delta_pos - 1)
+        hotspot_window_end = min(n - 1, max_delta_pos + 2)
+
+    elif neighborhood == NeighborhoodType.BRIDGE_DEPENDENT_SEGMENT:
+        # Hotspot: positions adjacent to existing REAL_BRIDGE_EDGE in segment
+        # For now, use the center of the segment as proxy
+        center_pos = n // 2
+        hotspot_center_idx = seg_oids[center_pos] if seg_oids else ""
+        hotspot_window_start = max(1, center_pos - 1)
+        hotspot_window_end = min(n - 1, center_pos + 2)
+
+    else:
+        # Fallback: use all middle orders
+        hotspot_window_start = 1
+        hotspot_window_end = n - 1
+        hotspot_center_idx = seg_oids[n // 2] if seg_oids else ""
+
+    # Clamp window
+    hotspot_window_start = max(1, min(hotspot_window_start, n - 1))
+    hotspot_window_end = max(hotspot_window_start, min(hotspot_window_end, n - 1))
+    hotspot_window_size = max(0, hotspot_window_end - hotspot_window_start + 1)
+
+    # Collect window candidates (exclude anchors at index 0 and n-1)
+    window_candidates = seg_oids[hotspot_window_start:hotspot_window_end + 1]
+    hotspot_diag["hotspot_window_size"] = hotspot_window_size
+    hotspot_diag["hotspot_center_order_id"] = str(hotspot_center_idx) if hotspot_center_idx != -1 else ""
+
+    # If window has enough candidates, prioritize them
+    if len(window_candidates) >= orders_to_remove_count:
+        selected = rand.sample(window_candidates, orders_to_remove_count)
+        hotspot_diag["hotspot_candidates"] = selected
+        hotspot_diag["hotspot_random_backfill_count"] = 0
+        return selected, hotspot_diag
+
+    # Otherwise: take all window candidates, then backfill from other middle orders
+    selected = list(window_candidates)
+    remaining = orders_to_remove_count - len(selected)
+
+    # Backfill from other middle orders (not in window, not anchors)
+    all_middle = set(seg_oids[1:n - 1]) - set(window_candidates)
+    if remaining > 0 and all_middle:
+        backfill_pool = list(all_middle)
+        rand.shuffle(backfill_pool)
+        backfill = backfill_pool[:remaining]
+        selected.extend(backfill)
+        hotspot_diag["hotspot_random_backfill_count"] = len(backfill)
+
+    hotspot_diag["hotspot_candidates"] = selected[:orders_to_remove_count]
+    return selected[:orders_to_remove_count], hotspot_diag
+
+
+def _compute_hotspot_strength(
+    neighborhood: NeighborhoodType,
+    seg: Optional[CampaignSegment],
+    orders_df: pd.DataFrame,
+    cfg: PlannerConfig,
+    drop_pressure_info: Optional[dict] = None,
+) -> float:
+    """
+    Compute a [0,1] hotspot_strength score for the given neighborhood.
+
+    Used to bias destroy_count upward (more aggressive destruction) when
+    the segment has strong hotspot signals.
+    """
+    if seg is None or orders_df.empty:
+        return 0.0
+
+    order_lookup = orders_df.set_index("order_id")
+    seg_oids = seg.order_ids
+
+    if neighborhood == NeighborhoodType.HIGH_DROP_PRESSURE:
+        dp_info = drop_pressure_info or _compute_segment_drop_pressure(seg, {}, orders_df, cfg)
+        score = dp_info.get("drop_pressure_score", 0.0)
+        # Normalize: score > 5 is strong hotspot
+        return min(1.0, score / 5.0)
+
+    elif neighborhood == NeighborhoodType.WIDTH_TENSION_HOTSPOT:
+        widths = []
+        for oid in seg_oids:
+            if oid in order_lookup.index:
+                widths.append(float(order_lookup.loc[oid].get("width", 0) or 0))
+        if len(widths) < 2:
+            return 0.0
+        width_range = max(widths) - min(widths)
+        # range > 300 is strong hotspot
+        return min(1.0, width_range / 300.0)
+
+    elif neighborhood == NeighborhoodType.GROUP_SWITCH_HOTSPOT:
+        groups = []
+        for oid in seg_oids:
+            if oid in order_lookup.index:
+                groups.append(str(order_lookup.loc[oid].get("steel_group", "") or ""))
+        if len(groups) < 2:
+            return 0.0
+        # count switches
+        switches = sum(1 for i in range(len(groups) - 1) if groups[i] != groups[i + 1])
+        # 2+ switches = strong
+        return min(1.0, switches / 2.0)
+
+    elif neighborhood == NeighborhoodType.BRIDGE_DEPENDENT_SEGMENT:
+        # Bridge-dependent means segment is underfilled with bridge edges used
+        ton_min = float(cfg.rule.campaign_ton_min)
+        if seg.total_tons < ton_min:
+            gap_ratio = (ton_min - seg.total_tons) / ton_min
+            return min(1.0, gap_ratio)
+        return 0.0
+
+    elif neighborhood == NeighborhoodType.LOW_FILL_SEGMENT:
+        ton_min = float(cfg.rule.campaign_ton_min)
+        gap_ratio = max(0.0, ton_min - seg.total_tons) / ton_min if ton_min > 0 else 0.0
+        return min(1.0, gap_ratio * 2.0)  # amplify so 0.2 gap → 0.4 strength
+
+    elif neighborhood == NeighborhoodType.TAIL_REBALANCE:
+        ton_min = float(cfg.rule.campaign_ton_min)
+        gap_ratio = max(0.0, ton_min - seg.total_tons) / ton_min if ton_min > 0 else 0.0
+        return min(1.0, gap_ratio * 1.5)
+
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -2027,6 +2444,8 @@ def _run_alns_iteration(
     max_destroy_orders: int = 45,
     time_limit: float = 10.0,
     underfilled_segs: Optional[List[CampaignSegment]] = None,
+    repair_family_edges: Optional[List] = None,
+    family_repair_already_attempted_keys: Optional[set] = None,
 ) -> Tuple[
     List[CampaignSegment],
     Dict[str, List[str]],
@@ -2082,6 +2501,19 @@ def _run_alns_iteration(
         "local_cpsat_infeasible_count": 0,
         "local_cpsat_total_seconds": 0.0,
         "local_cpsat_skip_reason_histogram": {},
+        # ---- Hotspot destroy diagnostics ----
+        "destroy_hotspot_type": "",
+        "destroy_hotspot_center": "",
+        "destroy_window_size": 0,
+        "destroy_hotspot_candidates_count": 0,
+        "destroy_random_backfill_count": 0,
+        "drop_pressure_score": 0.0,
+        "drop_pressure_nearby_dropped_count": 0,
+        "drop_pressure_recoverable_tons_estimate": 0.0,
+        # ---- Family repair pool diagnostics ----
+        "repair_family_edge_pool_seen_count": 0,
+        "repair_family_edge_pool_filtered_count": 0,
+        "repair_family_edge_pool_used_count": 0,
     }
 
     # ---- Step 1: Select neighborhood ----
@@ -2089,12 +2521,12 @@ def _run_alns_iteration(
     if neighborhood == NeighborhoodType.TAIL_REBALANCE and underfilled_segs:
         # Use underfilled_segs as primary candidates, fall back to valid segs
         selected = _select_neighborhood(
-            neighborhood, current_segs, current_dropped, rand, cfg,
+            neighborhood, current_segs, current_dropped, orders_df, rand, cfg,
             underfilled_bias_segs=underfilled_segs,
         )
     else:
         selected = _select_neighborhood(
-            neighborhood, current_segs, current_dropped, rand, cfg,
+            neighborhood, current_segs, current_dropped, orders_df, rand, cfg,
         )
 
     # LOW_FILL diagnostics: how many candidates were considered
@@ -2117,8 +2549,16 @@ def _run_alns_iteration(
             "skipped_already_tried_count": 0,
         }, tail_repair_diag
 
-    # ---- Step 2: Compute destroy count ----
-    destroy_count = _compute_destroy_count(selected, rand)
+    # ---- Step 2: Compute destroy count with hotspot strength ----
+    # Compute per-segment hotspot_strength for destroy count biasing
+    primary_seg = selected[0]
+    dp_info = None
+    if neighborhood == NeighborhoodType.HIGH_DROP_PRESSURE:
+        dp_info = _compute_segment_drop_pressure(primary_seg, current_dropped, orders_df, cfg)
+    hotspot_strength = _compute_hotspot_strength(
+        neighborhood, primary_seg, orders_df, cfg, drop_pressure_info=dp_info
+    )
+    destroy_count = _compute_destroy_count(selected, rand, hotspot_strength=hotspot_strength)
     if destroy_count == 0:
         return current_segs, current_dropped, False, 0, 0, 0, 0, 0, 0, {}, {
             "filtered_by_capability_count": 0,
@@ -2262,21 +2702,45 @@ def _run_alns_iteration(
                     f"success=True, inserted={diag_lf.get('inserted_count', 0)}"
                 )
 
-    # ---- Step 3: Select orders to destroy ----
-    # Priority: destroy from candidates (non-fixed) first
-    all_destroyable: List[str] = []
-    for seg in selected:
-        # All orders except first (start) and last (end) are destroyable candidates
-        if len(seg.order_ids) > 2:
-            middle = seg.order_ids[1:-1]
-            all_destroyable.extend(middle)
-        elif len(seg.order_ids) == 2:
-            all_destroyable.append(seg.order_ids[1])  # destroy tail only
+    # ---- Step 3: Select orders to destroy (hotspot-driven) ----
+    # Use hotspot-centered window instead of uniform random sampling
+    orders_to_remove: List[str] = []
+    _destroy_hotspot_diag: dict = {
+        "destroy_hotspot_type": neighborhood.value,
+        "destroy_hotspot_center": "",
+        "destroy_window_size": 0,
+        "destroy_hotspot_candidates": [],
+        "destroy_random_backfill_count": 0,
+    }
+    _target_seg = selected[0]  # primary target segment
+    if len(_target_seg.order_ids) > 2:
+        _candidates, _hs_diag = _collect_hotspot_destroy_candidates(
+            _target_seg,
+            neighborhood,
+            orders_df,
+            destroy_count,
+            rand,
+            drop_pressure_info=dp_info,
+        )
+        orders_to_remove = _candidates
+        _destroy_hotspot_diag = _hs_diag
+    else:
+        # Too short to apply hotspot: use fallback
+        orders_to_remove = _target_seg.order_ids[1:destroy_count + 1]
+        _destroy_hotspot_diag["hotspot_window_size"] = 0
+        _destroy_hotspot_diag["hotspot_random_backfill_count"] = len(orders_to_remove)
 
-    if len(all_destroyable) > destroy_count:
-        all_destroyable = rand.sample(all_destroyable, destroy_count)
-
-    orders_to_remove = all_destroyable[:destroy_count]
+    # Inject hotspot destroy diagnostics into tail_repair_diag
+    tail_repair_diag["destroy_hotspot_type"] = str(neighborhood.value)
+    tail_repair_diag["destroy_hotspot_center"] = str(_destroy_hotspot_diag.get("hotspot_center_order_id", ""))
+    tail_repair_diag["destroy_window_size"] = int(_destroy_hotspot_diag.get("hotspot_window_size", 0))
+    tail_repair_diag["destroy_hotspot_candidates_count"] = len(_destroy_hotspot_diag.get("hotspot_candidates", []))
+    tail_repair_diag["destroy_random_backfill_count"] = int(_destroy_hotspot_diag.get("hotspot_random_backfill_count", 0))
+    # Drop pressure diagnostics (available for HIGH_DROP_PRESSURE neighborhood)
+    if dp_info is not None:
+        tail_repair_diag["drop_pressure_score"] = float(dp_info.get("drop_pressure_score", 0.0))
+        tail_repair_diag["drop_pressure_nearby_dropped_count"] = int(dp_info.get("nearby_dropped_count", 0))
+        tail_repair_diag["drop_pressure_recoverable_tons_estimate"] = float(dp_info.get("tons_recoverable_estimate", 0.0))
 
     # ---- Step 4: Apply destruction ----
     new_segs, removed = _destroy_orders_from_segments(
@@ -2480,6 +2944,71 @@ def _run_alns_iteration(
             if _prefer_family
             else ("secondary_neighborhood" if _allow_guarded_family_this_round else "disabled")
         )
+
+        # ---- Compute ALNS-round-level repair family edge keys ----
+        # Only when guarded family is enabled this round, filter repair_family_edges
+        # to form the round-local family repair pool for this line.
+        _round_family_keys: set = set()
+        _rfe_pool_seen = 0
+        _rfe_pool_filtered = 0
+        _round_family_keys: set = set()
+        _req_family_allowed = list(getattr(cfg.model, "virtual_family_frontload_allowed_families", []) if cfg.model else [])
+        _req_family_max_bridge = int(getattr(cfg.model, "virtual_family_frontload_max_bridge_count", 2) if cfg.model else 2)
+        _local_subproblem_oids = set(fixed_orders) | set(candidate_orders)
+        _already_attempted = family_repair_already_attempted_keys or set()
+
+        if _allow_guarded_family_this_round and repair_family_edges:
+            for _edge in repair_family_edges:
+                _rfe_pool_seen += 1
+                # Line filter
+                if str(_edge.line) != line:
+                    _rfe_pool_filtered += 1
+                    continue
+                # Edge type filter
+                if str(_edge.edge_type) != "VIRTUAL_BRIDGE_FAMILY_EDGE":
+                    _rfe_pool_filtered += 1
+                    continue
+                # Connectivity filter: at least one endpoint in local subproblem
+                if str(_edge.from_order_id) not in _local_subproblem_oids and \
+                   str(_edge.to_order_id) not in _local_subproblem_oids:
+                    _rfe_pool_filtered += 1
+                    continue
+                # Family allowlist filter
+                _bf = str(_edge.bridge_family or "MIXED")
+                if _req_family_allowed and _bf not in _req_family_allowed:
+                    _rfe_pool_filtered += 1
+                    continue
+                # Max bridge count filter (use effective_max_bridge_count)
+                _ebc = int(getattr(_edge, "estimated_bridge_count_max", 0) or 0)
+                if _ebc <= 0:
+                    _ebc = int(getattr(_edge, "estimated_bridge_count", 0) or 0)
+                if _req_family_max_bridge > 0 and _ebc > _req_family_max_bridge:
+                    _rfe_pool_filtered += 1
+                    continue
+                # Already attempted dedup
+                _key = (line, str(_edge.from_order_id), str(_edge.to_order_id), _bf)
+                if _key in _already_attempted:
+                    _rfe_pool_filtered += 1
+                    continue
+                _round_family_keys.add(_key)
+
+        # Accumulate round-level diagnostics
+        tail_repair_diag["repair_family_edge_pool_seen_count"] = _rfe_pool_seen
+        tail_repair_diag["repair_family_edge_pool_filtered_count"] = _rfe_pool_filtered
+        tail_repair_diag["repair_family_edge_pool_used_count"] = len(_round_family_keys)
+        # Pass round keys back to caller for dedup tracking
+        tail_repair_diag["_round_repair_family_edge_keys"] = set(_round_family_keys)
+
+        # Hotspot context for local CP-SAT (available from destroy phase)
+        _hs_center = str(_destroy_hotspot_diag.get("hotspot_center_order_id", "") or
+                         _destroy_hotspot_diag.get("destroy_hotspot_center", ""))
+        _hs_reason = (
+            f"round={round_num}, neighborhood={neighborhood.value}, "
+            f"hotspot_center={_hs_center}, "
+            f"window_size={_destroy_hotspot_diag.get('hotspot_window_size', 0)}, "
+            f"backfill={_destroy_hotspot_diag.get('hotspot_random_backfill_count', 0)}"
+        )
+
         req = LocalInsertRequest(
             line=line,
             fixed_order_ids=fixed_orders,
@@ -2495,6 +3024,12 @@ def _run_alns_iteration(
             # Family repair scoring preference (guarded profile)
             prefer_guarded_virtual_family=_prefer_family,
             guarded_virtual_family_reason=_family_reason,
+            # ALNS-round-level repair family edge keys
+            repair_family_edge_keys=list(_round_family_keys),
+            # Hotspot-driven destroy context
+            hotspot_type=str(neighborhood.value),
+            hotspot_center_order_id=_hs_center,
+            hotspot_reason=_hs_reason,
         )
 
         import time as _time_module
@@ -2941,6 +3476,13 @@ def run_constructive_lns_master(
     )
     constructive_build_seconds = time.perf_counter() - t_build_start
 
+    # Extract repair_family_edges for guarded family ALNS/local rebuild
+    repair_family_edges: List = list(getattr(build_result, "repair_family_edges", []) or [])
+    print(f"[APS][repair_family] pool_size={len(repair_family_edges)}")
+
+    # Track family repair already attempted (for reconstruction dedup)
+    family_repair_already_attempted_keys: set = set()
+
     # ---- Step B: Campaign cutting ----
     # cut_sequences_into_campaigns expects chains_by_line: Dict[str, List[ConstructiveChain]]
     t_cutter_start = time.perf_counter()
@@ -2969,6 +3511,7 @@ def run_constructive_lns_master(
         order_tons=order_tons_for_recon,
         orders_df=orders_for_build,
         cfg=cfg,
+        family_repair_already_attempted_keys=family_repair_already_attempted_keys,
     )
     if isinstance(cut_result.diagnostics, dict):
         cut_result.diagnostics.update({"underfilled_reconstruction": dict(recon_diag), **dict(recon_diag)})
@@ -3143,6 +3686,21 @@ def run_constructive_lns_master(
         "local_cpsat_no_improve_count": 0,
         "local_cpsat_infeasible_count": 0,
         "local_cpsat_total_seconds": 0.0,
+        # ---- Family repair pool diagnostics ----
+        "repair_family_edge_pool_seen_count": 0,
+        "repair_family_edge_pool_filtered_count": 0,
+        "repair_family_edge_pool_used_count": 0,
+        # ---- Hotspot destroy diagnostics ----
+        "destroy_hotspot_type": "",
+        "destroy_hotspot_center": "",
+        "destroy_window_size": 0,
+        "destroy_hotspot_candidates_count": 0,
+        "destroy_random_backfill_count": 0,
+        "drop_pressure_score": 0.0,
+        "drop_pressure_nearby_dropped_count": 0,
+        "drop_pressure_recoverable_tons_estimate": 0.0,
+        "active_neighborhoods_this_run": "",
+        "hotspot_neighborhood_enable_reason": "",
     }
 
     # ---- Phase timers for LNS ----
@@ -3181,7 +3739,91 @@ def run_constructive_lns_master(
         else:
             neighborhoods = list(base_neighborhoods)
 
+        # ---- Hotspot-driven neighborhood activation ----
+        # Detect business signals and conditionally add hotspot neighborhoods
+        # to the effective pool for this round.
+        _profile_name = str(getattr(cfg.model, "profile_name", "") or "")
+        _is_guarded_profile = (
+            getattr(cfg.model, "virtual_family_frontload_enabled", False) is True
+            or "guarded" in _profile_name.lower()
+        )
+        _total_dropped = sum(len(v) for v in current_dropped.values())
+        # Compute width_range and group_switch_count across all segments for this round
+        _width_range_max = 0.0
+        _group_switch_count = 0
+        _bridge_seg_count = 0
+        for _seg in current_segs:
+            if not _seg.is_valid or len(_seg.order_ids) < 2:
+                continue
+            if _seg.total_tons < ton_min_local:
+                _bridge_seg_count += 1
+            _seg_recs = {}
+            for _oid in _seg.order_ids:
+                if _oid in orders_df.set_index("order_id").index:
+                    _seg_recs[_oid] = dict(orders_df.set_index("order_id").loc[_oid])
+            _widths = [float(_r.get("width", 0) or 0) for _r in _seg_recs.values()]
+            if len(_widths) >= 2:
+                _wr = max(_widths) - min(_widths)
+                if _wr > _width_range_max:
+                    _width_range_max = _wr
+            _groups = [str(_r.get("steel_group", "") or "") for _r in _seg_recs.values()]
+            for _i in range(len(_groups) - 1):
+                if _groups[_i] != _groups[_i + 1]:
+                    _group_switch_count += 1
+
+        # Thresholds for enabling hotspot neighborhoods
+        _DROP_THRESHOLD = 5
+        _WIDTH_RANGE_THRESHOLD = 200.0
+        _GROUP_SWITCH_THRESHOLD = 2
+        _BRIDGE_THRESHOLD = 1
+        _ENABLE_HOTSPOT = (
+            _is_guarded_profile
+            or _total_dropped > _DROP_THRESHOLD
+            or underfilled_count >= 3
+        )
+
+        _hotspot_added = False
+        if _ENABLE_HOTSPOT:
+            # WIDTH_TENSION_HOTSPOT: width range signal
+            if _width_range_max > _WIDTH_RANGE_THRESHOLD or _total_dropped > _DROP_THRESHOLD:
+                if NeighborhoodType.WIDTH_TENSION_HOTSPOT not in neighborhoods:
+                    neighborhoods.append(NeighborhoodType.WIDTH_TENSION_HOTSPOT)
+                    _hotspot_added = True
+            # GROUP_SWITCH_HOTSPOT: group transition signal
+            if _group_switch_count >= _GROUP_SWITCH_THRESHOLD or _is_guarded_profile:
+                if NeighborhoodType.GROUP_SWITCH_HOTSPOT not in neighborhoods:
+                    neighborhoods.append(NeighborhoodType.GROUP_SWITCH_HOTSPOT)
+                    _hotspot_added = True
+            # BRIDGE_DEPENDENT_SEGMENT: underfilled segments with bridge usage
+            if _bridge_seg_count >= _BRIDGE_THRESHOLD or _is_guarded_profile:
+                if NeighborhoodType.BRIDGE_DEPENDENT_SEGMENT not in neighborhoods:
+                    neighborhoods.append(NeighborhoodType.BRIDGE_DEPENDENT_SEGMENT)
+                    _hotspot_added = True
+
         neighborhood = neighborhoods[r % len(neighborhoods)]
+
+        # Record active neighborhoods and hotspot activation reason for diagnostics
+        _nb_names = [str(nb.value) for nb in neighborhoods]
+        _hotspot_reason = ""
+        if _hotspot_added:
+            _reasons = []
+            if _is_guarded_profile:
+                _reasons.append("guarded_profile")
+            if _total_dropped > _DROP_THRESHOLD:
+                _reasons.append(f"dropped>{_DROP_THRESHOLD}")
+            if underfilled_count >= 3:
+                _reasons.append("underfilled>=3")
+            if _width_range_max > _WIDTH_RANGE_THRESHOLD:
+                _reasons.append(f"width_range>{_WIDTH_RANGE_THRESHOLD}")
+            if _group_switch_count >= _GROUP_SWITCH_THRESHOLD:
+                _reasons.append(f"group_switch>={_GROUP_SWITCH_THRESHOLD}")
+            if _bridge_seg_count >= _BRIDGE_THRESHOLD:
+                _reasons.append(f"bridge_seg>={_BRIDGE_THRESHOLD}")
+            _hotspot_reason = ",".join(_reasons)
+        # Accumulate per-round diagnostics; the first round seeds the values
+        if r == 0:
+            accum_tail_repair_diag["active_neighborhoods_this_run"] = ",".join(_nb_names)
+            accum_tail_repair_diag["hotspot_neighborhood_enable_reason"] = _hotspot_reason
 
         # Run destruction + repair
         (
@@ -3210,7 +3852,15 @@ def run_constructive_lns_master(
             max_destroy_orders=45,
             time_limit=8.0,
             underfilled_segs=underfilled_segs,
+            repair_family_edges=repair_family_edges,
+            family_repair_already_attempted_keys=family_repair_already_attempted_keys,
         )
+
+        # After iteration: add round's repair family edge keys to global dedup set
+        # (applies only when family was enabled this round)
+        _returned_family_keys = round_tail_diag.get("_round_repair_family_edge_keys", set())
+        if _returned_family_keys:
+            family_repair_already_attempted_keys.update(_returned_family_keys)
 
         # Accumulate tail repair diagnostics
         for k, v in round_tail_diag.items():

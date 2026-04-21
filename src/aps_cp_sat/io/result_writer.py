@@ -149,6 +149,51 @@ def _num_float(value: object) -> float:
         return 0.0
 
 
+_STR_TO_DEFAULT_INT = {"unknown", "UNKNOWN", "n/a", "N/A", "none", "NONE", "null", "NULL", ""}
+_STR_TO_DEFAULT_FLOAT = {"unknown", "UNKNOWN", "n/a", "N/A", "none", "NONE", "null", "NULL", ""}
+
+
+def _safe_int(v: object, default: int = 0) -> int:
+    """Safe integer conversion for engine_meta fields.
+
+    Handles None, empty string, and known non-numeric sentinel strings
+    like 'unknown', 'UNKNOWN', 'n/a', 'N/A', etc.
+    """
+    if v is None:
+        return default
+    if isinstance(v, int):
+        return v
+    if isinstance(v, bool):
+        return int(v)
+    sv = str(v).strip()
+    if sv in _STR_TO_DEFAULT_INT:
+        return default
+    try:
+        return int(float(sv))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(v: object, default: float = 0.0) -> float:
+    """Safe float conversion for engine_meta fields.
+
+    Handles None, empty string, and known non-numeric sentinel strings.
+    """
+    if v is None:
+        return default
+    if isinstance(v, float):
+        return v
+    if isinstance(v, bool):
+        return float(int(v))
+    sv = str(v).strip()
+    if sv in _STR_TO_DEFAULT_FLOAT:
+        return default
+    try:
+        return float(sv)
+    except (TypeError, ValueError):
+        return default
+
+
 def _build_diagnostics_report(diagnostics: Dict[str, object] | None) -> pd.DataFrame:
     if not isinstance(diagnostics, dict) or not diagnostics:
         return pd.DataFrame(columns=["section", "metric", "value"])
@@ -723,44 +768,44 @@ def export_schedule_results(
             ("统一指标.allow_virtual_bridge_edge_in_constructive", bool(virtual_bridge_enabled)),
             ("统一指标.allow_real_bridge_edge_in_constructive", bool(real_bridge_enabled)),
             # ---- repair_only 字段已降级，不再在默认 summary 中展示 ----
-            ("统一指标.scheduled_real_orders", int(em.get("scheduled_real_orders", 0) or 0)),
-            ("统一指标.scheduled_virtual_orders", int(em.get("scheduled_virtual_orders", 0) or 0)),
-            ("统一指标.dropped_count", int(em.get("dropped_count", 0) or 0)),
-            ("统一指标.campaign_count", int(em.get("campaign_count", 0) or 0)),
-            ("统一指标.low_slots", int(em.get("low_slots", 0) or 0)),
-            ("统一指标.tail_underfilled_count", int(em.get("tail_underfilled_count", 0) or 0)),
-            ("统一指标.selected_real_bridge_edge_count", int(em.get("selected_real_bridge_edge_count", 0) or 0)),
+            ("统一指标.scheduled_real_orders", _safe_int(em.get("scheduled_real_orders"))),
+            ("统一指标.scheduled_virtual_orders", _safe_int(em.get("scheduled_virtual_orders"))),
+            ("统一指标.dropped_count", _safe_int(em.get("dropped_count"))),
+            ("统一指标.campaign_count", _safe_int(em.get("campaign_count"))),
+            ("统一指标.low_slots", _safe_int(em.get("low_slots"))),
+            ("统一指标.tail_underfilled_count", _safe_int(em.get("tail_underfilled_count"))),
+            ("统一指标.selected_real_bridge_edge_count", _safe_int(em.get("selected_real_bridge_edge_count"))),
             # ---- 新口径：guarded virtual family ----
-            ("统一指标.selected_virtual_bridge_family_edge_count", int(em.get("selected_virtual_bridge_family_edge_count", 0) or 0)),
-            ("统一指标.selected_legacy_virtual_bridge_edge_count", int(em.get("selected_legacy_virtual_bridge_edge_count", 0) or 0)),
-            ("统一指标.local_cpsat_skipped_due_to_gate", int(em.get("local_cpsat_skipped_due_to_gate", 0) or 0)),
-            ("统一指标.greedy_virtual_family_edge_uses", int(em.get("greedy_virtual_family_edge_uses", 0) or 0)),
-            ("统一指标.alns_virtual_family_attempt_count", int(em.get("alns_virtual_family_attempt_count", 0) or 0)),
-            ("统一指标.max_bridge_count_used", int(em.get("max_bridge_count_used", 0) or 0)),
-            ("统一指标.lns_accepted_rounds", int(em.get("lns_accepted_rounds", 0) or 0)),
-            ("统一指标.lns_drop_delta", int(em.get("lns_drop_delta", 0) or 0)),
+            ("统一指标.selected_virtual_bridge_family_edge_count", _safe_int(em.get("selected_virtual_bridge_family_edge_count"))),
+            ("统一指标.selected_legacy_virtual_bridge_edge_count", _safe_int(em.get("selected_legacy_virtual_bridge_edge_count"))),
+            ("统一指标.local_cpsat_skipped_due_to_gate", _safe_int(em.get("local_cpsat_skipped_due_to_gate"))),
+            ("统一指标.greedy_virtual_family_edge_uses", _safe_int(em.get("greedy_virtual_family_edge_uses"))),
+            ("统一指标.alns_virtual_family_attempt_count", _safe_int(em.get("alns_virtual_family_attempt_count"))),
+            ("统一指标.max_bridge_count_used", _safe_int(em.get("max_bridge_count_used"))),
+            ("统一指标.lns_accepted_rounds", _safe_int(em.get("lns_accepted_rounds"))),
+            ("统一指标.lns_drop_delta", _safe_int(em.get("lns_drop_delta"))),
             ("统一指标.reconstruction_no_gain", bool(em.get("reconstruction_no_gain", False))),
             # ---- Legacy virtual pilot 已降级，不再在默认 summary 中展示 ----
             ("统一指标.acceptance", str(em.get("acceptance", em.get("result_acceptance_status", "")))),
             ("统一指标.acceptance_gate_reason", str(em.get("acceptance_gate_reason", ""))),
             ("统一指标.validation_gate_reason", str(em.get("validation_gate_reason", ""))),
-            ("CandidateGraph.边总数", int(em.get("candidate_graph_edge_count", 0) or 0)),
-            ("CandidateGraph.直接边数", int(em.get("candidate_graph_direct_edge_count", 0) or 0)),
-            ("CandidateGraph.实物桥边数", int(em.get("candidate_graph_real_bridge_edge_count", 0) or 0)),
-            ("CandidateGraph.虚拟桥family边数", int(em.get("candidate_graph_virtual_bridge_family_edge_count", 0) or 0)),
-            ("CandidateGraph.宽度过滤数", int(em.get("candidate_graph_filtered_by_width_count", 0) or 0)),
-            ("CandidateGraph.厚度过滤数", int(em.get("candidate_graph_filtered_by_thickness_count", 0) or 0)),
-            ("CandidateGraph.温度过滤数", int(em.get("candidate_graph_filtered_by_temp_count", 0) or 0)),
-            ("CandidateGraph.钢种组过滤数", int(em.get("candidate_graph_filtered_by_group_count", 0) or 0)),
-            ("CandidateGraph.虚拟链长过滤数", int(em.get("candidate_graph_filtered_by_max_virtual_chain_count", 0) or 0)),
-            ("Constructive图.接受直接边数", int(_summary_cut_or_em("accepted_direct_edge_count", em.get("accepted_direct_edge_count", 0)) or 0)),
-            ("Constructive图.接受实物桥边数", int(_summary_cut_or_em("accepted_real_bridge_edge_count", em.get("accepted_real_bridge_edge_count", 0)) or 0)),
-            ("Constructive图.过滤虚拟桥边数", int(_summary_cut_or_em("filtered_virtual_bridge_edge_count", em.get("filtered_virtual_bridge_edge_count", 0)) or 0)),
-            ("Constructive图.过滤实物桥边数", int(_summary_cut_or_em("filtered_real_bridge_edge_count", em.get("filtered_real_bridge_edge_count", 0)) or 0)),
-            ("LocalInserter.允许直接弧数", int(em.get("local_inserter_direct_arcs_allowed", 0) or 0)),
-            ("LocalInserter.允许实物桥弧数", int(em.get("local_inserter_real_bridge_arcs_allowed", 0) or 0)),
-            ("LocalInserter.阻断实物桥弧数", int(em.get("local_inserter_real_bridge_arcs_blocked", 0) or 0)),
-            ("LocalInserter.阻断虚拟桥弧数", int(em.get("local_inserter_virtual_bridge_arcs_blocked", 0) or 0)),
+            ("CandidateGraph.边总数", _safe_int(em.get("candidate_graph_edge_count"))),
+            ("CandidateGraph.直接边数", _safe_int(em.get("candidate_graph_direct_edge_count"))),
+            ("CandidateGraph.实物桥边数", _safe_int(em.get("candidate_graph_real_bridge_edge_count"))),
+            ("CandidateGraph.虚拟桥family边数", _safe_int(em.get("candidate_graph_virtual_bridge_family_edge_count"))),
+            ("CandidateGraph.宽度过滤数", _safe_int(em.get("candidate_graph_filtered_by_width_count"))),
+            ("CandidateGraph.厚度过滤数", _safe_int(em.get("candidate_graph_filtered_by_thickness_count"))),
+            ("CandidateGraph.温度过滤数", _safe_int(em.get("candidate_graph_filtered_by_temp_count"))),
+            ("CandidateGraph.钢种组过滤数", _safe_int(em.get("candidate_graph_filtered_by_group_count"))),
+            ("CandidateGraph.虚拟链长过滤数", _safe_int(em.get("candidate_graph_filtered_by_max_virtual_chain_count"))),
+            ("Constructive图.接受直接边数", _safe_int(_summary_cut_or_em("accepted_direct_edge_count", em.get("accepted_direct_edge_count")))),
+            ("Constructive图.接受实物桥边数", _safe_int(_summary_cut_or_em("accepted_real_bridge_edge_count", em.get("accepted_real_bridge_edge_count")))),
+            ("Constructive图.过滤虚拟桥边数", _safe_int(_summary_cut_or_em("filtered_virtual_bridge_edge_count", em.get("filtered_virtual_bridge_edge_count")))),
+            ("Constructive图.过滤实物桥边数", _safe_int(_summary_cut_or_em("filtered_real_bridge_edge_count", em.get("filtered_real_bridge_edge_count")))),
+            ("LocalInserter.允许直接弧数", _safe_int(em.get("local_inserter_direct_arcs_allowed"))),
+            ("LocalInserter.允许实物桥弧数", _safe_int(em.get("local_inserter_real_bridge_arcs_allowed"))),
+            ("LocalInserter.阻断实物桥弧数", _safe_int(em.get("local_inserter_real_bridge_arcs_blocked"))),
+            ("LocalInserter.阻断虚拟桥弧数", _safe_int(em.get("local_inserter_virtual_bridge_arcs_blocked"))),
             ("LocalInserter.边策略", str(em.get("local_inserter_edge_policy_used", ""))),
             ("Underfilled重构.尝试", int(_summary_cut_or_em("underfilled_reconstruction_attempts", 0) or 0)),
             ("Underfilled重构.成功", int(_summary_cut_or_em("underfilled_reconstruction_success", 0) or 0)),
@@ -814,7 +859,7 @@ def export_schedule_results(
             ("Repair实物桥pack不一致次数", int(_summary_cut_or_em("repair_bridge_inconsistency_count", 0) or 0)),
             ("Repair实物桥.耗时秒", round(float(_summary_cut_or_em("repair_only_real_bridge_seconds", 0.0) or 0.0), 3)),
             # ---- selected_virtual_bridge_edge_count 已降级为 debug/compat，不在默认主展示 ----
-            ("[debug]统一指标.selected_virtual_bridge_edge_count(旧口径)", int(em.get("selected_virtual_bridge_edge_count", 0) or 0)),
+            ("[debug]统一指标.selected_virtual_bridge_edge_count(旧口径)", _safe_int(em.get("selected_virtual_bridge_edge_count"))),
         ]
         for row in lns_rows:
             summary_df.loc[len(summary_df)] = row
@@ -919,40 +964,40 @@ def export_schedule_results(
             ("统一指标.allow_virtual_bridge_edge_in_constructive", bool(virtual_bridge_enabled)),
             ("统一指标.allow_real_bridge_edge_in_constructive", bool(real_bridge_enabled)),
             # ---- repair_only 字段已降级，不再在默认 summary 中展示 ----
-            ("统一指标.scheduled_real_orders", int(em.get("scheduled_real_orders", 0) or 0)),
-            ("统一指标.scheduled_virtual_orders", int(em.get("scheduled_virtual_orders", 0) or 0)),
-            ("统一指标.dropped_count", int(em.get("dropped_count", 0) or 0)),
-            ("统一指标.campaign_count", int(em.get("campaign_count", 0) or 0)),
-            ("统一指标.low_slots", int(em.get("low_slots", 0) or 0)),
-            ("统一指标.tail_underfilled_count", int(em.get("tail_underfilled_count", 0) or 0)),
-            ("统一指标.selected_real_bridge_edge_count", int(em.get("selected_real_bridge_edge_count", 0) or 0)),
+            ("统一指标.scheduled_real_orders", _safe_int(em.get("scheduled_real_orders"))),
+            ("统一指标.scheduled_virtual_orders", _safe_int(em.get("scheduled_virtual_orders"))),
+            ("统一指标.dropped_count", _safe_int(em.get("dropped_count"))),
+            ("统一指标.campaign_count", _safe_int(em.get("campaign_count"))),
+            ("统一指标.low_slots", _safe_int(em.get("low_slots"))),
+            ("统一指标.tail_underfilled_count", _safe_int(em.get("tail_underfilled_count"))),
+            ("统一指标.selected_real_bridge_edge_count", _safe_int(em.get("selected_real_bridge_edge_count"))),
             # ---- 新口径：guarded virtual family ----
-            ("统一指标.selected_virtual_bridge_family_edge_count", int(em.get("selected_virtual_bridge_family_edge_count", 0) or 0)),
-            ("统一指标.selected_legacy_virtual_bridge_edge_count", int(em.get("selected_legacy_virtual_bridge_edge_count", 0) or 0)),
-            ("统一指标.local_cpsat_skipped_due_to_gate", int(em.get("local_cpsat_skipped_due_to_gate", 0) or 0)),
-            ("统一指标.greedy_virtual_family_edge_uses", int(em.get("greedy_virtual_family_edge_uses", 0) or 0)),
-            ("统一指标.alns_virtual_family_attempt_count", int(em.get("alns_virtual_family_attempt_count", 0) or 0)),
-            ("统一指标.max_bridge_count_used", int(em.get("max_bridge_count_used", 0) or 0)),
-            ("统一指标.lns_accepted_rounds", int(em.get("lns_accepted_rounds", 0) or 0)),
-            ("统一指标.lns_drop_delta", int(em.get("lns_drop_delta", 0) or 0)),
+            ("统一指标.selected_virtual_bridge_family_edge_count", _safe_int(em.get("selected_virtual_bridge_family_edge_count"))),
+            ("统一指标.selected_legacy_virtual_bridge_edge_count", _safe_int(em.get("selected_legacy_virtual_bridge_edge_count"))),
+            ("统一指标.local_cpsat_skipped_due_to_gate", _safe_int(em.get("local_cpsat_skipped_due_to_gate"))),
+            ("统一指标.greedy_virtual_family_edge_uses", _safe_int(em.get("greedy_virtual_family_edge_uses"))),
+            ("统一指标.alns_virtual_family_attempt_count", _safe_int(em.get("alns_virtual_family_attempt_count"))),
+            ("统一指标.max_bridge_count_used", _safe_int(em.get("max_bridge_count_used"))),
+            ("统一指标.lns_accepted_rounds", _safe_int(em.get("lns_accepted_rounds"))),
+            ("统一指标.lns_drop_delta", _safe_int(em.get("lns_drop_delta"))),
             ("统一指标.reconstruction_no_gain", bool(em.get("reconstruction_no_gain", False))),
             # ---- Legacy virtual pilot 已降级，不再在默认 summary 中展示 ----
             ("统一指标.acceptance", str(em.get("acceptance", em.get("result_acceptance_status", "")))),
             ("统一指标.acceptance_gate_reason", str(em.get("acceptance_gate_reason", ""))),
             ("统一指标.validation_gate_reason", str(em.get("validation_gate_reason", ""))),
-            ("CandidateGraph.边总数", int(em.get("candidate_graph_edge_count", 0) or 0)),
-            ("CandidateGraph.直接边数", int(em.get("candidate_graph_direct_edge_count", 0) or 0)),
-            ("CandidateGraph.实物桥边数", int(em.get("candidate_graph_real_bridge_edge_count", 0) or 0)),
-            ("CandidateGraph.虚拟桥family边数", int(em.get("candidate_graph_virtual_bridge_family_edge_count", 0) or 0)),
-            ("CandidateGraph.宽度过滤数", int(em.get("candidate_graph_filtered_by_width_count", 0) or 0)),
-            ("CandidateGraph.厚度过滤数", int(em.get("candidate_graph_filtered_by_thickness_count", 0) or 0)),
-            ("CandidateGraph.温度过滤数", int(em.get("candidate_graph_filtered_by_temp_count", 0) or 0)),
-            ("CandidateGraph.钢种组过滤数", int(em.get("candidate_graph_filtered_by_group_count", 0) or 0)),
-            ("CandidateGraph.虚拟链长过滤数", int(em.get("candidate_graph_filtered_by_max_virtual_chain_count", 0) or 0)),
+            ("CandidateGraph.边总数", _safe_int(em.get("candidate_graph_edge_count"))),
+            ("CandidateGraph.直接边数", _safe_int(em.get("candidate_graph_direct_edge_count"))),
+            ("CandidateGraph.实物桥边数", _safe_int(em.get("candidate_graph_real_bridge_edge_count"))),
+            ("CandidateGraph.虚拟桥family边数", _safe_int(em.get("candidate_graph_virtual_bridge_family_edge_count"))),
+            ("CandidateGraph.宽度过滤数", _safe_int(em.get("candidate_graph_filtered_by_width_count"))),
+            ("CandidateGraph.厚度过滤数", _safe_int(em.get("candidate_graph_filtered_by_thickness_count"))),
+            ("CandidateGraph.温度过滤数", _safe_int(em.get("candidate_graph_filtered_by_temp_count"))),
+            ("CandidateGraph.钢种组过滤数", _safe_int(em.get("candidate_graph_filtered_by_group_count"))),
+            ("CandidateGraph.虚拟链长过滤数", _safe_int(em.get("candidate_graph_filtered_by_max_virtual_chain_count"))),
             # ---- Decode order integrity gate (fail-fast from constructive_lns decode path) ----
             ("LNS.decode_order_integrity_ok", bool(em.get("decode_order_integrity_ok", True))),
-            ("LNS.decode_order_mismatch_count", int(em.get("decode_order_mismatch_count", 0))),
-            ("LNS.decode_demoted_order_count", int(em.get("decode_demoted_order_count", 0))),
+            ("LNS.decode_order_mismatch_count", _safe_int(em.get("decode_order_mismatch_count"))),
+            ("LNS.decode_demoted_order_count", _safe_int(em.get("decode_demoted_order_count"))),
             ("LNS.decode_order_mismatch_campaigns", str(em.get("decode_order_mismatch_campaigns", []))),
             # ---- Tail repair attempt/success counts ----
             ("Tail.RECUT尝试", int(lns_diag.get("tail_repair_recut_attempts", lns_diag.get("campaign_cut_diags", {}).get("tail_rebalance_summary", {}).get("tail_repair_recut_attempts", 0) if isinstance(lns_diag.get("campaign_cut_diags"), dict) else 0))),
@@ -1050,7 +1095,7 @@ def export_schedule_results(
             ("Salvage.降级fragments数", int(lns_diag.get("final_segment_demoted_fragment_count", 0))),
             ("Salvage.整段丢弃次数", int(lns_diag.get("final_segment_full_drop_count", 0))),
             # ---- selected_virtual_bridge_edge_count 已降级为 debug/compat，不在默认主展示 ----
-            ("[debug]统一指标.selected_virtual_bridge_edge_count(旧口径)", int(em.get("selected_virtual_bridge_edge_count", 0) or 0)),
+            ("[debug]统一指标.selected_virtual_bridge_edge_count(旧口径)", _safe_int(em.get("selected_virtual_bridge_edge_count"))),
         ])
 
     if isinstance(failure_diagnostics, dict):
@@ -1106,8 +1151,8 @@ def export_schedule_results(
             ("total_run_seconds", total_run_seconds),
             # ---- Decode order integrity gate (fail-fast from constructive_lns decode path) ----
             ("decode_order_integrity_ok", bool(em.get("decode_order_integrity_ok", True))),
-            ("decode_order_mismatch_count", int(em.get("decode_order_mismatch_count", 0))),
-            ("decode_demoted_order_count", int(em.get("decode_demoted_order_count", 0))),
+            ("decode_order_mismatch_count", _safe_int(em.get("decode_order_mismatch_count"))),
+            ("decode_demoted_order_count", _safe_int(em.get("decode_demoted_order_count"))),
             ("decode_order_mismatch_campaigns", str(em.get("decode_order_mismatch_campaigns", []))),
             # ---- campaign_slot_no 一致性诊断 ----
             ("campaign_slot_no_consistency_ok", campaign_slot_consistency_ok),
@@ -1118,20 +1163,20 @@ def export_schedule_results(
             ("run_path_fingerprint_campaign_cutter", str(em.get("run_path_fingerprint_campaign_cutter", ""))),
             ("run_path_fingerprint_constructive_lns_master", str(em.get("run_path_fingerprint_constructive_lns_master", ""))),
             # ---- Tail repair diagnostics ----
-            ("tail_repair_recut_attempts", int(em.get("tail_repair_recut_attempts", 0))),
-            ("tail_repair_recut_success", int(em.get("tail_repair_recut_success", 0))),
-            ("tail_repair_shift_attempts", int(em.get("tail_repair_shift_attempts", 0))),
-            ("tail_repair_shift_success", int(em.get("tail_repair_shift_success", 0))),
-            ("tail_repair_fill_attempts", int(em.get("tail_repair_fill_attempts", 0))),
-            ("tail_repair_fill_success", int(em.get("tail_repair_fill_success", 0))),
-            ("tail_repair_merge_attempts", int(em.get("tail_repair_merge_attempts", 0))),
-            ("tail_repair_merge_success", int(em.get("tail_repair_merge_success", 0))),
+            ("tail_repair_recut_attempts", _safe_int(em.get("tail_repair_recut_attempts"))),
+            ("tail_repair_recut_success", _safe_int(em.get("tail_repair_recut_success"))),
+            ("tail_repair_shift_attempts", _safe_int(em.get("tail_repair_shift_attempts"))),
+            ("tail_repair_shift_success", _safe_int(em.get("tail_repair_shift_success"))),
+            ("tail_repair_fill_attempts", _safe_int(em.get("tail_repair_fill_attempts"))),
+            ("tail_repair_fill_success", _safe_int(em.get("tail_repair_fill_success"))),
+            ("tail_repair_merge_attempts", _safe_int(em.get("tail_repair_merge_attempts"))),
+            ("tail_repair_merge_success", _safe_int(em.get("tail_repair_merge_success"))),
             # ---- Final segment salvage diagnostics ----
-            ("final_segment_salvage_attempts", int(em.get("final_segment_salvage_attempts", 0))),
-            ("final_segment_salvage_success_count", int(em.get("final_segment_salvage_success_count", 0))),
-            ("final_segment_salvaged_piece_count", int(em.get("final_segment_salvaged_piece_count", 0))),
-            ("final_segment_demoted_fragment_count", int(em.get("final_segment_demoted_fragment_count", 0))),
-            ("final_segment_full_drop_count", int(em.get("final_segment_full_drop_count", 0))),
+            ("final_segment_salvage_attempts", _safe_int(em.get("final_segment_salvage_attempts"))),
+            ("final_segment_salvage_success_count", _safe_int(em.get("final_segment_salvage_success_count"))),
+            ("final_segment_salvaged_piece_count", _safe_int(em.get("final_segment_salvaged_piece_count"))),
+            ("final_segment_demoted_fragment_count", _safe_int(em.get("final_segment_demoted_fragment_count"))),
+            ("final_segment_full_drop_count", _safe_int(em.get("final_segment_full_drop_count"))),
         ],
         columns=["key", "value"],
     )
@@ -1522,6 +1567,26 @@ def export_schedule_results(
             ("template_build_seconds", template_build_seconds),
             ("joint_master_seconds", joint_master_seconds),
             ("fallback_total_seconds", fallback_total_seconds),
+            # ---- Block-first metrics ----
+            ("solver_path", str(em.get("solver_path", "joint_master"))),
+            ("block_first_enabled", int(em.get("solver_path", "") == "block_first")),
+            ("generated_blocks_total", _safe_int(em.get("generated_blocks_total"))),
+            ("selected_blocks_count", _safe_int(em.get("selected_blocks_count"))),
+            ("block_master_dropped_count", _safe_int(em.get("block_master_dropped_count"))),
+            ("selected_order_coverage", _safe_float(em.get("selected_order_coverage"))),
+            ("generated_blocks_with_real_bridge", _safe_int(em.get("generated_blocks_with_real_bridge"))),
+            ("generated_blocks_with_guarded_family", _safe_int(em.get("generated_blocks_with_guarded_family"))),
+            ("generated_blocks_with_mixed_bridge_potential", _safe_int(em.get("generated_blocks_with_mixed_bridge_potential"))),
+            ("selected_blocks_with_real_bridge", _safe_int(em.get("selected_blocks_with_real_bridge"))),
+            ("selected_blocks_with_guarded_family", _safe_int(em.get("selected_blocks_with_guarded_family"))),
+            ("selected_blocks_with_mixed_bridge", _safe_int(em.get("selected_blocks_with_mixed_bridge"))),
+            ("mixed_bridge_attempt_count", _safe_int(em.get("mixed_bridge_attempt_count"))),
+            ("mixed_bridge_success_count", _safe_int(em.get("mixed_bridge_success_count"))),
+            ("block_alns_rounds_attempted", _safe_int(em.get("block_alns_rounds_attempted"))),
+            ("block_alns_rounds_accepted", _safe_int(em.get("block_alns_rounds_accepted"))),
+            ("avg_block_quality_score", _safe_float(em.get("avg_block_quality_score"))),
+            ("avg_block_underfill_risk", _safe_float(em.get("avg_block_underfill_risk"))),
+            ("block_transition_avg_cost", _safe_float(em.get("block_transition_avg_cost"))),
         ],
         columns=["metric", "value"],
     )
