@@ -957,24 +957,222 @@ def solve_master_model(
         #   - constructive_lns_real_bridge_frontload: 主线别名
         #   - constructive_lns_direct_only_baseline: 回归基线 (Route C / direct_only)
         #   - constructive_lns_virtual_guarded_frontload: 受控 virtual family 实验线
+        #   - block_first_guarded_search: block-first 主路径 (block_generator -> block_master -> block_realizer -> block_alns)
         # 其他 alias / 实验线 / debug profile 已从主路径移除。
-        allowed_constructive_profiles = {
+        allowed_engineering_profiles = {
             "constructive_lns_search",
             "constructive_lns_direct_only_baseline",
             "constructive_lns_real_bridge_frontload",
             "constructive_lns_virtual_guarded_frontload",
+            "block_first_guarded_search",
         }
-        if profile_name not in allowed_constructive_profiles:
+        if profile_name not in allowed_engineering_profiles:
             raise RuntimeError(
                 f"[APS][PROFILE_GUARD] illegal profile: {profile_name}; "
-                f"Only {sorted(allowed_constructive_profiles)} are allowed in current engineering mode"
+                f"Only {sorted(allowed_engineering_profiles)} are allowed in current engineering mode"
             )
-        if solver_strategy != "constructive_lns":
+        if solver_strategy not in ("constructive_lns", "block_first"):
             raise RuntimeError(
                 f"[APS][PROFILE_GUARD] illegal main_solver_strategy: {solver_strategy}; "
-                "Only constructive_lns is allowed in current engineering mode"
+                "Only constructive_lns and block_first are allowed in current engineering mode"
             )
 
+        # =====================================================================
+        # Branch: block_first vs. constructive_lns
+        # =====================================================================
+        if solver_strategy == "block_first":
+            # =================================================================
+            # BLOCK-FIRST MASTER PATH (New Skeleton - Production Path)
+            # =================================================================
+            print(f"[APS][master] requested_profile={profile_name}")
+            print(f"[APS][master] requested_main_solver_strategy={solver_strategy}")
+            print(f"[APS][block_first] Entering block-first master path")
+            print(f"[APS][block_first] main_path=block_first")
+            print(f"[APS][block_first] profile_name={profile_name}")
+
+            # Lazy imports for new skeleton (avoid circular imports)
+            try:
+                from aps_cp_sat.model.block_generator import generate_candidate_blocks
+                from aps_cp_sat.model.block_master import solve_block_master
+                from aps_cp_sat.model.block_realizer import realize_selected_blocks
+                from aps_cp_sat.model.block_alns import run_block_alns
+            except ImportError as e:
+                raise ImportError(f"[APS][block_first] Failed to import block_first modules: {e}")
+
+            # Log block generator config
+            print(
+                f"[APS][block_first] block_generator_max_blocks_total="
+                f"{int(getattr(current_cfg.model, 'block_generator_max_blocks_total', 80))}"
+            )
+            print(
+                f"[APS][block_first] block_alns_rounds="
+                f"{int(getattr(current_cfg.model, 'block_alns_rounds', 10))}"
+            )
+
+            t0 = perf_counter()
+
+            # Step 1: Candidate Block Generation
+            gen_t0 = perf_counter()
+            print(f"[APS][block_first] Generating candidate blocks...")
+            block_pool = generate_candidate_blocks(
+                orders_df=orders_df,
+                transition_pack=current_transition_pack,
+                cfg=current_cfg,
+                constructive_result=None,
+                cut_result=None,
+                dropped_orders=None,
+                random_seed=int(getattr(current_cfg.model, "random_seed", 42)),
+            )
+            gen_seconds = perf_counter() - gen_t0
+            print(
+                f"[APS][block_first] Generated {len(block_pool.blocks)} candidate blocks "
+                f"in {gen_seconds:.2f}s"
+            )
+
+            # Step 2: Block Master Selection
+            master_t0 = perf_counter()
+            print(f"[APS][block_first] Running block master selection...")
+            master_result = solve_block_master(
+                pool=block_pool,
+                orders_df=orders_df,
+                cfg=current_cfg,
+                random_seed=int(getattr(current_cfg.model, "random_seed", 42)),
+            )
+            master_seconds = perf_counter() - master_t0
+            print(
+                f"[APS][block_first] Selected {len(master_result.selected_blocks)} blocks "
+                f"covering {len(master_result.selected_order_ids)} orders "
+                f"in {master_seconds:.2f}s"
+            )
+
+            # Step 3: Block Realization
+            realizer_t0 = perf_counter()
+            print(f"[APS][block_first] Realizing selected blocks...")
+            realization_result = realize_selected_blocks(
+                master_result=master_result,
+                orders_df=orders_df,
+                transition_pack=current_transition_pack,
+                cfg=current_cfg,
+                random_seed=int(getattr(current_cfg.model, "random_seed", 42)),
+            )
+            realizer_seconds = perf_counter() - realizer_t0
+            print(
+                f"[APS][block_first] Realized {len(realization_result.realized_blocks)} blocks "
+                f"in {realizer_seconds:.2f}s"
+            )
+
+            # Step 4: Block ALNS (lightweight)
+            alns_t0 = perf_counter()
+            alns_result = run_block_alns(
+                initial_pool=block_pool,
+                initial_master_result=master_result,
+                initial_realization_result=realization_result,
+                orders_df=orders_df,
+                transition_pack=current_transition_pack,
+                cfg=current_cfg,
+                random_seed=int(getattr(current_cfg.model, "random_seed", 42)),
+            )
+            alns_seconds = perf_counter() - alns_t0
+            print(
+                f"[APS][block_first] Block ALNS: {alns_result.iterations_attempted} rounds attempted, "
+                f"{alns_result.iterations_accepted} accepted, {alns_seconds:.2f}s"
+            )
+
+            total_seconds = perf_counter() - t0
+
+            # Build schedule_df from realization
+            schedule_df = pd.DataFrame()
+            if realization_result.realized_schedule_df is not None and not realization_result.realized_schedule_df.empty:
+                schedule_df = realization_result.realized_schedule_df.copy()
+                schedule_df = schedule_df.rename(columns={
+                    "order_id": "order_id",
+                    "sequence_in_block": "master_seq",
+                    "block_id": "block_id",
+                    "block_line": "assigned_line",
+                    "edge_type": "selected_edge_type",
+                    "tons": "tons",
+                })
+                # Add required columns
+                schedule_df["is_unassigned"] = 0
+                schedule_df["assigned_slot"] = 1  # Block realization uses slot=1 per block
+                schedule_df["force_break_before"] = 0
+                schedule_df["selected_template_id"] = ""
+                schedule_df["selected_bridge_path"] = ""
+
+            # Build dropped_df
+            dropped_df = pd.DataFrame()
+            if master_result.dropped_order_ids:
+                all_order_ids = set(str(oid) for oid in orders_df["order_id"])
+                dropped_order_ids_set = set(master_result.dropped_order_ids)
+                dropped_records = [
+                    dict(row) for _, row in orders_df.iterrows()
+                    if str(row["order_id"]) in dropped_order_ids_set
+                ]
+                for rec in dropped_records:
+                    rec["drop_reason"] = "NOT_SELECTED_IN_BLOCKS"
+                    rec["dominant_drop_reason"] = "BLOCK_COMPETITION_LOSS"
+                    rec["secondary_reasons"] = "BLOCK_FIRST_MASTER"
+                dropped_df = pd.DataFrame(dropped_records)
+
+            # Build engine_meta
+            diag = master_result.diagnostics
+            block_real_diag = realization_result.block_realization_diag
+            block_alns_diag = alns_result.neighborhood_diag
+
+            engine_meta = {
+                "solver_path": "block_first",
+                "main_path": "block_first",
+                "profile_name": profile_name,
+                "engine_used": "block_first_new_skeleton",
+                "assigned_count": len(master_result.selected_order_ids),
+                "unassigned_count": len(master_result.dropped_order_ids),
+                # Block generation metrics
+                "generated_blocks_total": block_pool.diagnostics.get("generated_blocks_total", len(block_pool.blocks)),
+                "generated_blocks_by_line": block_pool.diagnostics.get("generated_blocks_by_line", {}),
+                "generated_blocks_by_mode": block_pool.diagnostics.get("generated_blocks_by_mode", {}),
+                # Block master metrics
+                "selected_blocks_count": len(master_result.selected_blocks),
+                "selected_order_coverage": diag.get("selected_order_coverage", 0),
+                "block_master_dropped_count": diag.get("block_master_dropped_count", 0),
+                "avg_block_quality_in_selected": diag.get("avg_block_quality_in_selected", 0.0),
+                "avg_block_tons_in_selected": diag.get("avg_block_tons_in_selected", 0.0),
+                # Block realization metrics
+                "block_realized_count": block_real_diag.get("block_realized_count", 0),
+                "orders_in_realized_blocks": block_real_diag.get("orders_in_realized_blocks", 0),
+                "mixed_bridge_attempt_count": block_real_diag.get("mixed_bridge_attempt_count", 0),
+                "mixed_bridge_success_count": block_real_diag.get("mixed_bridge_success_count", 0),
+                # Block ALNS metrics
+                "block_alns_rounds_attempted": block_alns_diag.get("block_alns_rounds_attempted", 0),
+                "block_alns_rounds_accepted": block_alns_diag.get("block_alns_rounds_accepted", 0),
+                # Timing
+                "block_generation_seconds": gen_seconds,
+                "block_master_seconds": master_seconds,
+                "block_realization_seconds": realizer_seconds,
+                "block_alns_seconds": alns_seconds,
+                "total_block_first_seconds": total_seconds,
+                # Architecture markers
+                "used_local_routing": False,
+                "local_routing_role": "block_first_new_skeleton",
+                "strict_template_edges_enabled": True,
+                "master_architecture": "block_first_new_skeleton",
+                "enforced_profile": profile_name,
+                "enforced_main_solver_strategy": "block_first",
+                # Legacy compatibility
+                "plan_df": schedule_df,
+                "dropped_df": dropped_df,
+            }
+
+            print(
+                f"[APS][block_first] Complete: {engine_meta['assigned_count']} orders assigned, "
+                f"{engine_meta['unassigned_count']} dropped, "
+                f"total_time={total_seconds:.2f}s"
+            )
+
+            return schedule_df, pd.DataFrame(), dropped_df, engine_meta
+
+        # =====================================================================
+        # CONSTRUCTIVE LNS MASTER PATH (Legacy Main Path)
+        # =====================================================================
         print(f"[APS][master] requested_profile={profile_name}")
         print(f"[APS][master] requested_main_solver_strategy={solver_strategy}")
         print(f"[APS][master] joint_master_branch_enabled=false")

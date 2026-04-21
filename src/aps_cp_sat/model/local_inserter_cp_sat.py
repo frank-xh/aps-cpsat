@@ -73,6 +73,10 @@ class LocalInsertRequest:
             Used for family-repair-focused neighborhoods. Defaults to False.
         guarded_virtual_family_reason: Human-readable reason for preferring family edges.
             Used for diagnostics. Defaults to "".
+        repair_family_edge_keys: ALNS-round-level admission keys for family edges.
+            Only edges whose (line, from_order_id, to_order_id, bridge_family) key
+            is in this set may enter the strict graph.
+            Empty list = no family edges admitted regardless of profile/request flags.
     """
     line: str
     fixed_order_ids: List[str]
@@ -87,6 +91,21 @@ class LocalInsertRequest:
     virtual_family_max_bridge_count: int = 0
     prefer_guarded_virtual_family: bool = False
     guarded_virtual_family_reason: str = ""
+    # ALNS-round-level repair family edge admission keys
+    repair_family_edge_keys: List[tuple] = field(default_factory=list)
+    # Hotspot-driven destroy context (hotspot neighborhood only)
+    # Used by local CP-SAT to bias scoring near the destroy hotspot center
+    hotspot_type: str = ""
+    hotspot_center_order_id: str = ""
+    hotspot_reason: str = ""
+
+    # ---- Block-first context fields ----
+    # When set, the local inserter is serving a block internal rebuild
+    # rather than an order-level ALNS subproblem.
+    block_context_id: str = ""
+    block_realization_mode: str = ""  # "internal_rebuild" | "boundary_repair" | "mixed_bridge"
+    block_internal_hotspot_type: str = ""  # "underfill" | "group_switch" | "width_tension" | "bridge_dependency"
+    allow_mixed_bridge_candidates: bool = False  # If True, generate mixed bridge candidates
 
 
 @dataclass
@@ -205,6 +224,10 @@ class _StrictTemplateGraph:
         # Family repair scoring preference (guarded profile)
         self.req_prefer_guarded_family: bool = getattr(req, "prefer_guarded_virtual_family", False) if req else False
         self.req_guarded_family_reason: str = str(getattr(req, "guarded_virtual_family_reason", "") if req else "")
+        # ALNS-round-level repair family edge keys (admission gate)
+        self.req_repair_family_edge_keys: set = set(getattr(req, "repair_family_edge_keys", []) or [])
+        self.rebuild_repair_family_edge_keys_count: int = len(self.req_repair_family_edge_keys)
+        self.rebuild_repair_family_edge_keys_used_count: int = 0
 
         # Determine edge policy string
         # Policy determines which arc types are allowed in local inserter:
@@ -332,6 +355,21 @@ class _StrictTemplateGraph:
                     self.virtual_bridge_arcs_blocked += 1
                     continue
 
+                # (d) ALNS-round-level repair family edge key gate
+                # If req_repair_family_edge_keys is non-empty, only admit edges whose
+                # (line, from_order_id, to_order_id, bridge_family) key is in the set.
+                # This is the mechanism by which ALNS round picks specific family edges
+                # from the repair pool to try in local CP-SAT rebuild.
+                if self.req_repair_family_edge_keys:
+                    _edge_key = (tpl_line, from_oid, to_oid, bridge_family)
+                    if _edge_key not in self.req_repair_family_edge_keys:
+                        self.virtual_bridge_arcs_blocked += 1
+                        continue
+                    # Key found: admit this family edge
+                    self.rebuild_repair_family_edge_keys_used_count: int = getattr(
+                        self, "rebuild_repair_family_edge_keys_used_count", 0
+                    ) + 1
+
                 self.rebuild_guarded_virtual_family_allowed = True
                 self.rebuild_virtual_family_candidate_count += 1
                 self.rebuild_virtual_family_arc_count += 1
@@ -392,6 +430,9 @@ class _StrictTemplateGraph:
             "rebuild_virtual_family_budget_for_rebuild": int(self.req_family_budget),
             "rebuild_virtual_family_budget_blocked_count": int(self.rebuild_virtual_family_budget_blocked_count),
             "rebuild_virtual_family_used_count": int(self.rebuild_virtual_family_used_count),
+            # ALNS-round-level repair family edge key diagnostics
+            "rebuild_repair_family_edge_keys_count": int(self.rebuild_repair_family_edge_keys_count),
+            "rebuild_repair_family_edge_keys_used_count": int(self.rebuild_repair_family_edge_keys_used_count),
         }
 
 

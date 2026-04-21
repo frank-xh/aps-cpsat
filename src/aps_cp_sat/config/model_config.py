@@ -186,3 +186,58 @@ class ModelConfig:
     tail_fill_accept_partial_progress: bool = True      # Accept fill if it narrows gap even if tail still underfilled
     tail_fill_max_inserts_per_tail: int = 2             # Max consecutive fill inserts per tail (2 = 2-pass fill)
     tail_fill_second_pass_gap_limit: float = 30.0       # Only do 2nd fill if gap_to_min <= this after 1st fill
+    # ---- Block Generator Configuration (block_first_guarded_search) ----
+    block_generator_target_blocks: int = 2000
+    block_generator_time_limit_seconds: float = 15.0
+    block_generator_max_blocks_per_line: int = 30
+    block_generator_max_blocks_total: int = 80
+    block_generator_max_seed_per_bucket: int = 8
+    block_generator_target_tons_min: float = 150.0
+    block_generator_target_tons_target: float = 1200.0
+    block_generator_target_tons_max: float = 550.0
+    # ---- Candidate block (pool) threshold: looser than target_tons_* ----
+    # Blocks between candidate_tons_min and target_tons_min are accepted
+    # into the candidate pool as small_candidate blocks, but are penalized
+    # by block_master to discourage them as final campaign blocks.
+    block_generator_candidate_tons_min: float = 300.0
+    block_generator_candidate_tons_target: float = 700.0
+    block_generator_candidate_tons_max: float = 2000.0
+    block_generator_max_orders_per_block: int = 30
+    block_generator_allow_guarded_family: bool = True
+    block_generator_allow_real_bridge: bool = True
+    block_generator_allow_mixed_bridge_potential: bool = True
+    block_generator_max_family_edges_per_block: int = 3
+    block_generator_max_real_bridge_edges_per_block: int = 5
+    block_generator_max_bridge_count_per_block: int = 2
+    # ---- Directional Clustering Weights ----
+    directional_cluster_width_weight: float = 1.0
+    directional_cluster_thickness_weight: float = 1.0
+    directional_cluster_temp_weight: float = 0.8
+    directional_cluster_group_weight: float = 1.2
+    directional_cluster_due_weight: float = 0.6
+    directional_cluster_tons_fill_weight: float = 1.0
+    directional_cluster_real_bridge_bonus: float = 0.8
+    directional_cluster_guarded_family_bonus: float = 0.5
+    directional_cluster_mixed_bridge_potential_bonus: float = 0.3
+    # ---- Block ALNS Configuration ----
+    block_alns_enabled: bool = True
+    block_alns_rounds: int = 10
+    block_alns_early_stop_no_improve_rounds: int = 2
+    block_alns_swap_enabled: bool = True
+    block_alns_replace_enabled: bool = True
+    block_alns_split_enabled: bool = True
+    block_alns_merge_enabled: bool = True
+    block_alns_boundary_rebalance_enabled: bool = True
+    block_alns_internal_rebuild_enabled: bool = True
+    block_alns_accept_threshold: float = 0.0
+    # ---- Block Master Configuration ----
+    block_master_slot_buffer: int = 2
+    block_master_greedy: bool = True
+    block_master_max_conflict_skip: int = 5
+    block_master_prefer_quality_score: bool = True
+    # ---- Mixed Bridge (block-internal only) ----
+    mixed_bridge_in_block_enabled: bool = True
+    mixed_bridge_allowed_forms: list[str] = field(default_factory=lambda: ["REAL_TO_GUARDED", "GUARDED_TO_REAL"])
+    mixed_bridge_allowed_hotspots: list[str] = field(default_factory=lambda: ["underfill", "group_switch", "bridge_dependency", "width_tension"])
+    mixed_bridge_max_attempts_per_block: int = 10
+

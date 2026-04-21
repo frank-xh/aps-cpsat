@@ -4058,6 +4058,7 @@ def _try_bridge_ton_rescue_recut(
     window_id: int,
     direction: str,
     expansion_block: list[CampaignSegment],
+    current_block_segment_count: int,
     current_block_segment_ids: list[int],
     direct_edges: set[tuple[str, str]],
     real_edge: tuple[str, str],
@@ -4297,6 +4298,7 @@ def _reconstruct_underfilled_segments(
     order_tons: dict[str, float] | None = None,
     orders_df: pd.DataFrame | None = None,
     cfg: PlannerConfig | None = None,
+    family_repair_already_attempted_keys: set | None = None,
 ) -> tuple[list[CampaignSegment], list[CampaignSegment], dict]:
     """
     Repair-only local reconstruction for underfilled segments.
@@ -4306,6 +4308,9 @@ def _reconstruct_underfilled_segments(
     as a repair candidate after direct-only reconstruction has no gain.
     """
     t0 = perf_counter()
+    # Initialize family_repair_already_attempted_keys if None (for compatibility)
+    _family_dedup_keys: set = set(family_repair_already_attempted_keys) if family_repair_already_attempted_keys else set()
+
     diag = {
         "underfilled_reconstruction_enabled": True,
         "underfilled_reconstruction_attempts": 0,
@@ -4342,6 +4347,9 @@ def _reconstruct_underfilled_segments(
         "repair_bridge_raw_rows_total": 0,
         "repair_bridge_matched_rows_total": 0,
         "repair_bridge_kept_rows_total": 0,
+        # Family repair dedup diagnostics (for ALNS vs reconstruction role clarity)
+        "family_repair_already_attempted_key_count": len(_family_dedup_keys),
+        "repair_virtual_family_skipped_due_to_existing_attempt_count": 0,
         "repair_bridge_endpoint_key_mismatch_count": 0,
         "repair_bridge_field_name_mismatch_count": 0,
         "repair_bridge_inconsistency_count": 0,
@@ -5296,6 +5304,7 @@ def _reconstruct_underfilled_segments(
                             failed_after_min = 0
                             last_tons: float | None = None
                             current_block_segment_ids = [int(seg.campaign_local_id) for seg in block]
+                            current_block_segment_count = len(block)
                             for window_id, window in enumerate(rescue_windows, start=1):
                                 combined_tons = float(window.get("tons", 0.0) or 0.0)
                                 if last_tons is not None and abs(combined_tons - last_tons) <= 1e-6:
@@ -5311,6 +5320,7 @@ def _reconstruct_underfilled_segments(
                                     window_id=int(window_id),
                                     direction=str(window.get("direction", "")),
                                     expansion_block=expansion_block,
+                                    current_block_segment_count=current_block_segment_count,
                                     current_block_segment_ids=current_block_segment_ids,
                                     direct_edges=direct_edges,
                                     real_edge=rescue_edge,
@@ -8070,6 +8080,43 @@ def _print_cutting_summary(
                 f"valid={len(line_segs)}, under={len(line_under)}, "
                 f"avg_tons={avg_t:.0f}, min={ton_min}, max={ton_max}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Family repair dedup helper for reconstruction
+# ---------------------------------------------------------------------------
+
+def _should_skip_family_repair(
+    line: str,
+    from_order_id: str,
+    to_order_id: str,
+    bridge_family: str,
+    already_attempted_keys: set,
+    recon_diag: dict,
+) -> bool:
+    """
+    Check if a family repair candidate should be skipped because ALNS/local rebuild
+    has already attempted it (dedup gate).
+
+    Args:
+        line: Production line
+        from_order_id: Source order ID
+        to_order_id: Target order ID
+        bridge_family: Bridge family type
+        already_attempted_keys: Set of keys already attempted by ALNS/local rebuild
+        recon_diag: Reconstruction diagnostics dict (for incrementing skip counter)
+
+    Returns:
+        True if should skip (key already attempted), False if should proceed.
+    """
+    _key = (str(line), str(from_order_id), str(to_order_id), str(bridge_family))
+    if _key in already_attempted_keys:
+        if recon_diag is not None:
+            recon_diag["repair_virtual_family_skipped_due_to_existing_attempt_count"] = (
+                recon_diag.get("repair_virtual_family_skipped_due_to_existing_attempt_count", 0) + 1
+            )
+        return True
+    return False
 
 
 __all__ = [

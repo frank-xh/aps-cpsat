@@ -1,10 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
-from typing import Dict
+from typing import Dict, Any
 import pandas as pd
 
 from aps_cp_sat.decode import decode_candidate_allocation, decode_solution
@@ -22,6 +22,16 @@ try:
     from aps_cp_sat.persistence.service import persist_run_analysis_from_excel
 except Exception:
     persist_run_analysis_from_excel = None
+
+# Block-first import check (lazy, used only for error reporting)
+_block_first_import_error: str | None = None
+try:
+    from aps_cp_sat.model.block_generator import generate_candidate_blocks  # noqa: F401
+    from aps_cp_sat.model.block_master import solve_block_master  # noqa: F401
+    from aps_cp_sat.model.block_realizer import realize_selected_blocks  # noqa: F401
+    from aps_cp_sat.model.block_alns import run_block_alns  # noqa: F401
+except ImportError as e:
+    _block_first_import_error = str(e)
 
 
 class ColdRollingPipeline:
@@ -156,13 +166,15 @@ class ColdRollingPipeline:
         #   - constructive_lns_real_bridge_frontload: Alias of constructive_lns_search
         #   - constructive_lns_direct_only_baseline: Regression baseline (Route C / direct_only)
         #   - constructive_lns_virtual_guarded_frontload: Guarded virtual family experiment line
+        #   - block_first_guarded_search: Block-first experiment line (block → block master → realize → block ALNS)
         # NOTE: constructive_lns_bridge_family_master / debug_acceptance 已移出默认主路径，
         # 保留于 compat/experimental_disabled/ 或 debug-only，不进入默认生产守卫。
         _ALLOWED_ALNS_PROFILES = {
             "constructive_lns_search",                      # Production mainline (Route RB)
-            "constructive_lns_real_bridge_frontload",       # Alias of mainline (Route RB)
+            "constructive_lns_real_bridge_frontload",      # Alias of mainline (Route RB)
             "constructive_lns_direct_only_baseline",        # Diagnostic baseline (Route C)
-            "constructive_lns_virtual_guarded_frontload",   # Guarded virtual family experiment
+            "constructive_lns_virtual_guarded_frontload",    # Guarded virtual family experiment
+            "block_first_guarded_search",                   # Block-first experiment line
         }
 
         # Case B: auto-correct empty/default
@@ -245,6 +257,31 @@ class ColdRollingPipeline:
         "acceptance",
         "acceptance_gate_reason",
         "validation_gate_reason",
+        # ---- Block-first experiment line fields ----
+        "generated_blocks_total",
+        "selected_blocks_count",
+        "selected_order_coverage",
+        "block_master_dropped_count",
+        "mixed_bridge_attempt_count",
+        "mixed_bridge_success_count",
+        "mixed_bridge_reject_count",
+        "block_alns_rounds_attempted",
+        "block_alns_rounds_accepted",
+        "block_swap_attempt_count",
+        "block_replace_attempt_count",
+        "block_split_attempt_count",
+        "block_merge_attempt_count",
+        "block_boundary_rebalance_attempt_count",
+        "block_internal_rebuild_attempt_count",
+        "avg_block_quality_score",
+        "avg_block_tons_in_selected",
+        "block_transition_avg_cost",
+        "orders_in_realized_blocks",
+        "avg_realized_block_quality",
+        "block_generation_seconds",
+        "block_master_seconds",
+        "block_realization_seconds",
+        "block_alns_seconds",
     )
 
     @staticmethod
@@ -1184,6 +1221,70 @@ class ColdRollingPipeline:
             print(f"[APS][PROFILE_GUARD] effective_profile={req.config.model.profile_name}")
             print(f"[APS][PROFILE_GUARD] effective_main_solver_strategy={req.config.model.main_solver_strategy}")
             print(f"[APS][PROFILE_GUARD] joint_master_disabled=true")
+
+            # =========================================================================
+            # Branch: block_first vs. constructive_lns
+            # pipeline prepares data, dispatches to solve_master_model for execution
+            # =========================================================================
+            if req.config.model.main_solver_strategy == "block_first":
+                if _block_first_import_error is not None:
+                    raise ImportError(
+                        f"[APS][block_first] Failed to import block_first modules: {_block_first_import_error}"
+                    )
+                print(f"[APS][block_first] Starting block-first via solve_master_model")
+                print(f"[APS][block_first] profile_name={req.config.model.profile_name}")
+                print(
+                    f"[APS][block_first] block_generator_max_blocks_total={int(getattr(req.config.model, 'block_generator_max_blocks_total', 80))}"
+                )
+                print(
+                    f"[APS][block_first] block_alns_rounds={int(getattr(req.config.model, 'block_alns_rounds', 10))}"
+                )
+                print(f"[APS][block_first] prepared transition_pack and dispatching to solve_master_model")
+
+                # ---- Prepare orders and templates (same as constructive_lns) ----
+                orders_df = prepare_orders_for_model(req.orders_path, req.steel_info_path, req.config)
+                self._print_data_diagnostics(orders_df)
+
+                build_t0 = perf_counter()
+                transition_pack = build_transition_templates(orders_df, req.config)
+                transition_pack = self._attach_candidate_graph(orders_df, transition_pack, req.config)
+                template_build_seconds = perf_counter() - build_t0
+                self._print_template_diagnostics(transition_pack)
+                print(f"[APS][block_first] template_build_seconds={template_build_seconds:.3f}")
+
+                # ---- Dispatch to solve_master_model (single canonical block-first path) ----
+                schedule_df, rounds_df, dropped_df, engine_meta = solve_master_model(
+                    req, transition_pack=transition_pack, orders_df=orders_df
+                )
+
+                total_runtime = perf_counter() - run_t0
+
+                # ---- Build ColdRollingResult (pipeline adds its own timing) ----
+                result = ColdRollingResult(
+                    schedule_df=schedule_df,
+                    rounds_df=rounds_df,
+                    output_path=Path(req.output_path),
+                    dropped_df=dropped_df,
+                    engine_meta=engine_meta,
+                    config=req.config,
+                )
+
+                # ---- Decode phase (reuse existing decode) ----
+                result = decode_solution(result)
+                annotated_dropped = ColdRollingPipeline._annotate_dropped_orders(
+                    orders_df,
+                    result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else pd.DataFrame(),
+                    result.engine_meta or {},
+                )
+                result = replace(result, dropped_df=annotated_dropped)
+                updated_engine_meta = dict(result.engine_meta or {})
+                updated_engine_meta["total_runtime_seconds"] = total_runtime
+                result = replace(result, engine_meta=updated_engine_meta)
+                return result  # <-- EXIT block_first path here (dispatched to solve_master_model)
+
+            # =========================================================================
+            # constructive_lns path (existing)
+            # =========================================================================
             print(f"[APS][constructive_lns] preparing transition templates for constructive graph search")
             print(f"[APS][Profile] name={req.config.model.profile_name}")
             if req.config.model.profile_name == "constructive_lns_debug_acceptance":
