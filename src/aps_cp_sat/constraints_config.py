@@ -9,9 +9,9 @@ class ConstraintThresholds:
     min_temp_overlap_real_real: float = 10.0
     max_width_drop: float = 250.0
     # 逆宽规则：逻辑逆宽量上限、单次物理逆宽步长、每轧期逻辑逆宽次数上限。
-    real_reverse_step_max_mm: float = 20.0
-    virtual_reverse_attach_max_mm: float = 250.0
-    max_width_rise_physical_step: float = 20.0
+    real_reverse_step_max_mm: float = 50.0
+    virtual_reverse_attach_max_mm: float = 50.0
+    max_width_rise_physical_step: float = 50.0
     max_logical_reverse_per_campaign: int = 5
 
     # 轧期吨位阈值

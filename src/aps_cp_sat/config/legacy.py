@@ -17,7 +17,7 @@ def legacy_to_planner_config(legacy_constraint_config, *, model: ModelConfig | N
         min_temp_overlap_real_real=float(th.min_temp_overlap_real_real),
         max_width_drop=float(th.max_width_drop),
         max_width_rise_physical_step=float(th.max_width_rise_physical_step),
-        virtual_reverse_attach_max_mm=float(getattr(th, "virtual_reverse_attach_max_mm", 250.0)),
+        virtual_reverse_attach_max_mm=float(getattr(th, "virtual_reverse_attach_max_mm", 50.0)),
         max_logical_reverse_per_campaign=int(th.max_logical_reverse_per_campaign),
         campaign_ton_min=float(th.campaign_ton_min),
         campaign_ton_max=float(th.campaign_ton_max),

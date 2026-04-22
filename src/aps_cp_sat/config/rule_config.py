@@ -7,12 +7,12 @@ class RuleConfig:
     min_temp_overlap_real_real: float = 10.0
     max_width_drop: float = 250.0
     # real_step_max_mm: only for real->real adjacency
-    real_reverse_step_max_mm: float = 20.0
+    real_reverse_step_max_mm: float = 50.0
     # virtual_reverse_attach_max_mm: only when the right-side coil is virtual
     # (real->virtual or virtual->virtual). It does not relax real->real.
-    virtual_reverse_attach_max_mm: float = 250.0
+    virtual_reverse_attach_max_mm: float = 50.0
     # compatibility alias retained for older helper code
-    max_width_rise_physical_step: float = 20.0
+    max_width_rise_physical_step: float = 50.0
     # same campaign reverse-width episode limit, counted as logical reverse
     # events per campaign rather than every virtual slab inside a bridge chain.
     max_logical_reverse_per_campaign: int = 5

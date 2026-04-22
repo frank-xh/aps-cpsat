@@ -346,7 +346,7 @@ def _width_reverse_virtual_need(
     if delta <= 0.0:
         return 0
     step = max(1.0, float(TH.max_width_rise_physical_step))
-    logical_max = float(getattr(TH, "virtual_reverse_attach_max_mm", 250.0))
+    logical_max = float(getattr(TH, "virtual_reverse_attach_max_mm", 50.0))
     if delta > logical_max:
         return 10**9
     if strict_virtual_width_levels:
@@ -991,7 +991,7 @@ def _bridge_pair(
     # 逆宽专用：按“每次物理逆宽<=20mm”构造阶梯桥接。
     if bool(physical_reverse_step_mode) and float(b["width"]) > float(a["width"]):
         delta = float(b["width"]) - float(a["width"])
-        if delta > float(getattr(TH, "virtual_reverse_attach_max_mm", 250.0)):
+        if delta > float(getattr(TH, "virtual_reverse_attach_max_mm", 50.0)):
             raise RuntimeError("reverse-width logical delta exceeds hard limit")
         physical_step = max(1.0, float(TH.max_width_rise_physical_step))
         physical_steps = int(math.ceil(delta / physical_step))
@@ -1185,7 +1185,7 @@ def _attach_checks(df: pd.DataFrame) -> pd.DataFrame:
     ).fillna(False)
     out["width_over_mm"] = out["width_over_mm"] + (
         (rev_cnt - int(TH.max_logical_reverse_per_campaign)).clip(lower=0).astype(float)
-        * float(getattr(TH, "real_reverse_step_max_mm", 20.0))
+        * float(getattr(TH, "real_reverse_step_max_mm", 50.0))
     )
     first_rows = out.groupby(group_cols).head(1).index
     out.loc[first_rows, ["narrow_to_wide", "width_jump_violation", "thickness_violation", "group_switch", "non_pc_direct_switch", "temp_conflict"]] = False
@@ -1792,7 +1792,7 @@ def export_schedule_results(
             campaign_ton_target=float(TH.campaign_ton_target),
             min_temp_overlap_real_real=float(TH.min_temp_overlap_real_real),
             max_width_drop=float(TH.max_width_drop),
-            virtual_reverse_attach_max_mm=float(getattr(TH, "virtual_reverse_attach_max_mm", 250.0)),
+            virtual_reverse_attach_max_mm=float(getattr(TH, "virtual_reverse_attach_max_mm", 50.0)),
             max_width_rise_physical_step=float(TH.max_width_rise_physical_step),
             max_logical_reverse_per_campaign=int(TH.max_logical_reverse_per_campaign),
             virtual_chain_penalty_threshold=int(TH.virtual_chain_penalty_threshold),

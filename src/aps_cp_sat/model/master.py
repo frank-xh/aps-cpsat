@@ -1213,9 +1213,16 @@ def solve_master_model(
                 "orders_in_realized_blocks": block_real_diag.get("orders_in_realized_blocks", 0),
                 "mixed_bridge_attempt_count": block_real_diag.get("mixed_bridge_attempt_count", 0),
                 "mixed_bridge_success_count": block_real_diag.get("mixed_bridge_success_count", 0),
+                "unresolved_internal_pair_count": block_real_diag.get("unresolved_internal_pair_count", 0),
+                "unresolved_boundary_pair_count": block_real_diag.get("unresolved_boundary_pair_count", 0),
+                "unresolved_pair_count_total": block_real_diag.get("unresolved_pair_count_total", 0),
+                "resolved_internal_pair_count": block_real_diag.get("resolved_internal_pair_count", 0),
+                "resolved_boundary_pair_count": block_real_diag.get("resolved_boundary_pair_count", 0),
+                "unresolved_pair_examples": block_real_diag.get("unresolved_pair_examples", []),
                 # Block ALNS metrics
                 "block_alns_rounds_attempted": block_alns_diag.get("block_alns_rounds_attempted", 0),
                 "block_alns_rounds_accepted": block_alns_diag.get("block_alns_rounds_accepted", 0),
+                "block_alns_rejected_due_to_unresolved_regression": block_alns_diag.get("rejected_due_to_unresolved_regression", 0),
                 # Timing
                 "block_generation_seconds": gen_seconds,
                 "block_master_seconds": master_seconds,

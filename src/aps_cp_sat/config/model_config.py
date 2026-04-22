@@ -10,6 +10,7 @@ class ModelConfig:
     max_orders: int = 720
     rounds: int = 4
     time_limit_seconds: float = 20.0
+    random_seed: int = 42
     master_profile_count: int = 2
     master_seed_count: int = 1
     master_num_workers: int = 4
@@ -192,14 +193,14 @@ class ModelConfig:
     block_generator_max_blocks_per_line: int = 30
     block_generator_max_blocks_total: int = 80
     block_generator_max_seed_per_bucket: int = 8
-    block_generator_target_tons_min: float = 150.0
-    block_generator_target_tons_target: float = 1200.0
-    block_generator_target_tons_max: float = 550.0
+    block_generator_target_tons_min: float = 200.0
+    block_generator_target_tons_target: float = 700.0
+    block_generator_target_tons_max: float = 1200.0
     # ---- Candidate block (pool) threshold: looser than target_tons_* ----
     # Blocks between candidate_tons_min and target_tons_min are accepted
     # into the candidate pool as small_candidate blocks, but are penalized
     # by block_master to discourage them as final campaign blocks.
-    block_generator_candidate_tons_min: float = 300.0
+    block_generator_candidate_tons_min: float = 200.0
     block_generator_candidate_tons_target: float = 700.0
     block_generator_candidate_tons_max: float = 2000.0
     block_generator_max_orders_per_block: int = 30
@@ -240,4 +241,25 @@ class ModelConfig:
     mixed_bridge_allowed_forms: list[str] = field(default_factory=lambda: ["REAL_TO_GUARDED", "GUARDED_TO_REAL"])
     mixed_bridge_allowed_hotspots: list[str] = field(default_factory=lambda: ["underfill", "group_switch", "bridge_dependency", "width_tension"])
     mixed_bridge_max_attempts_per_block: int = 10
+    # ---- Virtual slab shadow/formal contract ----
+    # Shadow mode estimates virtual bridge/fill benefits without writing virtual
+    # rows into official schedules. Formal mode is intentionally off by default.
+    virtual_enabled: bool = True
+    virtual_shadow_mode_enabled: bool = True
+    virtual_formal_enabled: bool = False
+    virtual_budget_total_tons: float = 500.0
+    virtual_budget_per_campaign_tons: float = 80.0
+    virtual_max_count_per_campaign: int = 2
+    virtual_max_consecutive_chain: int = 5
+    virtual_penalty_per_piece: float = 1000.0
+    virtual_penalty_per_ton: float = 20.0
+    virtual_bridge_only_for_allowed_gaps: bool = True
+    virtual_allowed_lines: list[str] = field(default_factory=lambda: ["big_roll", "small_roll"])
+    virtual_allowed_steel_groups: list[str] = field(default_factory=list)
+    penalty_virtual_piece_count: float = 1000.0
+    penalty_virtual_tons: float = 20.0
+    penalty_virtual_bridge_segments: float = 500.0
+    penalty_consecutive_virtual_chain: float = 2000.0
+    reward_drop_reduction_if_virtual: float = 800.0
+    reward_hard_violation_elimination_if_virtual: float = 1500.0
 

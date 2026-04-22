@@ -40,7 +40,6 @@ PRODUCTION-LEVEL BLOCK POOL ORCHESTRATOR: block_generator.py
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 from time import perf_counter
 import random
@@ -141,8 +140,8 @@ def _compute_block_quality_score(
     score += min(15.0, block.order_count * 1.5)
 
     # Reward: good tons coverage
-    target_min = float(getattr(cfg.model, "block_generator_target_tons_min", 150.0))
-    target_max = float(getattr(cfg.model, "block_generator_target_tons_max", 550.0))
+    target_min = float(getattr(cfg.model, "block_generator_target_tons_min", 200.0))
+    target_max = float(getattr(cfg.model, "block_generator_target_tons_max", 1200.0))
     if target_min <= block.total_tons <= target_max:
         score += 15.0
     elif block.total_tons > target_max:
@@ -162,7 +161,7 @@ def _compute_block_quality_score(
 
 def _compute_underfill_risk(
     block: CandidateBlock,
-    min_campaign_tons: float = 300.0,
+    min_campaign_tons: float = 700.0,
 ) -> float:
     """Estimate risk that block will be underfilled in a campaign."""
     if block.total_tons >= min_campaign_tons:
@@ -208,95 +207,192 @@ def _classify_mixed_bridge_opportunity(
 
 
 # =============================================================================
+# Helpers: tolerant object access / edge normalization / macro extraction
+# =============================================================================
+
+
+def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _edge_to_record(edge: Any) -> Dict[str, Any]:
+    """
+    Normalize CandidateEdge / dict edge into a plain dict record.
+    """
+    if isinstance(edge, dict):
+        return dict(edge)
+
+    return {
+        "from_order_id": str(_obj_get(edge, "from_order_id", "")),
+        "to_order_id": str(_obj_get(edge, "to_order_id", "")),
+        "edge_type": str(_obj_get(edge, "edge_type", "")),
+        "score": float(_obj_get(edge, "score", 0.0) or 0.0),
+        "bridge_path_payload": _obj_get(edge, "bridge_path_payload", None),
+        "metadata": _obj_get(edge, "metadata", None),
+    }
+
+
+def _extract_macro_blocks(macro_result: Any) -> List[Any]:
+    """
+    Robustly extract macro blocks from various return shapes.
+
+    Supports:
+    - list[MacroBlock]
+    - object.blocks
+    - object.macro_blocks
+    - object.candidates / object.candidate_blocks
+    - dict with those keys
+    - tuple containing one of the above
+    """
+    if macro_result is None:
+        return []
+
+    if isinstance(macro_result, list):
+        return list(macro_result)
+
+    if isinstance(macro_result, tuple):
+        for item in macro_result:
+            extracted = _extract_macro_blocks(item)
+            if extracted:
+                return extracted
+        return []
+
+    if isinstance(macro_result, dict):
+        for k in ("blocks", "macro_blocks", "candidates", "candidate_blocks"):
+            v = macro_result.get(k)
+            if isinstance(v, list):
+                return list(v)
+        return []
+
+    for attr in ("blocks", "macro_blocks", "candidates", "candidate_blocks"):
+        if hasattr(macro_result, attr):
+            v = getattr(macro_result, attr)
+            if isinstance(v, list):
+                return list(v)
+
+    return []
+
+
+# =============================================================================
 # MacroBlock -> CandidateBlock Conversion (bridge feasible_block_builder to orchestrator)
 # =============================================================================
 
 
 def _macro_block_to_candidate_block(
-    macro: MacroBlock,
+    macro: Any,
     orders_by_id: Dict[str, Dict[str, Any]],
     cfg: PlannerConfig,
 ) -> CandidateBlock:
     """
-    Convert a MacroBlock (from feasible_block_builder) to a CandidateBlock (orchestrator level).
+    Convert a MacroBlock (or MacroBlock-like dict/object) to a CandidateBlock.
 
     This is the bridge between the low-level engine (feasible_block_builder) and
     the production orchestrator (block_generator).
     """
-    if not macro.order_ids:
-        raise ValueError(f"MacroBlock {macro.block_id} has no orders")
+    order_ids = list(_obj_get(macro, "order_ids", []) or [])
+    if not order_ids:
+        raise ValueError(f"Macro result has no orders: type={type(macro).__name__}")
 
-    head_order = orders_by_id.get(macro.order_ids[0], {})
-    tail_order = orders_by_id.get(macro.order_ids[-1], {})
+    block_id = str(_obj_get(macro, "block_id", "")) or f"macro_{order_ids[0]}"
+    line = str(_obj_get(macro, "line", "")) or str(orders_by_id.get(order_ids[0], {}).get("line", ""))
 
-    # Build internal edges from macro block metadata
-    internal_edges = []
-    for i in range(len(macro.order_ids) - 1):
-        internal_edges.append({
-            "from_order_id": macro.order_ids[i],
-            "to_order_id": macro.order_ids[i + 1],
-            "edge_type": "DIRECT_EDGE",  # Simplified - macro doesn't track individual edge types
-        })
+    head_order = orders_by_id.get(order_ids[0], {})
+    tail_order = orders_by_id.get(order_ids[-1], {})
+
+    internal_edges = list(_obj_get(macro, "internal_edges", []) or [])
+    if not internal_edges:
+        # Build simplified direct chain if low-level block didn't expose per-edge info
+        for i in range(len(order_ids) - 1):
+            internal_edges.append({
+                "from_order_id": order_ids[i],
+                "to_order_id": order_ids[i + 1],
+                "edge_type": "DIRECT_EDGE",
+            })
 
     # Determine generation mode from source
-    mode = macro.source_generation_mode or "direct_friendly"
+    mode = (
+        _obj_get(macro, "source_generation_mode")
+        or _obj_get(macro, "generation_mode")
+        or "direct_friendly"
+    )
 
     # Detect hotspots
     steel_groups_seen = set()
     widths_seen = []
-    for oid in macro.order_ids:
+    for oid in order_ids:
         o = orders_by_id.get(oid, {})
         steel_groups_seen.add(str(o.get("steel_group", "")))
         widths_seen.append(float(o.get("width", 0)))
 
+    steel_groups_seen.discard("")
     has_group_switch = len(steel_groups_seen) > 1
     has_width_tension = bool(widths_seen) and (max(widths_seen) - min(widths_seen)) > 400.0
 
     # Candidate pool gate (looser) vs ideal target gate (tighter)
-    candidate_min = float(getattr(cfg.model, "block_generator_candidate_tons_min", 300.0))
-    target_min = float(getattr(cfg.model, "block_generator_target_tons_min", 150.0))
-    target_max = float(getattr(cfg.model, "block_generator_target_tons_max", 550.0))
-    has_underfill_hotspot = macro.total_tons < candidate_min
+    candidate_min = float(getattr(cfg.model, "block_generator_candidate_tons_min", 200.0))
+    target_min = float(getattr(cfg.model, "block_generator_target_tons_min", 200.0))
+    target_max = float(getattr(cfg.model, "block_generator_target_tons_max", 1200.0))
 
-    # Size class: distinguishes small pool candidates from ideal target candidates
-    if macro.total_tons < target_min:
+    total_tons = float(_obj_get(macro, "total_tons", 0.0))
+    if total_tons <= 0.0:
+        total_tons = sum(float(orders_by_id.get(oid, {}).get("tons", 0.0)) for oid in order_ids)
+
+    has_underfill_hotspot = total_tons < candidate_min
+
+    if total_tons < target_min:
         is_under_target_block = True
         candidate_size_class = "small_candidate"
-    elif macro.total_tons <= target_max:
+    elif total_tons <= target_max:
         is_under_target_block = False
         candidate_size_class = "target_candidate"
     else:
         is_under_target_block = False
         candidate_size_class = "above_target_max"
 
-    has_bridge_dependency_hotspot = (macro.real_bridge_edge_count + macro.virtual_family_edge_count) > 0
+    direct_edge_count = int(_obj_get(macro, "direct_edge_count", 0) or 0)
+    real_bridge_edge_count = int(_obj_get(macro, "real_bridge_edge_count", 0) or 0)
+    virtual_family_edge_count = int(_obj_get(macro, "virtual_family_edge_count", 0) or 0)
 
-    # Create CandidateBlock
+    # If counts are absent, infer from internal edge types
+    if direct_edge_count == 0 and real_bridge_edge_count == 0 and virtual_family_edge_count == 0 and internal_edges:
+        for e in internal_edges:
+            etype = str(e.get("edge_type", ""))
+            if etype == DIRECT_EDGE or etype == "DIRECT_EDGE":
+                direct_edge_count += 1
+            elif etype == REAL_BRIDGE_EDGE or etype == "REAL_BRIDGE_EDGE":
+                real_bridge_edge_count += 1
+            elif etype == VIRTUAL_BRIDGE_FAMILY_EDGE or etype == "VIRTUAL_BRIDGE_FAMILY_EDGE":
+                virtual_family_edge_count += 1
+
+    has_bridge_dependency_hotspot = (real_bridge_edge_count + virtual_family_edge_count) > 0
+
     block = CandidateBlock(
-        block_id=macro.block_id,
-        line=macro.line,
-        order_ids=list(macro.order_ids),
-        order_count=macro.order_count or len(macro.order_ids),
-        total_tons=macro.total_tons,
-        head_order_id=macro.head_order_id or (macro.order_ids[0] if macro.order_ids else ""),
-        tail_order_id=macro.tail_order_id or (macro.order_ids[-1] if macro.order_ids else ""),
+        block_id=block_id,
+        line=line,
+        order_ids=order_ids,
+        order_count=int(_obj_get(macro, "order_count", len(order_ids)) or len(order_ids)),
+        total_tons=total_tons,
+        head_order_id=str(_obj_get(macro, "head_order_id", order_ids[0])) or order_ids[0],
+        tail_order_id=str(_obj_get(macro, "tail_order_id", order_ids[-1])) or order_ids[-1],
         head_signature=_signature_from_order_dict(dict(head_order)) if head_order else {},
         tail_signature=_signature_from_order_dict(dict(tail_order)) if tail_order else {},
-        width_band=macro.width_band or "",
-        thickness_band=macro.thickness_band or "",
-        steel_group_profile=macro.steel_group_profile or "|".join(sorted(steel_groups_seen)),
-        temp_band=macro.temp_band or "",
-        direct_edge_count=macro.direct_edge_count,
-        real_bridge_edge_count=macro.real_bridge_edge_count,
-        virtual_family_edge_count=macro.virtual_family_edge_count,
-        mixed_bridge_possible=macro.mixed_bridge_possible,
-        mixed_bridge_reason=macro.mixed_bridge_reason,
-        block_quality_score=macro.block_quality_score or 0.0,
-        underfill_risk_score=macro.underfill_risk_score or 0.0,
-        bridge_dependency_score=macro.bridge_dependency_score or 0.0,
-        dropped_recovery_potential=macro.dropped_recovery_potential or 0.0,
-        source_bucket_key=macro.source_bucket_key or "",
-        source_generation_mode=mode,
+        width_band=str(_obj_get(macro, "width_band", "")) or "",
+        thickness_band=str(_obj_get(macro, "thickness_band", "")) or "",
+        steel_group_profile=str(_obj_get(macro, "steel_group_profile", "")) or "|".join(sorted(steel_groups_seen)),
+        temp_band=str(_obj_get(macro, "temp_band", "")) or "",
+        direct_edge_count=direct_edge_count,
+        real_bridge_edge_count=real_bridge_edge_count,
+        virtual_family_edge_count=virtual_family_edge_count,
+        mixed_bridge_possible=bool(_obj_get(macro, "mixed_bridge_possible", False)),
+        mixed_bridge_reason=str(_obj_get(macro, "mixed_bridge_reason", "")) or "",
+        block_quality_score=float(_obj_get(macro, "block_quality_score", 0.0) or 0.0),
+        underfill_risk_score=float(_obj_get(macro, "underfill_risk_score", 0.0) or 0.0),
+        bridge_dependency_score=float(_obj_get(macro, "bridge_dependency_score", 0.0) or 0.0),
+        dropped_recovery_potential=float(_obj_get(macro, "dropped_recovery_potential", 0.0) or 0.0),
+        source_bucket_key=str(_obj_get(macro, "source_bucket_key", "")) or "",
+        source_generation_mode=str(mode),
         internal_edges=internal_edges,
         has_group_switch=has_group_switch,
         has_width_tension=has_width_tension,
@@ -337,21 +433,19 @@ def _build_seed_greedy_block(
     - Tracks bridge composition explicitly
     - Computes quality/risk scores
     """
-    target_min = float(getattr(cfg.model, "block_generator_target_tons_min", 150.0))
-    target_max = float(getattr(cfg.model, "block_generator_target_tons_max", 550.0))
+    target_min = float(getattr(cfg.model, "block_generator_target_tons_min", 200.0))
+    target_max = float(getattr(cfg.model, "block_generator_target_tons_max", 1200.0))
     max_orders = int(getattr(cfg.model, "block_generator_max_orders_per_block", 30))
     max_family = int(getattr(cfg.model, "block_generator_max_family_edges_per_block", 3))
     max_real_bridge = int(getattr(cfg.model, "block_generator_max_real_bridge_edges_per_block", 5))
     allow_guarded = bool(getattr(cfg.model, "block_generator_allow_guarded_family", True))
     allow_real = bool(getattr(cfg.model, "block_generator_allow_real_bridge", True))
 
-    # Build adjacency from edges
     successors: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for e in graph_edges:
         frm = str(e.get("from_order_id", ""))
         successors[frm].append(e)
 
-    # Edge type filter
     def _edge_allowed(etype: str) -> bool:
         if etype == DIRECT_EDGE:
             return True
@@ -371,23 +465,19 @@ def _build_seed_greedy_block(
     block_counter[current.line] = block_counter.get(current.line, 0) + 1
     bid = f"{block_id_prefix}_{current.line}_{block_counter[current.line]}"
 
-    # Track steel groups for group switch detection
     steel_groups_seen = {current.steel_group}
     widths_seen = [current.width]
 
     for _ in range(max_orders - 1):
         if total_tons >= target_min and not (order_ids[-1] == start_seed.order_id and len(order_ids) > 1):
-            # In target range, check if we should stop
             if total_tons >= target_max * 0.85:
                 break
 
         next_edges = successors.get(current.order_id, [])
-        # Filter allowed edge types and sort by score
         allowed = [e for e in next_edges if _edge_allowed(str(e.get("edge_type", "")))]
         if not allowed:
             break
 
-        # Sort by score (higher = better), with diversity bias
         allowed.sort(key=lambda e: (float(e.get("score", 0)) + rng.random() * 0.5), reverse=True)
         chosen = allowed[0]
 
@@ -398,15 +488,12 @@ def _build_seed_greedy_block(
         if next_order is None:
             break
 
-        # Check capacity
         next_tons = float(next_order.get("tons", 0))
         if total_tons + next_tons > target_max * 1.1:
             break
 
-        # Edge type constraints
         if etype == VIRTUAL_BRIDGE_FAMILY_EDGE:
             if family_count >= max_family:
-                # Skip family edges if budget exhausted, try next
                 if len(allowed) > 1:
                     for alt in allowed[1:]:
                         if str(alt.get("edge_type", "")) != VIRTUAL_BRIDGE_FAMILY_EDGE:
@@ -425,28 +512,39 @@ def _build_seed_greedy_block(
                         break
                 else:
                     break
-            else:
-                family_count += 1
         elif etype == REAL_BRIDGE_EDGE:
             if real_bridge_count >= max_real_bridge:
                 if len(allowed) > 1:
                     for alt in allowed[1:]:
                         if str(alt.get("edge_type", "")) in {DIRECT_EDGE}:
+                            # fallback selected edge must preserve actual edge_type
                             chosen = alt
-                            etype = VIRTUAL_BRIDGE_FAMILY_EDGE  # renamed var for clarity
+                            etype = str(chosen.get("edge_type", ""))
                             next_oid = str(chosen.get("to_order_id", ""))
                             next_order = orders_by_id.get(next_oid)
+                            if next_order is None:
+                                break
+                            next_tons = float(next_order.get("tons", 0))
+                            if total_tons + next_tons > target_max * 1.1:
+                                next_order = None
+                                break
                             break
                     else:
                         break
                 else:
                     break
-            else:
-                real_bridge_count += 1
+
+        if next_order is None:
+            break
+
+        # Count by the actual chosen edge_type after any fallback substitution.
+        if etype == VIRTUAL_BRIDGE_FAMILY_EDGE:
+            family_count += 1
+        elif etype == REAL_BRIDGE_EDGE:
+            real_bridge_count += 1
         else:
             direct_count += 1
 
-        # Update steel groups / widths
         steel_groups_seen.add(str(next_order.get("steel_group", "")))
         widths_seen.append(float(next_order.get("width", 0)))
 
@@ -454,7 +552,6 @@ def _build_seed_greedy_block(
         total_tons += next_tons
         internal_edges.append(dict(chosen))
 
-        # Advance current
         current = BlockSeed(
             order_id=next_oid,
             line=current.line,
@@ -468,13 +565,13 @@ def _build_seed_greedy_block(
             due_rank=int(next_order.get("due_rank", 9999)),
         )
 
-    if len(order_ids) < 2:
+    candidate_min = float(getattr(cfg.model, "block_generator_candidate_tons_min", 200.0))
+    if len(order_ids) < 2 or total_tons < candidate_min:
         return None
 
     head_order = orders_by_id.get(order_ids[0], {})
     tail_order = orders_by_id.get(order_ids[-1], {})
 
-    # Build candidate block
     block = CandidateBlock(
         block_id=bid,
         line=start_seed.line,
@@ -492,22 +589,21 @@ def _build_seed_greedy_block(
         direct_edge_count=direct_count,
         real_bridge_edge_count=real_bridge_count,
         virtual_family_edge_count=family_count,
-        mixed_bridge_possible=False,  # set below
+        mixed_bridge_possible=False,
         mixed_bridge_reason="",
-        block_quality_score=0.0,  # set below
-        underfill_risk_score=0.0,  # set below
-        bridge_dependency_score=0.0,  # set below
+        block_quality_score=0.0,
+        underfill_risk_score=0.0,
+        bridge_dependency_score=0.0,
         dropped_recovery_potential=0.0,
         source_bucket_key=f"{start_seed.line}#{start_seed.width_band}#{start_seed.thickness_band}",
         source_generation_mode="greedy_seed",
         internal_edges=internal_edges,
         has_group_switch=(len(steel_groups_seen) > 1),
-        has_width_tension=False,  # will be set in post-processing
+        has_width_tension=False,
         has_underfill_hotspot=(total_tons < target_min),
         has_bridge_dependency_hotspot=(real_bridge_count + family_count > 0),
     )
 
-    # Compute scores
     block.underfill_risk_score = _compute_underfill_risk(block)
     block.bridge_dependency_score = _compute_bridge_dependency(block)
     block.block_quality_score = _compute_block_quality_score(block, cfg)
@@ -530,7 +626,6 @@ def _generate_seed_greedy_blocks(
     max_total = int(getattr(cfg.model, "block_generator_max_blocks_total", 80))
     max_per_bucket = int(getattr(cfg.model, "block_generator_max_seed_per_bucket", 8))
 
-    # Group seeds by bucket
     bucket_seeds: Dict[str, List[BlockSeed]] = defaultdict(list)
     for line, seeds in seeds_by_line.items():
         for s in seeds:
@@ -544,14 +639,12 @@ def _generate_seed_greedy_blocks(
     for bucket_key, seeds in sorted(bucket_seeds.items()):
         if len(blocks) >= max_total:
             break
-        # Sort seeds by priority / due_rank
         seeds_sorted = sorted(seeds, key=lambda s: (s.priority, s.due_rank))
         for seed in seeds_sorted[:max_per_bucket]:
             if len(blocks) >= max_total:
                 break
             if seed.order_id in used_orders:
                 continue
-            # Count blocks already built from this line
             line = seed.line
             line_count = sum(1 for b in blocks if b.line == line)
             if line_count >= max_per_line:
@@ -568,7 +661,6 @@ def _generate_seed_greedy_blocks(
             )
             if block is None:
                 continue
-            # Mark orders as used
             for oid in block.order_ids:
                 used_orders.add(oid)
             blocks.append(block)
@@ -598,8 +690,7 @@ def _generate_underfilled_rescue_blocks(
     used_orders: set = set()
 
     max_blocks = int(getattr(cfg.model, "block_generator_max_blocks_per_line", 30)) // 3
-    target_min = float(getattr(cfg.model, "block_generator_target_tons_min", 150.0))
-    allow_real = bool(getattr(cfg.model, "block_generator_allow_real_bridge", True))
+    target_min = float(getattr(cfg.model, "block_generator_target_tons_min", 200.0))
 
     for seg in underfilled_segments[:max_blocks]:
         if len(blocks) >= max_blocks:
@@ -613,8 +704,6 @@ def _generate_underfilled_rescue_blocks(
         if not seg_order_ids:
             continue
 
-        # Find tail orders of underfilled segment as seeds for rescue blocks
-        # Try to build a small block from the segment's tail orders
         tail_orders = seg_order_ids[-3:] if len(seg_order_ids) >= 3 else seg_order_ids
         for tail_oid in tail_orders:
             if tail_oid in used_orders:
@@ -623,8 +712,7 @@ def _generate_underfilled_rescue_blocks(
             if tail_order is None:
                 continue
 
-            # Build small rescue block targeting gap_to_min
-            target_tons = min(target_min, seg_tons + gap_to_min * 0.8)
+            _ = min(target_min, seg_tons + gap_to_min * 0.8)
             seed = BlockSeed(
                 order_id=tail_oid,
                 line=seg_line,
@@ -649,7 +737,7 @@ def _generate_underfilled_rescue_blocks(
             )
             if block is None:
                 continue
-            if block.total_tons < 50.0:  # Too small to be useful
+            if block.total_tons < 50.0:
                 continue
 
             for oid in block.order_ids:
@@ -688,7 +776,6 @@ def _generate_boundary_patch_blocks(
         if len(seg_order_ids) < 2:
             continue
 
-        # Look for group switch hotspots at boundaries
         boundary_pairs = list(zip(seg_order_ids[:-1], seg_order_ids[1:]))
         for i, (oid_a, oid_b) in enumerate(boundary_pairs):
             if len(blocks) >= max_blocks:
@@ -699,7 +786,6 @@ def _generate_boundary_patch_blocks(
             if order_a is None or order_b is None:
                 continue
 
-            # Detect group switch
             group_a = str(order_a.get("steel_group", ""))
             group_b = str(order_b.get("steel_group", ""))
             width_a = float(order_a.get("width", 0))
@@ -711,7 +797,6 @@ def _generate_boundary_patch_blocks(
             if not (is_group_switch or is_width_tension):
                 continue
 
-            # Build small patch block around boundary
             boundary_oids = seg_order_ids[max(0, i - 2): min(len(seg_order_ids), i + 3)]
             patch_tons = 0.0
             for poid in boundary_oids:
@@ -725,7 +810,6 @@ def _generate_boundary_patch_blocks(
             head_order = orders_by_id.get(boundary_oids[0], {})
             tail_order = orders_by_id.get(boundary_oids[-1], {})
 
-            # Build internal edge list
             internal_edges = []
             real_count = 0
             family_count = 0
@@ -738,7 +822,6 @@ def _generate_boundary_patch_blocks(
                     steel_groups.add(str(o.get("steel_group", "")))
                     widths.append(float(o.get("width", 0)))
                 if j < len(boundary_oids) - 1:
-                    # Find edge in graph
                     for e in graph_edges:
                         if (str(e.get("from_order_id", "")) == boundary_oids[j]
                            and str(e.get("to_order_id", "")) == boundary_oids[j + 1]):
@@ -821,9 +904,8 @@ def _generate_dropped_recovery_blocks(
     used_orders: set = set()
 
     max_blocks = int(getattr(cfg.model, "block_generator_max_blocks_per_line", 30)) // 4
-    target_min = float(getattr(cfg.model, "block_generator_target_tons_min", 150.0))
+    target_min = float(getattr(cfg.model, "block_generator_target_tons_min", 200.0))
 
-    # Group dropped by line
     dropped_by_line: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for do in dropped_orders:
         line = str(do.get("line", ""))
@@ -834,7 +916,6 @@ def _generate_dropped_recovery_blocks(
         if len(blocks) >= max_blocks:
             break
 
-        # Sort by due_rank / priority
         line_drops.sort(key=lambda d: (int(d.get("priority", 0)), int(d.get("due_rank", 9999))))
         remaining = list(line_drops)
 
@@ -899,7 +980,8 @@ def generate_candidate_blocks(
     This function is the production-level orchestrator that:
     1. Calls feasible_block_builder.generate_candidate_macro_blocks() as the low-level engine
     2. Converts MacroBlock results to CandidateBlock (orchestrator level)
-    3. Merges with supplemental strategies (underfilled rescue, boundary patch, dropped recovery)
+    3. Merges with supplemental strategies (seed greedy / underfilled rescue /
+       boundary patch / dropped recovery)
 
     Parameters
     ----------
@@ -914,66 +996,69 @@ def generate_candidate_blocks(
     Returns
     -------
     CandidateBlockPool with diagnostics
-
-    Architecture:
-    - Low-level engine: feasible_block_builder.generate_candidate_macro_blocks()
-    - Orchestrator: block_generator.generate_candidate_blocks() (this function)
     """
     rng = random.Random(random_seed)
     prefix = f"blk{int(rng.random() * 10000):04d}"
 
     lines = ["big_roll", "small_roll"]
-
-    # Build orders_by_id for conversions
     orders_by_id = {str(row.get("order_id", "")): dict(row) for _, row in orders_df.iterrows()}
 
-    # Get templates / candidate graph edges
     tpl_df = transition_pack.get("templates")
     if isinstance(tpl_df, pd.DataFrame) and not tpl_df.empty:
         graph_edges = tpl_df.to_dict("records")
     else:
         graph_edges = []
 
-    # Get candidate graph edges if available (more detailed)
     cand_graph = transition_pack.get("candidate_graph")
     if cand_graph is not None and hasattr(cand_graph, "edges"):
         cand_edges = cand_graph.edges
         if isinstance(cand_edges, list) and cand_edges:
-            graph_edges = cand_edges
+            graph_edges = [_edge_to_record(e) for e in cand_edges]
 
-    # Get underfilled segments from cut_result
+    # Ensure all edges are normalized dict records even when sourced from templates
+    graph_edges = [_edge_to_record(e) for e in graph_edges]
+    graph_edges = [
+        e for e in graph_edges
+        if str(e.get("from_order_id", "")) and str(e.get("to_order_id", ""))
+    ]
+
     underfilled_segs = []
     valid_segs = []
     if cut_result is not None:
         underfilled_segs = list(getattr(cut_result, "underfilled_segments", []) or [])
         valid_segs = list(getattr(cut_result, "segments", []) or [])
 
+    # ---- Seeds are useful both as fallback and supplemental strategy ----
+    seeds_by_line = _orders_to_seeds(orders_df, lines)
+
     # ---- A. Core: feasible_block_builder (low-level engine) ----
-    # Call the low-level engine to generate MacroBlocks
     tpl_df_input = transition_pack.get("templates")
-    macro_blocks: List[MacroBlock] = []
+    macro_blocks: List[Any] = []
     macro_gen_seconds = 0.0
+    macro_result_type = "None"
 
     try:
         macro_t0 = perf_counter()
         macro_result = _generate_macro_blocks(
             orders_df=orders_df,
-            templates_df=tpl_df_input,
+            tpl_df=tpl_df_input,
             cfg=cfg,
             random_seed=random_seed,
         )
         macro_gen_seconds = perf_counter() - macro_t0
+        macro_result_type = type(macro_result).__name__
 
-        # Extract MacroBlock list (handle both list and wrapped result)
-        if hasattr(macro_result, "blocks"):
-            macro_blocks = list(macro_result.blocks)
-        elif isinstance(macro_result, list):
-            macro_blocks = list(macro_result)
+        print(f"[APS][block_generator][DEBUG] macro_result_type={macro_result_type}")
+        if isinstance(macro_result, dict):
+            print(f"[APS][block_generator][DEBUG] macro_result_keys={list(macro_result.keys())}")
         else:
-            macro_blocks = []
+            attrs = [a for a in ("blocks", "macro_blocks", "candidates", "candidate_blocks") if hasattr(macro_result, a)]
+            print(f"[APS][block_generator][DEBUG] macro_result_attrs={attrs}")
+
+        macro_blocks = _extract_macro_blocks(macro_result)
 
         print(
-            f"[APS][block_generator] feasible_block_builder generated {len(macro_blocks)} MacroBlocks "
+            f"[APS][block_generator] feasible_block_builder extracted {len(macro_blocks)} MacroBlocks "
             f"in {macro_gen_seconds:.3f}s"
         )
     except Exception as e:
@@ -986,14 +1071,43 @@ def generate_candidate_blocks(
         try:
             cb = _macro_block_to_candidate_block(macro, orders_by_id, cfg)
             candidate_blocks_from_feasible.append(cb)
-        except Exception:
+        except Exception as e:
+            print(
+                f"[APS][block_generator][WARN] macro->candidate convert failed: "
+                f"type={type(macro).__name__}, err={e}"
+            )
             continue
 
-    # ---- B. Supplemental: local block generation (fallback + special cases) ----
-    # Convert orders to seeds for supplemental strategies
-    seeds_by_line = _orders_to_seeds(orders_df, lines)
+    # ---- B1. Seed Greedy Blocks (真正接入主流程) ----
+    seed_blocks = _generate_seed_greedy_blocks(
+        seeds_by_line=seeds_by_line,
+        graph_edges=graph_edges,
+        orders_df=orders_df,
+        cfg=cfg,
+        rng=rng,
+        block_id_prefix=prefix,
+    )
+    print(f"[APS][block_generator] seed_greedy generated {len(seed_blocks)} CandidateBlocks")
 
-    # B1. Underfilled Rescue Blocks (supplemental)
+    # Recovery fallback: if big_roll collapsed in the low-level engine, force a
+    # second seed-greedy pass for big_roll only so the candidate pool stays line-balanced.
+    feasible_big_roll_cnt = sum(1 for b in candidate_blocks_from_feasible if b.line == "big_roll")
+    seed_big_roll_cnt = sum(1 for b in seed_blocks if b.line == "big_roll")
+    if feasible_big_roll_cnt == 0 and seed_big_roll_cnt == 0 and seeds_by_line.get("big_roll"):
+        boosted_model = cfg.model.__class__(**{**cfg.model.__dict__, "block_generator_max_blocks_total": max(int(getattr(cfg.model, "block_generator_max_blocks_total", 80)), 120), "block_generator_max_blocks_per_line": max(int(getattr(cfg.model, "block_generator_max_blocks_per_line", 30)), 60)})
+        boosted_cfg = cfg.__class__(model=boosted_model, rule=cfg.rule, score=cfg.score)
+        big_only_seed_blocks = _generate_seed_greedy_blocks(
+            seeds_by_line={"big_roll": list(seeds_by_line.get("big_roll", []))},
+            graph_edges=graph_edges,
+            orders_df=orders_df,
+            cfg=boosted_cfg,
+            rng=rng,
+            block_id_prefix=prefix + "_bigrecovery",
+        )
+        seed_blocks.extend(big_only_seed_blocks)
+        print(f"[APS][block_generator] big_roll recovery seed pass generated {len(big_only_seed_blocks)} CandidateBlocks")
+
+    # ---- B2. Underfilled Rescue Blocks ----
     rescue_blocks = _generate_underfilled_rescue_blocks(
         underfilled_segments=underfilled_segs,
         graph_edges=graph_edges,
@@ -1002,8 +1116,9 @@ def generate_candidate_blocks(
         rng=rng,
         block_id_prefix=prefix,
     )
+    print(f"[APS][block_generator] underfilled_rescue generated {len(rescue_blocks)} CandidateBlocks")
 
-    # B2. Boundary Patch Blocks (supplemental)
+    # ---- B3. Boundary Patch Blocks ----
     boundary_blocks = _generate_boundary_patch_blocks(
         segments=valid_segs + underfilled_segs,
         graph_edges=graph_edges,
@@ -1012,8 +1127,9 @@ def generate_candidate_blocks(
         rng=rng,
         block_id_prefix=prefix,
     )
+    print(f"[APS][block_generator] boundary_patch generated {len(boundary_blocks)} CandidateBlocks")
 
-    # B3. Dropped Recovery Blocks (supplemental)
+    # ---- B4. Dropped Recovery Blocks ----
     dropped_list = dropped_orders or []
     dropped_blocks = _generate_dropped_recovery_blocks(
         dropped_orders=dropped_list,
@@ -1023,10 +1139,18 @@ def generate_candidate_blocks(
         rng=rng,
         block_id_prefix=prefix,
     )
+    print(f"[APS][block_generator] dropped_recovery generated {len(dropped_blocks)} CandidateBlocks")
 
     # ---- Merge all blocks, deduplicate by order set ----
-    # Priority: feasible_builder blocks first, then supplemental
-    all_blocks = candidate_blocks_from_feasible + rescue_blocks + boundary_blocks + dropped_blocks
+    # Priority: feasible_builder > seed_greedy > rescue > boundary > dropped
+    all_blocks = (
+        candidate_blocks_from_feasible
+        + seed_blocks
+        + rescue_blocks
+        + boundary_blocks
+        + dropped_blocks
+    )
+
     seen_order_sets: Dict[str, CandidateBlock] = {}
     for b in all_blocks:
         key = "|".join(sorted(b.order_ids))
@@ -1034,36 +1158,35 @@ def generate_candidate_blocks(
             seen_order_sets[key] = b
 
     final_blocks = list(seen_order_sets.values())
-
-    # Sort by quality score descending
     final_blocks.sort(key=lambda b: b.block_quality_score, reverse=True)
 
-    # ---- Build pool with enhanced diagnostics ----
     base_diagnostics = _build_diagnostics(final_blocks)
 
     pool = CandidateBlockPool(
         blocks=final_blocks,
         diagnostics={
             **base_diagnostics,
-            # Architecture markers: prove that feasible_block_builder is the low-level engine
             "block_generator_engine": "feasible_block_builder",
             "block_generator_orchestrator": "block_generator",
+            "macro_result_type": macro_result_type,
+            "macro_blocks_extracted_count": len(macro_blocks),
             "macro_blocks_generated_via_feasible_builder": len(candidate_blocks_from_feasible),
+            "seed_greedy_blocks_count": len(seed_blocks),
+            "underfilled_rescue_blocks_count": len(rescue_blocks),
+            "boundary_patch_blocks_count": len(boundary_blocks),
+            "dropped_recovery_blocks_count": len(dropped_blocks),
             "feasible_builder_generation_seconds": macro_gen_seconds,
-            "supplemental_blocks_count": len(rescue_blocks) + len(boundary_blocks) + len(dropped_blocks),
+            "supplemental_blocks_count": len(seed_blocks) + len(rescue_blocks) + len(boundary_blocks) + len(dropped_blocks),
         },
         generation_config={
             "block_generator_max_blocks_per_line": int(getattr(cfg.model, "block_generator_max_blocks_per_line", 30)),
             "block_generator_max_blocks_total": int(getattr(cfg.model, "block_generator_max_blocks_total", 80)),
-            # ---- Candidate pool gate (looser) ----
-            "block_generator_candidate_tons_min": float(getattr(cfg.model, "block_generator_candidate_tons_min", 300.0)),
+            "block_generator_candidate_tons_min": float(getattr(cfg.model, "block_generator_candidate_tons_min", 200.0)),
             "block_generator_candidate_tons_target": float(getattr(cfg.model, "block_generator_candidate_tons_target", 700.0)),
             "block_generator_candidate_tons_max": float(getattr(cfg.model, "block_generator_candidate_tons_max", 2000.0)),
-            # ---- Ideal target gate (tighter) ----
-            "block_generator_target_tons_min": float(getattr(cfg.model, "block_generator_target_tons_min", 150.0)),
-            "block_generator_target_tons_max": float(getattr(cfg.model, "block_generator_target_tons_max", 550.0)),
+            "block_generator_target_tons_min": float(getattr(cfg.model, "block_generator_target_tons_min", 200.0)),
+            "block_generator_target_tons_max": float(getattr(cfg.model, "block_generator_target_tons_max", 1200.0)),
             "random_seed": random_seed,
-            # Low-level engine reference
             "low_level_engine": "feasible_block_builder.generate_candidate_macro_blocks",
         },
         orders_input_count=len(orders_df),
@@ -1099,7 +1222,6 @@ def _build_diagnostics(blocks: List[CandidateBlock]) -> Dict[str, Any]:
         "generated_blocks_by_line": dict(by_line),
         "generated_blocks_by_mode": dict(by_mode),
         "generated_blocks_by_size_class": dict(by_size_class),
-        # ---- Candidate size class counts ----
         "generated_small_candidate_blocks": by_size_class.get("small_candidate", 0),
         "generated_target_candidate_blocks": by_size_class.get("target_candidate", 0),
         "generated_blocks_filtered_tons": 0,

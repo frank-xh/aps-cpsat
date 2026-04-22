@@ -160,6 +160,24 @@ class CandidateBlock:
     is_realized: bool = False
     scheduled_order_ids: List[str] = field(default_factory=list)
 
+    # Virtual slab contract. Formal virtual usage is disabled by default, but
+    # blocks and schedules now have stable fields for shadow analysis and later
+    # controlled enablement.
+    real_order_ids: List[str] = field(default_factory=list)
+    virtual_items: List[Dict[str, Any]] = field(default_factory=list)
+    virtual_usage_type: str = ""
+    virtual_tons: float = 0.0
+    virtual_count: int = 0
+    virtual_segment_count: int = 0
+
+    # Pre-assembly feasibility metadata used by block_master to avoid selecting
+    # tiny or poorly attachable fragments as primary campaign skeletons.
+    assembly_tons_class: str = ""
+    can_be_primary_campaign_block: bool = False
+    head_attachability_score: float = 0.0
+    tail_attachability_score: float = 0.0
+    estimated_campaign_fit_score: float = 0.0
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "block_id": self.block_id,
@@ -195,6 +213,17 @@ class CandidateBlock:
             "is_selected": self.is_selected,
             "is_realized": self.is_realized,
             "scheduled_order_ids": list(self.scheduled_order_ids),
+            "real_order_ids": list(self.real_order_ids or self.order_ids),
+            "virtual_items": list(self.virtual_items),
+            "virtual_usage_type": self.virtual_usage_type,
+            "virtual_tons": self.virtual_tons,
+            "virtual_count": self.virtual_count,
+            "virtual_segment_count": self.virtual_segment_count,
+            "assembly_tons_class": self.assembly_tons_class,
+            "can_be_primary_campaign_block": self.can_be_primary_campaign_block,
+            "head_attachability_score": self.head_attachability_score,
+            "tail_attachability_score": self.tail_attachability_score,
+            "estimated_campaign_fit_score": self.estimated_campaign_fit_score,
         }
 
 

@@ -14,6 +14,7 @@ import pandas as pd
 from aps_cp_sat.config import RuleConfig
 from aps_cp_sat.domain.models import ColdRollingResult
 from aps_cp_sat.rules import RULE_REGISTRY, RuleKey
+from aps_cp_sat.validate.final_schedule_audit import run_final_schedule_audit
 
 
 VALIDATION_RULE_KEYS = {
@@ -26,6 +27,125 @@ VALIDATION_RULE_KEYS = {
 
 # Compatibility-only fallback. Production path must pass cfg.rule explicitly.
 _COMPAT_RULE = RuleConfig()
+
+
+def _first_existing_col(df: pd.DataFrame, names: list[str]) -> str | None:
+    for name in names:
+        if name in df.columns:
+            return name
+    return None
+
+
+def _campaign_display_id(row) -> str:
+    """Display-safe campaign id.
+
+    block-first uses semantic campaign ids such as ``big_roll__slot_3``. The
+    validator must treat campaign_id as a label, not a numeric slot.
+    """
+    try:
+        if "campaign_id" in row.index:
+            value = row.get("campaign_id")
+            if not pd.isna(value) and str(value).strip():
+                return str(value)
+    except Exception:
+        pass
+    try:
+        if "assigned_slot" in row.index:
+            value = row.get("assigned_slot")
+            if not pd.isna(value) and str(value).strip():
+                return str(value)
+    except Exception:
+        pass
+    return "NA"
+
+
+def validate_width_audit_by_campaign(df: pd.DataFrame) -> Dict[str, object]:
+    """Independent display-level width audit.
+
+    This audit only checks adjacent coils inside the same campaign. It does not
+    use the template graph, so it can separate real in-campaign width issues
+    from cross-campaign visual misreads in exported sheets.
+    """
+    out: Dict[str, object] = {
+        "width_audit_pair_count": 0,
+        "width_audit_increase_violation_count": 0,
+        "width_audit_overdrop_violation_count": 0,
+        "width_audit_total_violation_count": 0,
+        "width_audit_examples": [],
+    }
+    if df.empty or "width" not in df.columns:
+        return out
+
+    line_col = _first_existing_col(df, ["line", "assigned_line"])
+    campaign_col = _first_existing_col(df, ["campaign_id", "master_slot", "assigned_slot", "slot_no"])
+    seq_col = _first_existing_col(df, ["campaign_seq", "sequence_in_slot"])
+    order_col = _first_existing_col(df, ["order_id", "source_order_id"])
+    if not line_col or not campaign_col:
+        return out
+
+    work = df.copy()
+    work["_audit_line"] = work[line_col].astype(str)
+    work["_audit_campaign"] = work[campaign_col].astype(str)
+    if seq_col:
+        work["_audit_seq"] = pd.to_numeric(work[seq_col], errors="coerce")
+    else:
+        work["_audit_seq"] = pd.NA
+    if work["_audit_seq"].isna().any():
+        fallback = work.groupby(["_audit_line", "_audit_campaign"], dropna=False).cumcount() + 1
+        work["_audit_seq"] = work["_audit_seq"].fillna(fallback)
+    work["_audit_seq"] = pd.to_numeric(work["_audit_seq"], errors="coerce").fillna(0).astype(int)
+    work["_audit_width"] = pd.to_numeric(work["width"], errors="coerce")
+    work["_audit_order_id"] = work[order_col].astype(str) if order_col else ""
+    work = work.dropna(subset=["_audit_width"]).sort_values(
+        ["_audit_line", "_audit_campaign", "_audit_seq"],
+        kind="mergesort",
+    )
+
+    examples: list[dict[str, object]] = []
+    pair_count = 0
+    increase_count = 0
+    overdrop_count = 0
+    for (line, campaign), grp in work.groupby(["_audit_line", "_audit_campaign"], dropna=False, sort=False):
+        prev = None
+        for _, row in grp.iterrows():
+            if prev is None:
+                prev = row
+                continue
+            pair_count += 1
+            width_a = float(prev["_audit_width"])
+            width_b = float(row["_audit_width"])
+            delta = width_b - width_a
+            audit_result = "OK"
+            if width_b > width_a:
+                increase_count += 1
+                audit_result = "WIDTH_INCREASE_VIOLATION"
+            elif width_a - width_b > 250.0:
+                overdrop_count += 1
+                audit_result = "WIDTH_OVERDROP_VIOLATION"
+            if audit_result != "OK" and len(examples) < 50:
+                examples.append(
+                    {
+                        "line": line,
+                        "campaign_id": campaign,
+                        "seq_a": int(prev["_audit_seq"]),
+                        "seq_b": int(row["_audit_seq"]),
+                        "order_id_a": str(prev["_audit_order_id"]),
+                        "order_id_b": str(row["_audit_order_id"]),
+                        "width_a": width_a,
+                        "width_b": width_b,
+                        "width_delta": delta,
+                        "same_campaign": True,
+                        "audit_result": audit_result,
+                    }
+                )
+            prev = row
+
+    out["width_audit_pair_count"] = int(pair_count)
+    out["width_audit_increase_violation_count"] = int(increase_count)
+    out["width_audit_overdrop_violation_count"] = int(overdrop_count)
+    out["width_audit_total_violation_count"] = int(increase_count + overdrop_count)
+    out["width_audit_examples"] = examples
+    return out
 
 
 def _audit_virtual_and_reverse(df: pd.DataFrame, rule: RuleConfig) -> Dict[str, object]:
@@ -99,7 +219,16 @@ def validate_solution_summary(result: ColdRollingResult, rule: RuleConfig | None
     rule = rule or _COMPAT_RULE
     df = result.schedule_df
     if df.empty:
-        return {"real_orders": 0, "virtual_orders": 0}
+        empty_width_audit = validate_width_audit_by_campaign(df)
+        final_audit = run_final_schedule_audit(df, rule, getattr(result, "engine_meta", None) or {})
+        final_audit_summary = final_audit.get("summary", {}) if isinstance(final_audit, dict) else {}
+        final_audit_details = final_audit.get("details", {}) if isinstance(final_audit, dict) else {}
+        out = {"real_orders": 0, "virtual_orders": 0, **empty_width_audit}
+        out["final_schedule_audit_summary"] = final_audit_summary
+        out["final_schedule_audit_details"] = final_audit_details
+        for key, value in final_audit_summary.items():
+            out[key if str(key).startswith("final_") else f"final_{key}"] = value
+        return out
 
     out: Dict[str, object] = {
         "real_orders": int((~df["is_virtual"]).sum()),
@@ -146,7 +275,7 @@ def validate_solution_summary(result: ColdRollingResult, rule: RuleConfig | None
             if not low_top.empty:
                 explain = []
                 for _, row in low_top.iterrows():
-                    explain.append(f"{row['line']}#{int(row['campaign_id'])}:缺口{float(row['gap']):.1f}t")
+                    explain.append(f"{row['line']}#{_campaign_display_id(row)}:缺口{float(row['gap']):.1f}t")
                 out["low_ton_top5"] = " | ".join(explain)
 
     # Count hard violations from validation checks
@@ -180,6 +309,15 @@ def validate_solution_summary(result: ColdRollingResult, rule: RuleConfig | None
     # Update with virtual and reverse audit data
     virtual_audit = _audit_virtual_and_reverse(df, rule)
     out.update(virtual_audit)
+    width_audit = validate_width_audit_by_campaign(df)
+    out.update(width_audit)
+    final_audit = run_final_schedule_audit(df, rule, getattr(result, "engine_meta", None) or {})
+    final_audit_summary = final_audit.get("summary", {}) if isinstance(final_audit, dict) else {}
+    final_audit_details = final_audit.get("details", {}) if isinstance(final_audit, dict) else {}
+    out["final_schedule_audit_summary"] = final_audit_summary
+    out["final_schedule_audit_details"] = final_audit_details
+    for key, value in final_audit_summary.items():
+        out[key if str(key).startswith("final_") else f"final_{key}"] = value
 
     # Model vs Validation ton comparison (Priority 1C)
     # Separate real tons and virtual tons per campaign for alignment check
@@ -470,9 +608,9 @@ def validate_model_equivalence(schedule_df: pd.DataFrame, templates_df: pd.DataF
     # hint一致性：campaign_id_hint / campaign_seq_hint / force_break_before 与导出序列一致。
     hint_mismatch = 0
     if {"campaign_id_hint", "campaign_id"}.issubset(df.columns):
-        x = pd.to_numeric(df["campaign_id_hint"], errors="coerce").fillna(0).astype(int)
-        y = pd.to_numeric(df["campaign_id"], errors="coerce").fillna(0).astype(int)
-        hint_mismatch += int(((x > 0) & (x != y)).sum())
+        x = df["campaign_id_hint"].astype(str).fillna("").str.strip()
+        y = df["campaign_id"].astype(str).fillna("").str.strip()
+        hint_mismatch += int(((x != "") & (x != "nan") & (x != y)).sum())
     if {"campaign_seq_hint", "campaign_seq"}.issubset(df.columns):
         x = pd.to_numeric(df["campaign_seq_hint"], errors="coerce").fillna(0).astype(int)
         y = pd.to_numeric(df["campaign_seq"], errors="coerce").fillna(0).astype(int)

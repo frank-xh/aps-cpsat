@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 """
 Export layer contract.
@@ -8,6 +8,7 @@ change plan semantics, add bridge rows, or repair infeasibility.
 """
 
 from pathlib import Path
+from datetime import datetime
 from time import perf_counter
 from typing import Dict, Iterable, Tuple
 
@@ -66,6 +67,14 @@ _VIOLATION_SRC_ZH = {
     "UNAVAILABLE_FOR_CANDIDATE": "候选不可得",
 }
 _CONFIDENCE_ZH = {"high": "高", "medium": "中", "low": "低"}
+
+
+def _append_timestamp_to_xlsx_path(output_path: str) -> Path:
+    """Return a timestamp-suffixed xlsx path like stem_YYYYMMDD_HHMMSS.xlsx."""
+    p = Path(output_path)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = p.suffix or ".xlsx"
+    return p.with_name(f"{p.stem}_{ts}{suffix}")
 
 
 def _zh_enum(value: object, mapping: Dict[str, str]) -> object:
@@ -563,11 +572,16 @@ def export_schedule_results(
     final_df["engine_used"] = str(engine_used)
     rounds_df["engine_used"] = str(engine_used)
 
+    # Always write to a timestamp-suffixed file to avoid overwriting previous runs.
+    out_path = _append_timestamp_to_xlsx_path(output_path)
+
     low_cnt, low_gap = _campaign_ton_penalty(final_df, rule)
     diagnostics_report = _build_diagnostics_report(failure_diagnostics)
     fallback_diag = failure_diagnostics.get("fallback", {}) if isinstance(failure_diagnostics, dict) else {}
     em = engine_meta if isinstance(engine_meta, dict) else {}
     main_path = str(fallback_diag.get("main_path", engine_used))
+    if isinstance(em, dict):
+        em["export_output_path"] = str(out_path)
     used_local_routing = bool(fallback_diag.get("used_local_routing", False))
     local_routing_role = str(fallback_diag.get("local_routing_role", "not_used"))
     bridge_modeling = str(fallback_diag.get("bridge_modeling", "template_based"))
@@ -1106,6 +1120,10 @@ def export_schedule_results(
     if isinstance(equivalence_summary, dict) and equivalence_summary:
         equivalence_report = pd.DataFrame([(str(k), v) for k, v in equivalence_summary.items()], columns=["检查项", "值"])
 
+    # export branch flags used by campaign-slot diagnostics and sheet rendering
+    is_constructive_lns = str(engine_used) == "constructive_lns" or str(main_path) == "constructive_lns"
+    is_block_first = "block_first" in str(engine_used) or "block_first" in str(main_path) or str(em.get("profile_name", "")) == "block_first_guarded_search"
+
     # ---- 统一初始化 campaign_slot 一致性诊断变量（提前初始化，确保 diagnostics_snapshot / engine_meta 注入可用） ----
     campaign_slot_consistency_ok = True
     campaign_slot_fixed_count = 0
@@ -1353,9 +1371,6 @@ def export_schedule_results(
         "width", "thickness", "temp_min", "temp_max", "temp_mean", "tons", "backlog", "due_date", "due_bucket",
     ]
     schedule = final_df[[c for c in show_cols if c in final_df.columns]].copy()
-
-    # 检测是否为 constructive_lns 路径
-    is_constructive_lns = str(engine_used) == "constructive_lns" or str(main_path) == "constructive_lns"
 
     # ---- 关键修复：campaign_slot_no 必须严格使用 master_slot，不允许 fallback 到 cumcount ----
     # 修复点：对每个 (line, campaign_id) 分组，取众数的 master_slot 作为该 campaign 的槽位号
@@ -1836,7 +1851,6 @@ def export_schedule_results(
     if candidate_small_roll_out.empty:
         candidate_small_roll_out = candidate_schedule_df[candidate_schedule_df.get("line", pd.Series(dtype=str)) == "small_roll"].copy() if not candidate_schedule_df.empty else pd.DataFrame()
 
-    out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         # Main schedule sheets: keep official naming, but translate candidate drafts when backfilled.

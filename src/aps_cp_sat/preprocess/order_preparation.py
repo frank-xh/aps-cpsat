@@ -98,12 +98,17 @@ def _proc_hours(tons: float, thickness: float, line: str) -> float:
 
 def prepare_orders(
     orders_path: Path,
-    steel_info_path: Path,
+    steel_info_path: Path | None,
     cfg: PlannerConfig,
     grade_catalog: MergedGradeRuleCatalog | None = None,
 ) -> pd.DataFrame:
     df = pd.read_excel(orders_path, sheet_name=0).copy()
-    grade_catalog = grade_catalog or MergedGradeRuleCatalog.build(steel_info_path)
+
+    if grade_catalog is None:
+        if steel_info_path is not None:
+            grade_catalog = MergedGradeRuleCatalog.build(steel_info_path)
+        else:
+            grade_catalog = MergedGradeRuleCatalog(dict(MergedGradeRuleCatalog.RULES))
 
     col_id = _col_exact_or_fallback(df, ["合同完全号", "物料号", "订单号"], ["合同", "物料", "订单号"], 1)
     col_due = _col_by_name_or_index(df, ["交货", "due"], 4)
@@ -145,9 +150,14 @@ def prepare_orders(
         grade = _txt(row["grade"]).upper()
         source_cap = _roll_capability(_txt(row["roll_type"]))
         rule = grade_catalog.get(grade)
+
         steel_group = _txt(rule.get("steel_group", "UNKNOWN")).upper()
+        if steel_group in {"", "UNKNOWN"}:
+            steel_group = _txt(row.get("steel_group_raw", ""), "UNKNOWN").upper()
+
         line_capability = _merge_roll_capability(source_cap, _txt(rule.get("roll_capability", "dual")))
         priority = int(rule.get("priority", 1))
+
         rows.append(
             {
                 "order_id": src_id,

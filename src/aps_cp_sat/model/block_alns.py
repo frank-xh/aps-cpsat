@@ -105,6 +105,43 @@ def evaluate_block_first_plan(
     diag["failed_boundaries"] = failed_boundaries
     score -= failed_boundaries * 1000.0
 
+    unresolved_internal = int(realization_result.block_realization_diag.get("unresolved_internal_pair_count", 0) or 0)
+    unresolved_boundary = int(realization_result.block_realization_diag.get("unresolved_boundary_pair_count", 0) or 0)
+    unresolved_total = unresolved_internal + unresolved_boundary
+    diag["unresolved_internal_pair_count"] = unresolved_internal
+    diag["unresolved_boundary_pair_count"] = unresolved_boundary
+    diag["unresolved_pair_count_total"] = unresolved_total
+    # Unresolved pairs are direct evidence of template equivalence misses. Penalize
+    # them harder than generic failed boundaries so ALNS does not accept regressions.
+    score -= unresolved_total * 5000.0
+
+    virtual_formal_enabled = bool(getattr(cfg.model, "virtual_formal_enabled", False))
+    diag["virtual_formal_enabled"] = virtual_formal_enabled
+    virtual_count = 0
+    virtual_tons = 0.0
+    virtual_bridge_segments = 0
+    if realization_result.realized_schedule_df is not None and not realization_result.realized_schedule_df.empty:
+        df = realization_result.realized_schedule_df
+        if "is_virtual" in df.columns:
+            mask = df["is_virtual"].fillna(False).astype(bool)
+            virtual_count = int(mask.sum())
+            virtual_tons = float(df.loc[mask, "tons"].sum()) if "tons" in df.columns else 0.0
+        if "virtual_segment_count" in df.columns:
+            virtual_bridge_segments = int(pd.to_numeric(df["virtual_segment_count"], errors="coerce").fillna(0).sum())
+    diag["virtual_count"] = virtual_count
+    diag["virtual_tons"] = virtual_tons
+    diag["virtual_bridge_segments"] = virtual_bridge_segments
+    diag["penalty_virtual_piece_count"] = float(getattr(cfg.model, "penalty_virtual_piece_count", 0.0) or 0.0)
+    diag["penalty_virtual_tons"] = float(getattr(cfg.model, "penalty_virtual_tons", 0.0) or 0.0)
+    diag["penalty_virtual_bridge_segments"] = float(getattr(cfg.model, "penalty_virtual_bridge_segments", 0.0) or 0.0)
+    diag["penalty_consecutive_virtual_chain"] = float(getattr(cfg.model, "penalty_consecutive_virtual_chain", 0.0) or 0.0)
+    diag["reward_drop_reduction_if_virtual"] = float(getattr(cfg.model, "reward_drop_reduction_if_virtual", 0.0) or 0.0)
+    diag["reward_hard_violation_elimination_if_virtual"] = float(getattr(cfg.model, "reward_hard_violation_elimination_if_virtual", 0.0) or 0.0)
+    if virtual_formal_enabled:
+        score -= virtual_count * diag["penalty_virtual_piece_count"]
+        score -= virtual_tons * diag["penalty_virtual_tons"]
+        score -= virtual_bridge_segments * diag["penalty_virtual_bridge_segments"]
+
     # Minor static items to guide search when major factors tie
     avg_quality = master_result.diagnostics.get("avg_block_quality_in_selected", 0.0)
     diag["avg_quality"] = avg_quality
@@ -615,11 +652,17 @@ def run_block_alns(
             trial_score, trial_diag = evaluate_block_first_plan(trial_master_result, trial_realization_result, cfg)
 
             delta = trial_score - current_score
+            current_unresolved = int(current_diag.get("unresolved_pair_count_total", 0) or 0)
+            trial_unresolved = int(trial_diag.get("unresolved_pair_count_total", 0) or 0)
+            if trial_unresolved > current_unresolved:
+                nbd_diag["rejected_due_to_unresolved_regression"] = int(nbd_diag.get("rejected_due_to_unresolved_regression", 0) or 0) + 1
+                continue
 
             if delta > accept_threshold:
                 current_master_result = trial_master_result
                 current_realization_result = trial_realization_result
                 current_score = trial_score
+                current_diag = trial_diag
                 accepted += 1
                 if trial_score > best_score:
                     best_master_result = trial_master_result

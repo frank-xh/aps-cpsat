@@ -37,7 +37,7 @@ class BlockMasterResult:
     dropped_order_ids: List[str] = field(default_factory=list)
     selected_order_ids: List[str] = field(default_factory=list)
     block_order_by_line: Dict[str, List[str]] = field(default_factory=dict)
-    
+
     # Newly added fields for slot assembly
     campaign_slots: List[BlockCampaignSlot] = field(default_factory=list)
     block_to_slot: Dict[str, str] = field(default_factory=dict)
@@ -97,12 +97,68 @@ def _block_conflict_count(a: CandidateBlock, b: CandidateBlock) -> int:
     return len(set(a.order_ids) & set(b.order_ids))
 
 
+
+def _dedupe_preserve(seq: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for item in seq:
+        s = str(item)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _canonicalize_block(block: CandidateBlock, order_map: Dict[str, Dict[str, Any]], candidate_min_tons: float) -> bool:
+    """Normalize block content before master selection.
+
+    Removes duplicate order IDs inside a block, recomputes core tonnage/signatures from
+    source orders, and drops blocks that become empty or too tiny after de-duplication.
+    """
+    uniq_ids = _dedupe_preserve(block.order_ids)
+    if not uniq_ids:
+        return False
+
+    valid_ids = [oid for oid in uniq_ids if oid in order_map]
+    if not valid_ids:
+        return False
+
+    block.order_ids = valid_ids
+    block.real_order_ids = list(valid_ids)
+    block.order_count = len(valid_ids)
+    block.total_tons = float(sum(float(order_map[oid].get("tons", 0.0) or 0.0) for oid in valid_ids))
+    block.head_order_id = valid_ids[0]
+    block.tail_order_id = valid_ids[-1]
+    block.head_signature = dict(order_map.get(block.head_order_id, {}))
+    block.tail_signature = dict(order_map.get(block.tail_order_id, {}))
+
+    if block.internal_edges:
+        seen_pairs = set()
+        normalized_edges = []
+        valid_set = set(valid_ids)
+        for e in block.internal_edges:
+            frm = str(e.get("from_order_id", ""))
+            to = str(e.get("to_order_id", ""))
+            if frm in valid_set and to in valid_set and frm != to and (frm, to) not in seen_pairs:
+                normalized_edges.append(e)
+                seen_pairs.add((frm, to))
+        block.internal_edges = normalized_edges
+
+    if block.total_tons <= 0.0:
+        return False
+    # Filter out extremely tiny fragments after de-duplication; keep 80% of candidate min as
+    # a soft floor so recovery blocks can still survive, but pathological duplicates are removed.
+    if block.total_tons < max(1.0, 0.8 * float(candidate_min_tons)):
+        return False
+    return True
+
 def solve_block_master(
-    pool: CandidateBlockPool,
-    orders_df: pd.DataFrame,
-    cfg: PlannerConfig,
-    random_seed: int = 42,
-    preferred_block_order_by_line: Optional[Dict[str, List[str]]] = None,
+        pool: CandidateBlockPool,
+        orders_df: pd.DataFrame,
+        cfg: PlannerConfig,
+        random_seed: int = 42,
+        preferred_block_order_by_line: Optional[Dict[str, List[str]]] = None,
 ) -> BlockMasterResult:
     """
     Lightweight greedy block master.
@@ -112,7 +168,13 @@ def solve_block_master(
     2. Assemble into slots
     """
     rng = random.Random(random_seed)
-    blocks = list(pool.blocks)
+    candidate_min_tons = float(getattr(cfg.model, "block_generator_candidate_tons_min", 200.0) or 200.0)
+    order_map = {str(row.get("order_id", "")): dict(row) for _, row in orders_df.iterrows()}
+
+    blocks = []
+    for blk in list(pool.blocks):
+        if _canonicalize_block(blk, order_map, candidate_min_tons):
+            blocks.append(blk)
     max_skip = int(getattr(cfg.model, "block_master_max_conflict_skip", 5))
     prefer_quality = bool(getattr(cfg.model, "block_master_prefer_quality_score", True))
 
@@ -138,17 +200,15 @@ def solve_block_master(
     order_to_block: Dict[str, str] = {}
 
     for b in blocks_sorted:
-        conflicts = 0
-        for oid in b.order_ids:
-            if oid in order_to_block:
-                conflicts += 1
+        block_unique_ids = _dedupe_preserve(b.order_ids)
+        conflicts = sum(1 for oid in block_unique_ids if oid in order_to_block)
 
-        conflict_ratio = conflicts / max(1, b.order_count)
+        conflict_ratio = conflicts / max(1, len(block_unique_ids))
         if conflicts > max_skip or conflict_ratio > 0.5:
             rejected.append(b)
             continue
 
-        for oid in b.order_ids:
+        for oid in block_unique_ids:
             order_to_block[oid] = b.block_id
         selected.append(b)
 
@@ -157,7 +217,7 @@ def solve_block_master(
     # ---- Order blocks on each line ----
     block_order_by_line: Dict[str, List[str]] = {}
     ordered_blocks_global: List[CandidateBlock] = []
-    
+
     # If preferred order is provided, use it (for ALNS swap)
     if preferred_block_order_by_line:
         block_by_id = {b.block_id: b for b in selected}
@@ -214,26 +274,25 @@ def solve_block_master(
     for b in pool.blocks:
         b.is_selected = (b.block_id in selected_ids)
 
-
     # Phase 2: Assembly into Slots
     campaign_slots: List[BlockCampaignSlot] = []
     block_to_slot: Dict[str, str] = {}
     unassembled_block_ids: List[str] = []
-    
+
     min_tons = float(getattr(cfg.rule, "campaign_ton_min", 700.0))
     max_tons = float(getattr(cfg.rule, "campaign_ton_max", 2000.0))
-    
+
     block_obj_by_id = {b.block_id: b for b in selected}
-    
+
     for line in sorted(block_order_by_line.keys()):
         b_ids = block_order_by_line[line]
         if not b_ids:
             continue
-            
+
         slot_no = 1
         current_slot_blocks = []
         current_tons = 0.0
-        
+
         for bid in b_ids:
             b = block_obj_by_id[bid]
             # Try to add to current slot
@@ -261,7 +320,7 @@ def solve_block_master(
                     for blk in current_slot_blocks:
                         block_to_slot[blk.block_id] = campaign_id
                     slot_no += 1
-                
+
                 # Start new slot with current block if it fits by itself
                 if b.total_tons <= max_tons:
                     current_slot_blocks = [b]
@@ -271,7 +330,7 @@ def solve_block_master(
                     unassembled_block_ids.append(b.block_id)
                     current_slot_blocks = []
                     current_tons = 0.0
-                    
+
         # Close the last slot for the line
         if current_slot_blocks:
             campaign_id = f"{line}__slot_{slot_no}"
@@ -296,7 +355,7 @@ def solve_block_master(
     for s in campaign_slots:
         for bid in s.block_ids:
             assembled_order_ids.update(block_obj_by_id[bid].order_ids)
-            
+
     all_order_ids = set(str(oid) for oid in orders_df["order_id"])
     dropped_order_ids = [str(oid) for oid in all_order_ids if oid not in assembled_order_ids]
 
@@ -320,10 +379,10 @@ def solve_block_master(
         "dropped_order_count": len(dropped_order_ids),
         "block_master_dropped_count": len(dropped_order_ids),
         "avg_block_quality_in_selected": (
-            sum(b.block_quality_score for b in selected) / max(1, len(selected))
+                sum(b.block_quality_score for b in selected) / max(1, len(selected))
         ),
         "avg_block_tons_in_selected": (
-            sum(b.total_tons for b in selected) / max(1, len(selected))
+                sum(b.total_tons for b in selected) / max(1, len(selected))
         ),
         "selected_small_candidate_blocks": sum(1 for b in selected if b.candidate_size_class == "small_candidate"),
         "selected_target_candidate_blocks": sum(1 for b in selected if b.candidate_size_class == "target_candidate"),

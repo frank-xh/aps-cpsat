@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
-from typing import Any
 
 from aps_cp_sat.config import PlannerConfig
 
@@ -12,7 +12,7 @@ from aps_cp_sat.config import PlannerConfig
 @dataclass(frozen=True)
 class ColdRollingRequest:
     orders_path: Path
-    steel_info_path: Path
+    steel_info_path: Path | None
     output_path: Path
     config: PlannerConfig
 
