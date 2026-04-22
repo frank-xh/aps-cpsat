@@ -8,6 +8,7 @@ schedules, inject bridge rows, or repair feasibility.
 """
 
 from typing import Dict
+import math
 
 import pandas as pd
 
@@ -57,6 +58,598 @@ def _campaign_display_id(row) -> str:
     except Exception:
         pass
     return "NA"
+
+
+def recompute_final_schedule_summary(schedule_df: pd.DataFrame, rule: RuleConfig) -> Dict[str, object]:
+    """Recompute final schedule KPIs from the final schedule dataframe only."""
+    out: Dict[str, object] = {
+        "campaign_cnt": 0,
+        "assembled_slot_count": 0,
+        "underfilled_slot_count": 0,
+        "campaign_ton_min_violation_count": 0,
+        "campaign_ton_max_violation_count": 0,
+        "final_realized_order_count": 0,
+        "final_realized_tons": 0.0,
+        "final_realized_total_rows": 0,
+        "final_total_tons_including_virtual": 0.0,
+        "campaign_total_tons_min": 0.0,
+        "campaign_total_tons_max": 0.0,
+        "campaign_total_tons_avg": 0.0,
+    }
+    if schedule_df is None or schedule_df.empty:
+        return out
+
+    df = schedule_df.copy()
+    if "is_virtual" not in df.columns:
+        df["is_virtual"] = False
+    if "line" not in df.columns:
+        df["line"] = ""
+    if "campaign_id" not in df.columns:
+        if "master_slot" in df.columns:
+            df["campaign_id"] = df["line"].astype(str) + "__slot_" + pd.to_numeric(
+                df["master_slot"], errors="coerce"
+            ).fillna(0).astype(int).astype(str)
+        elif "slot_no" in df.columns:
+            df["campaign_id"] = df["line"].astype(str) + "__slot_" + pd.to_numeric(
+                df["slot_no"], errors="coerce"
+            ).fillna(0).astype(int).astype(str)
+        else:
+            df["campaign_id"] = "campaign_1"
+
+    real = df[~df["is_virtual"].fillna(False).astype(bool)].copy()
+    out["final_realized_order_count"] = int(len(real))
+    out["final_realized_tons"] = float(real["tons"].sum()) if "tons" in real.columns else 0.0
+    out["final_realized_total_rows"] = int(len(df))
+    out["final_total_tons_including_virtual"] = float(df["tons"].sum()) if "tons" in df.columns else 0.0
+
+    if "tons" not in df.columns:
+        return out
+
+    csum = df.groupby(["line", "campaign_id"], as_index=False)["tons"].sum()
+    min_ton = float(rule.campaign_ton_min)
+    max_ton = float(rule.campaign_ton_max)
+    low_mask = csum["tons"] < min_ton
+    high_mask = csum["tons"] > max_ton
+    out["campaign_cnt"] = int(len(csum))
+    out["assembled_slot_count"] = int(len(csum))
+    out["underfilled_slot_count"] = int(low_mask.sum())
+    out["campaign_ton_min_violation_count"] = int(low_mask.sum())
+    out["campaign_ton_max_violation_count"] = int(high_mask.sum())
+    out["campaign_total_tons_min"] = float(csum["tons"].min()) if not csum.empty else 0.0
+    out["campaign_total_tons_max"] = float(csum["tons"].max()) if not csum.empty else 0.0
+    out["campaign_total_tons_avg"] = float(csum["tons"].mean()) if not csum.empty else 0.0
+    return out
+
+
+def _build_shadow_virtual_fill_analysis(
+    schedule_df: pd.DataFrame,
+    rule: RuleConfig,
+    model_cfg,
+) -> tuple[list[dict], Dict[str, object]]:
+    def campaign_viability_band(current_tons: float) -> str:
+        min_ton = float(rule.campaign_ton_min)
+        gap = max(0.0, min_ton - float(current_tons))
+        near_gap = float(getattr(model_cfg, "near_viable_gap_tons", 80.0) or 80.0)
+        merge_gap = float(getattr(model_cfg, "merge_candidate_gap_tons", 250.0) or 250.0)
+        if gap <= 0.0:
+            return "ALREADY_VIABLE"
+        if gap <= near_gap:
+            return "NEAR_VIABLE"
+        if gap <= merge_gap:
+            return "MERGE_CANDIDATE"
+        return "HOPELESS_UNDERFILLED"
+
+    def estimate_shadow_virtual_fill_count(needed_tons: float, cfg_obj, rule_obj: RuleConfig) -> tuple[int, float, str]:
+        unit_tons = float(getattr(cfg_obj, "virtual_fill_unit_tons_assumption", 0.0) or 0.0)
+        if unit_tons <= 0.0:
+            unit_tons = float(getattr(rule_obj, "virtual_tons", 20.0) or 20.0)
+        if unit_tons <= 0.0:
+            return 0, 0.0, "INVALID_UNIT"
+        needed = max(0.0, float(needed_tons))
+        cnt = int(math.ceil(needed / unit_tons)) if needed > 0 else 0
+        return int(cnt), float(unit_tons), "FIXED_UNIT_TONS"
+
+    rows: list[dict] = []
+    metrics: Dict[str, object] = {
+        "shadow_virtual_fill_candidate_count": 0,
+        "shadow_virtual_fill_viable_count": 0,
+        "shadow_virtual_fill_needed_tons_total": 0.0,
+        "shadow_virtual_possible_reduced_underfilled_campaigns": 0,
+        "shadow_virtual_budget_needed_estimate": 0.0,
+        "shadow_virtual_possible_reduced_hard_violations": 0,
+        "shadow_virtual_fill_unit_tons_assumption": "",
+        "near_viable_promote_success_count": 0,
+        "hopeless_segments_dropped_for_near_viable_count": 0,
+        "second_receiver_candidate_count": 0,
+        "second_receiver_selected_campaign": "",
+        "second_receiver_gap_before": 0.0,
+        "second_receiver_gap_after": 0.0,
+        "second_receiver_viability_band_before": "",
+        "second_receiver_viability_band_after": "",
+        "second_receiver_promote_success_count": 0,
+        "donor_reallocation_attempt_count": 0,
+        "donor_reallocation_success_count": 0,
+        "donor_reallocation_rejected_due_to_pair_invalid": 0,
+        "donor_reallocation_rejected_due_to_duplicate": 0,
+        "donor_reallocation_rejected_due_to_no_ton_gain": 0,
+        "second_receiver_search_space_size": 0,
+        "donor_candidates_considered_count": 0,
+        "donor_candidates_rejected_due_to_line_mismatch": 0,
+        "donor_candidates_rejected_due_to_pair_invalid": 0,
+        "donor_candidates_rejected_due_to_duplicate": 0,
+        "donor_candidates_rejected_due_to_no_ton_gain": 0,
+        "donor_candidates_rejected_due_to_healthy_campaign_protection": 0,
+        "frozen_healthy_campaign_count": 0,
+        "second_receiver_ready_for_formal_fill": False,
+        "second_receiver_gap_after_reallocation": 0.0,
+        "second_receiver_failure_reason": "",
+        "second_receiver_analysis_rows": [],
+        "second_receiver_donor_candidate_rows": [],
+    }
+    if schedule_df is None or schedule_df.empty:
+        return rows, metrics
+    enabled = bool(getattr(model_cfg, "virtual_enabled", True)) and bool(getattr(model_cfg, "virtual_shadow_mode_enabled", True))
+    fill_enabled = bool(getattr(model_cfg, "virtual_shadow_fill_enabled", True))
+    formal_enabled = bool(getattr(model_cfg, "virtual_formal_enabled", False))
+    if not enabled or not fill_enabled or formal_enabled:
+        return rows, metrics
+
+    df = schedule_df.copy()
+    if "is_virtual" not in df.columns:
+        df["is_virtual"] = False
+    if "steel_group" not in df.columns:
+        df["steel_group"] = ""
+    if not {"line", "campaign_id", "tons"}.issubset(df.columns):
+        return rows, metrics
+    real = df[~df["is_virtual"].fillna(False).astype(bool)].copy()
+    if real.empty:
+        return rows, metrics
+
+    min_ton = float(rule.campaign_ton_min)
+    total_budget = float(getattr(model_cfg, "virtual_budget_total_tons", 0.0) or 0.0)
+    per_campaign_budget = float(getattr(model_cfg, "virtual_budget_per_campaign_tons", 0.0) or 0.0)
+    max_count = int(getattr(model_cfg, "virtual_max_count_per_campaign", 0) or 0)
+    max_gap_for_trial = float(getattr(model_cfg, "virtual_formal_fill_max_gap_tons", per_campaign_budget or 0.0) or 0.0)
+    allowed_lines = [str(x) for x in (getattr(model_cfg, "virtual_allowed_lines", []) or [])]
+    allowed_groups = [str(x) for x in (getattr(model_cfg, "virtual_allowed_steel_groups", []) or [])]
+    remaining_budget = max(0.0, total_budget)
+
+    csum = real.groupby(["line", "campaign_id"], as_index=False).agg(
+        tons=("tons", "sum"),
+        steel_group=("steel_group", "last"),
+    )
+    csum = csum.sort_values(["line", "campaign_id"], kind="mergesort")
+    for _, row in csum.iterrows():
+        current_tons = float(row["tons"] or 0.0)
+        if current_tons >= min_ton:
+            continue
+        needed_tons = max(0.0, min_ton - current_tons)
+        needed_count, unit_tons, assumption = estimate_shadow_virtual_fill_count(needed_tons, model_cfg, rule)
+        metrics["shadow_virtual_fill_unit_tons_assumption"] = str(assumption)
+        viability_band = campaign_viability_band(current_tons)
+
+        line = str(row["line"])
+        steel_group = str(row.get("steel_group", "") or "")
+        reason_code = "VIABLE"
+        reason_detail = "within constraints"
+        budget_ok = bool(needed_tons <= per_campaign_budget and needed_tons <= remaining_budget)
+        viable = True
+        if not list(getattr(rule, "virtual_width_levels", ()) or ()) or not list(getattr(rule, "virtual_thickness_levels", ()) or ()):
+            viable = False
+            reason_code = "NO_COMPATIBLE_VIRTUAL_SPEC"
+            reason_detail = "virtual width/thickness levels not configured"
+        elif allowed_lines and line not in allowed_lines:
+            viable = False
+            reason_code = "LINE_NOT_ALLOWED"
+            reason_detail = f"line={line} not in virtual_allowed_lines"
+        elif allowed_groups and steel_group and steel_group not in allowed_groups:
+            viable = False
+            reason_code = "STEEL_GROUP_NOT_ALLOWED"
+            reason_detail = f"steel_group={steel_group} not in virtual_allowed_steel_groups"
+        elif max_gap_for_trial > 0 and needed_tons > max_gap_for_trial:
+            viable = False
+            reason_code = "GAP_TOO_LARGE"
+            reason_detail = f"needed_tons={needed_tons:.1f} > formal_gap_limit={max_gap_for_trial:.1f}"
+        elif needed_count > max_count:
+            viable = False
+            reason_code = "COUNT_LIMIT_EXCEEDED"
+            reason_detail = f"needed_count={needed_count} > max_count={max_count}"
+        elif not budget_ok:
+            viable = False
+            reason_code = "BUDGET_EXCEEDED"
+            reason_detail = (
+                f"needed_tons={needed_tons:.1f} exceeds per_campaign_budget={per_campaign_budget:.1f}"
+                if needed_tons > per_campaign_budget
+                else f"needed_tons={needed_tons:.1f} exceeds remaining_budget={remaining_budget:.1f}"
+            )
+        elif unit_tons <= 0.0:
+            viable = False
+            reason_code = "RULE_NOT_CONFIGURED"
+            reason_detail = "virtual fill unit tons assumption is invalid"
+        if viability_band == "NEAR_VIABLE" and viable:
+            priority_band = "HIGH_PRIORITY_FILL"
+        elif viable:
+            priority_band = "LOW_PRIORITY_FILL"
+        else:
+            priority_band = "NOT_RECOMMENDED"
+
+        rows.append(
+            {
+                "line": line,
+                "campaign_id": str(row["campaign_id"]),
+                "current_tons": float(round(current_tons, 3)),
+                "min_required_tons": float(min_ton),
+                "gap_tons": float(round(needed_tons, 3)),
+                "viability_band": str(viability_band),
+                "shadow_fill_needed_tons": float(round(needed_tons, 3)),
+                "shadow_fill_needed_count": int(needed_count),
+                "shadow_fill_viable": bool(viable),
+                "shadow_fill_budget_ok": bool(budget_ok),
+                "shadow_fill_reason_code": str(reason_code),
+                "shadow_fill_reason_detail": str(reason_detail),
+                "shadow_fill_priority_band": str(priority_band),
+                "shadow_virtual_fill_unit_tons_assumption": str(assumption),
+                "expected_gain_type": "REDUCE_UNDERFILLED_CAMPAIGN",
+                "expected_gain_value": int(1 if viable else 0),
+            }
+        )
+        metrics["shadow_virtual_fill_needed_tons_total"] = float(metrics["shadow_virtual_fill_needed_tons_total"]) + needed_tons
+        if viable:
+            metrics["shadow_virtual_fill_viable_count"] = int(metrics["shadow_virtual_fill_viable_count"]) + 1
+            remaining_budget -= needed_tons
+
+    metrics["shadow_virtual_fill_candidate_count"] = int(len(rows))
+    metrics["shadow_virtual_possible_reduced_underfilled_campaigns"] = int(metrics["shadow_virtual_fill_viable_count"])
+    metrics["shadow_virtual_possible_reduced_hard_violations"] = int(metrics["shadow_virtual_fill_viable_count"])
+    metrics["shadow_virtual_budget_needed_estimate"] = float(round(total_budget - remaining_budget, 3))
+    if "promoted_by_local_reassemble" in df.columns:
+        promoted = df[df["promoted_by_local_reassemble"].fillna(False).astype(bool)].copy()
+        if not promoted.empty and {"line", "campaign_id"}.issubset(promoted.columns):
+            metrics["near_viable_promote_success_count"] = int(len(promoted.groupby(["line", "campaign_id"], dropna=False)))
+    if "hopeless_dropped_for_near_viable" in df.columns:
+        metrics["hopeless_segments_dropped_for_near_viable_count"] = int(df["hopeless_dropped_for_near_viable"].fillna(False).astype(bool).sum())
+    metrics["second_receiver_candidate_count"] = int((csum["tons"] < min_ton).sum()) if not csum.empty else 0
+    metrics["frozen_healthy_campaign_count"] = int((csum["tons"] >= min_ton).sum()) if not csum.empty else 0
+    if "donor_reallocated_to_second_receiver" in df.columns:
+        donor_reallocated = df[df["donor_reallocated_to_second_receiver"].fillna(False).astype(bool)].copy()
+        if not donor_reallocated.empty and {"line", "campaign_id"}.issubset(donor_reallocated.columns):
+            metrics["donor_reallocation_success_count"] = int(len(donor_reallocated.groupby(["line", "campaign_id"], dropna=False)))
+    if "second_receiver_donor_campaign_id" in df.columns:
+        donor_marks = df[df["second_receiver_donor_campaign_id"].fillna("").astype(str) != ""].copy()
+        donor_rows: list[dict] = []
+        if not donor_marks.empty and {"line", "campaign_id"}.issubset(donor_marks.columns):
+            for (line, campaign_id), cdf in donor_marks.groupby(["line", "campaign_id"], dropna=False):
+                first = cdf.iloc[0]
+                reason = str(first.get("second_receiver_donor_rejection_reason", "") or "")
+                pair_ok = bool(first.get("second_receiver_donor_pair_feasible", False))
+                dup_ok = bool(first.get("second_receiver_donor_duplicate_safe", False))
+                donor_tons = float(pd.to_numeric(cdf.get("second_receiver_donor_tons", pd.Series([0.0])), errors="coerce").fillna(0.0).max())
+                gap_after_est = float(pd.to_numeric(cdf.get("second_receiver_donor_gap_after_estimate", pd.Series([0.0])), errors="coerce").fillna(0.0).max())
+                selected_for_reallocation = bool(cdf.get("second_receiver_donor_selected", pd.Series([False] * len(cdf))).fillna(False).astype(bool).any())
+                donor_rows.append(
+                    {
+                        "line": str(line),
+                        "second_receiver_campaign_id": "",
+                        "donor_campaign_id": str(campaign_id),
+                        "donor_viability_band": str(first.get("second_receiver_donor_viability_band", "")),
+                        "donor_tons": float(round(donor_tons, 3)),
+                        "receiver_gap_before": 0.0,
+                        "receiver_gap_after_estimate": float(round(gap_after_est, 3)),
+                        "pair_feasible": bool(pair_ok),
+                        "duplicate_safe": bool(dup_ok),
+                        "rejection_reason": reason,
+                        "selected_for_reallocation": bool(selected_for_reallocation),
+                    }
+                )
+        metrics["second_receiver_donor_candidate_rows"] = donor_rows
+        metrics["donor_candidates_considered_count"] = int(len(donor_rows))
+        metrics["donor_reallocation_attempt_count"] = int(len(donor_rows))
+        metrics["second_receiver_search_space_size"] = int(len(donor_rows))
+        metrics["donor_candidates_rejected_due_to_pair_invalid"] = int(sum(1 for r in donor_rows if r.get("rejection_reason") == "PAIR_INVALID"))
+        metrics["donor_candidates_rejected_due_to_duplicate"] = int(sum(1 for r in donor_rows if r.get("rejection_reason") == "DUPLICATE_ORDER"))
+        metrics["donor_candidates_rejected_due_to_no_ton_gain"] = int(
+            sum(1 for r in donor_rows if r.get("rejection_reason") in {"NO_TON_GAIN", "NO_BAND_OR_GAP_PROGRESS"})
+        )
+        metrics["donor_candidates_rejected_due_to_healthy_campaign_protection"] = int(
+            sum(1 for r in donor_rows if r.get("rejection_reason") == "HEALTHY_CAMPAIGN_PROTECTED")
+        )
+        metrics["donor_reallocation_rejected_due_to_pair_invalid"] = int(metrics["donor_candidates_rejected_due_to_pair_invalid"])
+        metrics["donor_reallocation_rejected_due_to_duplicate"] = int(metrics["donor_candidates_rejected_due_to_duplicate"])
+        metrics["donor_reallocation_rejected_due_to_no_ton_gain"] = int(metrics["donor_candidates_rejected_due_to_no_ton_gain"])
+    if "second_receiver_selected" in df.columns:
+        selected = df[df["second_receiver_selected"].fillna(False).astype(bool)].copy()
+        if not selected.empty and {"line", "campaign_id"}.issubset(selected.columns):
+            first = selected.iloc[0]
+            line = str(first.get("line", ""))
+            campaign_id = str(first.get("campaign_id", ""))
+            current = csum[(csum["line"].astype(str) == line) & (csum["campaign_id"].astype(str) == campaign_id)]
+            tons_after = float(current.iloc[0]["tons"] or 0.0) if not current.empty else float(selected["tons"].sum())
+            gap_after = max(0.0, min_ton - tons_after)
+            band_after = campaign_viability_band(tons_after)
+            def _first_existing(col: str, default):
+                if col not in selected.columns:
+                    return default
+                vals = selected[col].dropna()
+                if vals.empty:
+                    return default
+                val = vals.iloc[0]
+                if isinstance(default, (float, int)):
+                    try:
+                        return float(val)
+                    except Exception:
+                        return default
+                if isinstance(default, bool):
+                    try:
+                        return bool(val)
+                    except Exception:
+                        return default
+                text = str(val)
+                return text if text else default
+
+            gap_before = float(_first_existing("second_receiver_gap_before", gap_after))
+            band_before = str(_first_existing("second_receiver_viability_band_before", band_after))
+            stored_gap_after = float(_first_existing("second_receiver_gap_after", gap_after))
+            stored_band_after = str(_first_existing("second_receiver_viability_band_after", band_after))
+            ready = bool(_first_existing("second_receiver_ready_for_formal_fill", stored_band_after == "NEAR_VIABLE"))
+            failure_reason = str(_first_existing("second_receiver_failure_reason", ""))
+            if stored_gap_after == 0.0 and gap_after > 0.0:
+                stored_gap_after = gap_after
+            if not stored_band_after:
+                stored_band_after = band_after
+            metrics["second_receiver_selected_campaign"] = f"{line}#{campaign_id}"
+            metrics["second_receiver_gap_before"] = float(round(gap_before, 3))
+            metrics["second_receiver_gap_after"] = float(round(stored_gap_after, 3))
+            metrics["second_receiver_gap_after_reallocation"] = float(round(stored_gap_after, 3))
+            metrics["second_receiver_viability_band_before"] = band_before
+            metrics["second_receiver_viability_band_after"] = stored_band_after
+            metrics["second_receiver_ready_for_formal_fill"] = bool(ready)
+            metrics["second_receiver_failure_reason"] = failure_reason
+            if stored_band_after != band_before or stored_gap_after + 1e-9 < gap_before:
+                metrics["second_receiver_promote_success_count"] = 1
+            shadow_by_key = {(str(r.get("line", "")), str(r.get("campaign_id", ""))): r for r in rows}
+            shadow = shadow_by_key.get((line, campaign_id), {})
+            for drow in metrics.get("second_receiver_donor_candidate_rows", []):
+                drow["second_receiver_campaign_id"] = campaign_id
+                drow["receiver_gap_before"] = float(round(gap_before, 3))
+            metrics["second_receiver_analysis_rows"] = [
+                {
+                    "line": line,
+                    "campaign_id": campaign_id,
+                    "role": "second_receiver",
+                    "tons_before": float(round(max(0.0, min_ton - gap_before), 3)),
+                    "tons_after": float(round(tons_after, 3)),
+                    "gap_before": float(round(gap_before, 3)),
+                    "gap_after": float(round(stored_gap_after, 3)),
+                    "viability_band_before": band_before,
+                    "viability_band_after": stored_band_after,
+                    "donor_reallocated": bool(metrics["donor_reallocation_success_count"]),
+                    "shadow_fill_reason_code_after": str(shadow.get("shadow_fill_reason_code", failure_reason)),
+                    "shadow_fill_priority_band_after": str(shadow.get("shadow_fill_priority_band", "HIGH_PRIORITY_FILL" if ready else "NOT_RECOMMENDED")),
+                    "local_reallocation_reason": str(failure_reason),
+                    "ready_for_formal_fill_next_step": bool(ready),
+                }
+            ]
+    return rows, metrics
+
+
+def _build_formal_virtual_fill_trial_summary(schedule_df: pd.DataFrame) -> tuple[list[dict], Dict[str, object]]:
+    rows: list[dict] = []
+    metrics: Dict[str, object] = {
+        "formal_virtual_fill_trial_count": 0,
+        "formal_virtual_fill_success_count": 0,
+        "formal_virtual_fill_rollback_count": 0,
+        "formal_virtual_fill_success_campaigns": [],
+        "formal_virtual_fill_rollback_reasons": [],
+    }
+    if schedule_df is None or schedule_df.empty:
+        return rows, metrics
+    if not {"line", "campaign_id", "tons", "is_virtual"}.issubset(schedule_df.columns):
+        return rows, metrics
+    work = schedule_df.copy()
+    if "virtual_usage_type" not in work.columns:
+        work["virtual_usage_type"] = ""
+    virt = work[
+        work.get("is_virtual", pd.Series([False] * len(work), index=work.index)).fillna(False).astype(bool)
+        & (work["virtual_usage_type"].astype(str) == "fill")
+    ].copy()
+    if virt.empty:
+        return rows, metrics
+
+    real = work[~work.get("is_virtual", pd.Series([False] * len(work), index=work.index)).fillna(False).astype(bool)].copy()
+    real_tons = real.groupby(["line", "campaign_id"], as_index=False)["tons"].sum().rename(columns={"tons": "current_tons_before"})
+    fill_tons = virt.groupby(["line", "campaign_id"], as_index=False).agg(
+        virtual_fill_count=("tons", "count"),
+        virtual_fill_tons=("tons", "sum"),
+    )
+    merged = pd.merge(real_tons, fill_tons, on=["line", "campaign_id"], how="inner")
+    for _, row in merged.iterrows():
+        before = float(row["current_tons_before"] or 0.0)
+        fill_tons_val = float(row["virtual_fill_tons"] or 0.0)
+        rows.append(
+            {
+                "line": str(row["line"]),
+                "campaign_id": str(row["campaign_id"]),
+                "current_tons_before": float(round(before, 3)),
+                "current_tons_after": float(round(before + fill_tons_val, 3)),
+                "gap_before": None,
+                "virtual_fill_count": int(row["virtual_fill_count"] or 0),
+                "virtual_fill_tons": float(round(fill_tons_val, 3)),
+                "trial_result": "SUCCESS",
+                "rollback_reason": "",
+            }
+        )
+    metrics["formal_virtual_fill_trial_count"] = int(len(rows))
+    metrics["formal_virtual_fill_success_count"] = int(len(rows))
+    metrics["formal_virtual_fill_rollback_count"] = 0
+    metrics["formal_virtual_fill_success_campaigns"] = [f"{r['line']}#{r['campaign_id']}" for r in rows]
+    metrics["formal_virtual_fill_rollback_reasons"] = []
+    return rows, metrics
+
+
+def _build_shadow_bridge_analysis(schedule_df: pd.DataFrame, rule: RuleConfig, model_cfg) -> tuple[list[dict], Dict[str, object]]:
+    def _band(tons: float) -> str:
+        gap = max(0.0, float(rule.campaign_ton_min) - float(tons))
+        near_gap = float(getattr(model_cfg, "near_viable_gap_tons", 80.0) or 80.0)
+        merge_gap = float(getattr(model_cfg, "merge_candidate_gap_tons", 250.0) or 250.0)
+        if gap <= 0.0:
+            return "ALREADY_VIABLE"
+        if gap <= near_gap:
+            return "NEAR_VIABLE"
+        if gap <= merge_gap:
+            return "MERGE_CANDIDATE"
+        return "HOPELESS_UNDERFILLED"
+
+    metrics: Dict[str, object] = {
+        "shadow_bridge_candidate_count": 0,
+        "shadow_bridge_analysis_attempt_count": 0,
+        "shadow_bridge_analysis_success_count": 0,
+        "shadow_bridge_possible_reduced_underfilled_campaigns": 0,
+        "shadow_bridge_possible_reduced_hard_violations": 0,
+        "second_receiver_shadow_bridge_gap_before": 0.0,
+        "second_receiver_shadow_bridge_gap_after_estimate": 0.0,
+        "second_receiver_shadow_bridge_viability_band_before": "",
+        "second_receiver_shadow_bridge_viability_band_after_estimate": "",
+        "second_receiver_shadow_bridge_reason_code": "",
+        "shadow_bridge_analysis_rows": [],
+    }
+    rows: list[dict] = []
+    if schedule_df is None or schedule_df.empty or not {"line", "campaign_id", "tons"}.issubset(schedule_df.columns):
+        metrics["second_receiver_shadow_bridge_reason_code"] = "NO_BRIDGE_CANDIDATE"
+        return rows, metrics
+    enabled = bool(getattr(model_cfg, "virtual_enabled", True)) and bool(getattr(model_cfg, "virtual_shadow_mode_enabled", True))
+    bridge_enabled = bool(getattr(model_cfg, "virtual_shadow_bridge_enabled", True))
+    formal_bridge = bool(getattr(model_cfg, "virtual_formal_bridge_enabled", False))
+    if not enabled or not bridge_enabled or formal_bridge:
+        metrics["second_receiver_shadow_bridge_reason_code"] = "BRIDGE_NOT_ALLOWED_BY_CONFIG"
+        return rows, metrics
+
+    df = schedule_df.copy()
+    if "is_virtual" not in df.columns:
+        df["is_virtual"] = False
+    real = df[~df["is_virtual"].fillna(False).astype(bool)].copy()
+    if real.empty:
+        metrics["second_receiver_shadow_bridge_reason_code"] = "NO_BRIDGE_CANDIDATE"
+        return rows, metrics
+    if "global_sequence_on_line" not in real.columns:
+        real["global_sequence_on_line"] = real.groupby("line", sort=False).cumcount() + 1
+
+    min_ton = float(rule.campaign_ton_min)
+    near_gap = float(getattr(model_cfg, "near_viable_gap_tons", 80.0) or 80.0)
+    merge_gap = float(getattr(model_cfg, "merge_candidate_gap_tons", 250.0) or 250.0)
+    max_virtual_tons = float(getattr(model_cfg, "shadow_bridge_max_total_virtual_tons_per_campaign", 100.0) or 100.0)
+    max_virtual_count = int(getattr(model_cfg, "shadow_bridge_max_virtual_count_per_gap", 5) or 5)
+
+    csum = (
+        real.groupby(["line", "campaign_id"], as_index=False, dropna=False)
+        .agg(
+            tons=("tons", "sum"),
+            first_global=("global_sequence_on_line", "min"),
+            last_global=("global_sequence_on_line", "max"),
+        )
+        .sort_values(["line", "first_global"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+    csum["gap"] = csum["tons"].map(lambda v: max(0.0, min_ton - float(v or 0.0)))
+    csum["viability_band"] = csum["tons"].map(lambda v: _band(float(v or 0.0)))
+
+    selected_line = ""
+    selected_campaign = ""
+    if "second_receiver_selected" in df.columns:
+        selected = df[df["second_receiver_selected"].fillna(False).astype(bool)]
+        if not selected.empty:
+            selected_line = str(selected.iloc[0].get("line", ""))
+            selected_campaign = str(selected.iloc[0].get("campaign_id", ""))
+    attempt_count = 0
+    success_count = 0
+    for _, camp in csum[csum["tons"] < min_ton].iterrows():
+        line = str(camp["line"])
+        campaign_id = str(camp["campaign_id"])
+        current_tons = float(camp["tons"] or 0.0)
+        gap = float(camp["gap"] or 0.0)
+        before_band = str(camp["viability_band"])
+        line_meta = csum[csum["line"].astype(str) == line].sort_values("first_global", kind="mergesort").reset_index(drop=True)
+        idxs = line_meta.index[line_meta["campaign_id"].astype(str) == campaign_id].tolist()
+        best_after = current_tons
+        candidate_count = 0
+        reason = "NO_BRIDGE_CANDIDATE"
+        action = "NOT_WORTH_RESCUING"
+        if idxs:
+            idx = int(idxs[0])
+            saw_healthy = False
+            saw_nonhealthy_no_gain = False
+            for nidx in [idx - 1, idx + 1, idx - 2, idx + 2]:
+                if nidx < 0 or nidx >= len(line_meta):
+                    continue
+                neighbor = line_meta.iloc[nidx]
+                donor_tons = float(neighbor["tons"] or 0.0)
+                if donor_tons >= min_ton:
+                    saw_healthy = True
+                    attempt_count += 1
+                    continue
+                attempt_count += 1
+                after = current_tons + donor_tons
+                if after <= current_tons:
+                    saw_nonhealthy_no_gain = True
+                    continue
+                candidate_count += 1
+                if max_virtual_tons <= 0.0 or max_virtual_count <= 0:
+                    reason = "BRIDGE_EXCEEDS_VIRTUAL_CHAIN_LIMIT"
+                    continue
+                best_after = max(best_after, after)
+                after_gap = max(0.0, min_ton - after)
+                after_band = _band(after)
+                if after_gap < gap or after_band != before_band:
+                    reason = "BRIDGE_COULD_OPEN_DONOR_PATH"
+                    success_count += 1
+                    action = "TRY_SHADOW_BRIDGE_NEXT"
+                    break
+                saw_nonhealthy_no_gain = True
+            if candidate_count <= 0:
+                if saw_healthy:
+                    reason = "BRIDGE_ONLY_WITH_MIXED_COMPLEX_PATH"
+                    action = "REQUIRES_COMPLEX_MIXED_BRIDGE"
+                elif saw_nonhealthy_no_gain:
+                    reason = "BRIDGE_COULD_NOT_IMPROVE_TON"
+                    action = "KEEP_AS_IS"
+        after_gap = max(0.0, min_ton - best_after)
+        after_band = _band(best_after)
+        if reason == "BRIDGE_COULD_OPEN_DONOR_PATH" and after_gap <= near_gap:
+            action = "TRY_FORMAL_FILL_NEXT"
+        elif reason == "BRIDGE_COULD_OPEN_DONOR_PATH" and after_gap <= merge_gap:
+            action = "TRY_SHADOW_BRIDGE_NEXT"
+        is_second = bool(line == selected_line and campaign_id == selected_campaign)
+        rows.append(
+            {
+                "line": line,
+                "campaign_id": campaign_id,
+                "current_tons": float(round(current_tons, 3)),
+                "gap_tons": float(round(gap, 3)),
+                "bridge_candidate_count": int(candidate_count),
+                "bridge_analysis_attempt_count": int(attempt_count),
+                "gap_after_estimate": float(round(after_gap, 3)),
+                "viability_band_before": before_band,
+                "viability_band_after_estimate": after_band,
+                "shadow_bridge_reason_code": reason,
+                "recommended_next_action": action,
+                "is_second_receiver": bool(is_second),
+                "second_receiver_selected": bool(is_second),
+                "second_receiver_gap_before": float(round(gap, 3)) if is_second else 0.0,
+                "second_receiver_gap_after_estimate": float(round(after_gap, 3)) if is_second else 0.0,
+            }
+        )
+    second = next((r for r in rows if bool(r.get("is_second_receiver", False))), {})
+    metrics["shadow_bridge_analysis_rows"] = rows
+    metrics["shadow_bridge_candidate_count"] = int(sum(int(r.get("bridge_candidate_count", 0) or 0) for r in rows))
+    metrics["shadow_bridge_analysis_attempt_count"] = int(attempt_count)
+    metrics["shadow_bridge_analysis_success_count"] = int(success_count)
+    metrics["shadow_bridge_possible_reduced_underfilled_campaigns"] = int(sum(1 for r in rows if r.get("shadow_bridge_reason_code") == "BRIDGE_COULD_OPEN_DONOR_PATH"))
+    metrics["shadow_bridge_possible_reduced_hard_violations"] = int(metrics["shadow_bridge_possible_reduced_underfilled_campaigns"])
+    metrics["second_receiver_shadow_bridge_gap_before"] = float(second.get("second_receiver_gap_before", 0.0) or 0.0)
+    metrics["second_receiver_shadow_bridge_gap_after_estimate"] = float(second.get("second_receiver_gap_after_estimate", 0.0) or 0.0)
+    metrics["second_receiver_shadow_bridge_viability_band_before"] = str(second.get("viability_band_before", ""))
+    metrics["second_receiver_shadow_bridge_viability_band_after_estimate"] = str(second.get("viability_band_after_estimate", ""))
+    metrics["second_receiver_shadow_bridge_reason_code"] = str(second.get("shadow_bridge_reason_code", "NO_BRIDGE_CANDIDATE"))
+    return rows, metrics
 
 
 def validate_width_audit_by_campaign(df: pd.DataFrame) -> Dict[str, object]:
@@ -218,12 +811,23 @@ def validate_solution_summary(result: ColdRollingResult, rule: RuleConfig | None
     # for compatibility and lightweight tests.
     rule = rule or _COMPAT_RULE
     df = result.schedule_df
+    model_cfg = getattr(getattr(result, "config", None), "model", None)
     if df.empty:
         empty_width_audit = validate_width_audit_by_campaign(df)
         final_audit = run_final_schedule_audit(df, rule, getattr(result, "engine_meta", None) or {})
         final_audit_summary = final_audit.get("summary", {}) if isinstance(final_audit, dict) else {}
         final_audit_details = final_audit.get("details", {}) if isinstance(final_audit, dict) else {}
         out = {"real_orders": 0, "virtual_orders": 0, **empty_width_audit}
+        out.update(recompute_final_schedule_summary(df, rule))
+        shadow_rows, shadow_metrics = _build_shadow_virtual_fill_analysis(df, rule, model_cfg)
+        formal_rows, formal_metrics = _build_formal_virtual_fill_trial_summary(df)
+        shadow_bridge_rows, shadow_bridge_metrics = _build_shadow_bridge_analysis(df, rule, model_cfg)
+        out["shadow_virtual_fill_rows"] = shadow_rows
+        out["formal_virtual_fill_trial_rows"] = formal_rows
+        out["shadow_bridge_analysis_rows"] = shadow_bridge_rows
+        out.update(shadow_metrics)
+        out.update(formal_metrics)
+        out.update(shadow_bridge_metrics)
         out["final_schedule_audit_summary"] = final_audit_summary
         out["final_schedule_audit_details"] = final_audit_details
         for key, value in final_audit_summary.items():
@@ -234,11 +838,22 @@ def validate_solution_summary(result: ColdRollingResult, rule: RuleConfig | None
         "real_orders": int((~df["is_virtual"]).sum()),
         "virtual_orders": int(df["is_virtual"].sum()),
     }
+    final_summary = recompute_final_schedule_summary(df, rule)
+    out.update(final_summary)
+    shadow_rows, shadow_metrics = _build_shadow_virtual_fill_analysis(df, rule, model_cfg)
+    formal_rows, formal_metrics = _build_formal_virtual_fill_trial_summary(df)
+    shadow_bridge_rows, shadow_bridge_metrics = _build_shadow_bridge_analysis(df, rule, model_cfg)
+    out["shadow_virtual_fill_rows"] = shadow_rows
+    out["formal_virtual_fill_trial_rows"] = formal_rows
+    out["shadow_bridge_analysis_rows"] = shadow_bridge_rows
+    out.update(shadow_metrics)
+    out.update(formal_metrics)
+    out.update(shadow_bridge_metrics)
 
     # HARD VIOLATION TRACKING: campaign_ton_min and campaign_ton_max are now HARD constraints
-    campaign_ton_min_violation_count = 0
-    campaign_ton_max_violation_count = 0
-    campaign_ton_hard_violation_count_total = 0
+    campaign_ton_min_violation_count = int(final_summary.get("campaign_ton_min_violation_count", 0) or 0)
+    campaign_ton_max_violation_count = int(final_summary.get("campaign_ton_max_violation_count", 0) or 0)
+    campaign_ton_hard_violation_count_total = campaign_ton_min_violation_count + campaign_ton_max_violation_count
     hard_violation_count_total = 0
 
     if {"line", "campaign_id", "tons"}.issubset(set(df.columns)):
@@ -246,28 +861,15 @@ def validate_solution_summary(result: ColdRollingResult, rule: RuleConfig | None
         if not real.empty:
             csum = real.groupby(["line", "campaign_id"], as_index=False)["tons"].sum()
             min_ton = float(rule.campaign_ton_min)
-            max_ton = float(rule.campaign_ton_max)
-
-            # HARD: campaign_ton_min violation (slot tons < 700)
             low = csum["tons"] < min_ton
-            campaign_ton_min_violation_count = int(low.sum())
-
-            # HARD: campaign_ton_max violation (slot tons > 2000)
-            over = csum["tons"] > max_ton
-            campaign_ton_max_violation_count = int(over.sum())
-
-            # Total campaign ton hard violations
-            campaign_ton_hard_violation_count_total = campaign_ton_min_violation_count + campaign_ton_max_violation_count
-
-            out["campaign_cnt"] = int(len(csum))
             out["campaign_ton_min_hard_enforced"] = True
-            out["campaign_ton_window"] = [min_ton, max_ton]
+            out["campaign_ton_window"] = [float(rule.campaign_ton_min), float(rule.campaign_ton_max)]
             out["campaign_ton_min_violation_count"] = campaign_ton_min_violation_count
             out["campaign_ton_max_violation_count"] = campaign_ton_max_violation_count
             out["campaign_ton_hard_violation_count_total"] = campaign_ton_hard_violation_count_total
 
             # Legacy support: still track low_ton_campaign_cnt as diagnostic
-            low_ton_cnt = int(low.sum())
+            low_ton_cnt = campaign_ton_min_violation_count
             out["low_ton_campaign_cnt"] = low_ton_cnt
 
             csum["gap"] = (min_ton - csum["tons"]).clip(lower=0.0)

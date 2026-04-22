@@ -12,9 +12,9 @@ from aps_cp_sat.domain.models import ColdRollingRequest
 # =========================
 # 写死的输入输出路径
 # =========================
-ORDERS_PATH = Path(r"D:\Desktop\冷轧连退钢带-202511订单明细数据-原始数据.xlsx")
+ORDERS_PATH = Path(r"D:\桌面\冷轧连退钢带-202511订单明细数据-原始数据.xlsx")
 STEEL_INFO_PATH = None  # 没有单独钢种文件时保持为 None
-OUTPUT_DIR = Path(r"D:\Desktop\SAT排程结果")
+OUTPUT_DIR = Path(r"D:\桌面\SAT排程结果")
 OUTPUT_FILE_NAME = "block_first_verify.xlsx"
 
 # =========================

@@ -29,7 +29,6 @@ Two-phase solving:
 
 import pandas as pd
 
-
 # =============================================================================
 # UNIFIED DROP PRIORITY HELPER
 # Priority order (MUST be used by ALL drop sorting logic):
@@ -70,7 +69,7 @@ def _drop_priority_key(item: dict) -> tuple:
     # Priority order: global_iso > ton_window > no_feasible > bridge > adjacency_risk > iso > low_priority
     adjacency_risk = bool(d.get("adjacency_risk", False))
     iso = bool(d.get("iso", False) or d.get("isolated", False))
-    
+
     # low_priority: check order dict or direct priority field
     if "order" in d and isinstance(d["order"], dict):
         priority = int(d["order"].get("priority", 0) or 0)
@@ -81,7 +80,7 @@ def _drop_priority_key(item: dict) -> tuple:
     # Outlier and tiebreaker fields
     width_outlier = float(d.get("width_outlier", 0) or 0)
     thick_outlier = float(d.get("thick_outlier", 0) or 0)
-    
+
     if "order" in d and isinstance(d["order"], dict):
         due_rank = int(d["order"].get("due_rank", 9) or 9)
         tons = float(d["order"].get("tons", 0.0) or 0.0)
@@ -125,7 +124,7 @@ def _dominant_drop_reason(item: dict) -> str:
     # Priority 5: adjacency_risk (Priority 2: pre-strict to structure_fallback)
     adjacency_risk = bool(d.get("adjacency_risk", False))
     iso = bool(d.get("iso", False) or d.get("isolated", False))
-    
+
     if "order" in d and isinstance(d["order"], dict):
         priority = int(d["order"].get("priority", 0) or 0)
     else:
@@ -150,6 +149,8 @@ def _dominant_drop_reason(item: dict) -> str:
     else:
         reasons = d.get("reasons", []) or []
         return str(reasons[0]) if reasons else "OTHER"
+
+
 from time import perf_counter
 from dataclasses import replace
 
@@ -204,8 +205,8 @@ def _should_fast_fail_after_routing_infeasible(joint: dict, cfg) -> tuple[bool, 
         coverage = float(slot.get("template_coverage_ratio", 1.0) or 1.0)
         zero_degree = int(slot.get("zero_in_orders", 0) or 0) + int(slot.get("zero_out_orders", 0) or 0)
         if (
-            order_count >= int(cfg.model.fast_fail_slot_order_count_threshold)
-            and coverage <= float(cfg.model.fast_fail_slot_coverage_threshold)
+                order_count >= int(cfg.model.fast_fail_slot_order_count_threshold)
+                and coverage <= float(cfg.model.fast_fail_slot_coverage_threshold)
         ):
             return True, "top_unroutable_slot_overpacked_and_low_coverage"
         if zero_degree >= int(cfg.model.fast_fail_slot_zero_degree_threshold):
@@ -218,16 +219,17 @@ def _structure_fallback_enabled(cfg) -> bool:
 
 
 def _pick_structure_drop_candidates(
-    orders_df: pd.DataFrame,
-    joint: dict,
-    feasibility_evidence: dict,
-    cfg,
+        orders_df: pd.DataFrame,
+        joint: dict,
+        feasibility_evidence: dict,
+        cfg,
 ) -> pd.DataFrame:
     if orders_df is None or orders_df.empty:
         return pd.DataFrame()
     max_drop_count = max(0, int(getattr(cfg.model, "max_drop_count_for_partial", 0) or 0))
     max_drop_ratio = max(0.0, float(getattr(cfg.model, "max_drop_ratio_for_partial", 0.0) or 0.0))
-    budget = min(max_drop_count if max_drop_count > 0 else len(orders_df), max(1, int(len(orders_df) * max_drop_ratio))) if max_drop_ratio > 0 else max_drop_count
+    budget = min(max_drop_count if max_drop_count > 0 else len(orders_df),
+                 max(1, int(len(orders_df) * max_drop_ratio))) if max_drop_ratio > 0 else max_drop_count
     if budget <= 0:
         return pd.DataFrame()
 
@@ -244,20 +246,20 @@ def _pick_structure_drop_candidates(
         return ["big_roll", "small_roll"]
 
     def add_candidate(
-        order_id: str,
-        score: int,
-        reason: str,
-        secondary: str = "",
-        *,
-        slot: dict | None = None,
-        risk_summary: str = "",
-        would_break_slot_if_kept: bool = False,
-        would_break_ton_window_if_kept: bool = False,
-        globally_isolated: bool = False,
-        no_feasible_line: bool = False,
-        bridge_required_but_not_supported: bool = False,
-        # Priority 2: adjacency_risk parameter for pre-strict to structure_fallback
-        adjacency_risk: bool = False,
+            order_id: str,
+            score: int,
+            reason: str,
+            secondary: str = "",
+            *,
+            slot: dict | None = None,
+            risk_summary: str = "",
+            would_break_slot_if_kept: bool = False,
+            would_break_ton_window_if_kept: bool = False,
+            globally_isolated: bool = False,
+            no_feasible_line: bool = False,
+            bridge_required_but_not_supported: bool = False,
+            # Priority 2: adjacency_risk parameter for pre-strict to structure_fallback
+            adjacency_risk: bool = False,
     ) -> None:
         oid = str(order_id or "")
         if not oid or oid not in by_id:
@@ -297,14 +299,17 @@ def _pick_structure_drop_candidates(
         if risk_summary:
             row["risk_summary"] = str(risk_summary)
         row["would_break_slot_if_kept"] = bool(row["would_break_slot_if_kept"] or would_break_slot_if_kept)
-        row["would_break_ton_window_if_kept"] = bool(row["would_break_ton_window_if_kept"] or would_break_ton_window_if_kept)
+        row["would_break_ton_window_if_kept"] = bool(
+            row["would_break_ton_window_if_kept"] or would_break_ton_window_if_kept)
         row["globally_isolated"] = bool(row["globally_isolated"] or globally_isolated)
         row["no_feasible_line"] = bool(row["no_feasible_line"] or no_feasible_line)
-        row["bridge_required_but_not_supported"] = bool(row["bridge_required_but_not_supported"] or bridge_required_but_not_supported)
+        row["bridge_required_but_not_supported"] = bool(
+            row["bridge_required_but_not_supported"] or bridge_required_but_not_supported)
         # Priority 2: adjacency_risk update
         row["adjacency_risk"] = bool(row["adjacency_risk"] or adjacency_risk)
 
-    isolated_top = feasibility_evidence.get("isolated_orders_topn", []) if isinstance(feasibility_evidence, dict) else []
+    isolated_top = feasibility_evidence.get("isolated_orders_topn", []) if isinstance(feasibility_evidence,
+                                                                                      dict) else []
     isolated_lookup = {str(item.get("order_id", "")): item for item in isolated_top}
 
     # Analyze ton window feasibility for each order
@@ -313,7 +318,7 @@ def _pick_structure_drop_candidates(
     ton_max = float(getattr(cfg.rule, "campaign_ton_max", 2000.0) or 2000.0)
     slot_upper_bound = int(joint.get("slot_upper_bound_by_line", {}).get("big_roll", 10))
     ton_window_breakers: dict[str, dict] = {}
-    
+
     # FIX: raw_slots must be defined before use (moved from below)
     raw_slots = joint.get("slot_route_details", []) if isinstance(joint.get("slot_route_details", []), list) else []
 
@@ -387,7 +392,8 @@ def _pick_structure_drop_candidates(
         slot_rows = [by_id[oid] for oid in slot_ids]
         slot_df = pd.DataFrame(slot_rows)
         width_median = float(slot_df["width"].median()) if "width" in slot_df.columns and not slot_df.empty else 0.0
-        thick_median = float(slot_df["thickness"].median()) if "thickness" in slot_df.columns and not slot_df.empty else 0.0
+        thick_median = float(
+            slot_df["thickness"].median()) if "thickness" in slot_df.columns and not slot_df.empty else 0.0
         over_cap = int(slot.get("order_count_over_cap", 0) or 0)
         zero_degree = int(slot.get("zero_in_orders", 0) or 0) + int(slot.get("zero_out_orders", 0) or 0)
         target_remove = max(1, min(max(1, over_cap), max(1, budget // max(1, len(focus_bad_slots)))))
@@ -429,7 +435,7 @@ def _pick_structure_drop_candidates(
             break_ton = oid in ton_window_breakers
             no_feasible_line = bool(not _allowed_lines(rec))
             bridge_required_but_not_supported = False  # Not directly tracked here
-            
+
             # Priority 2: Pre-strict adjacency risk
             # An order has adjacency risk if keeping it would cause adjacency violations:
             # - The slot has low template coverage (many orders can't transition)
@@ -448,7 +454,7 @@ def _pick_structure_drop_candidates(
                 or pair_gap > 5
                 or oid in set(str(v) for v in (slot.get("top_isolated_orders", []) or []))
             )
-            
+
             ranked_rows.append(
                 (
                     oid,
@@ -560,7 +566,9 @@ def _pick_structure_drop_candidates(
         soid = str(oid)
         break_ton = soid in ton_window_breakers
         if not allowed:
-            add_candidate(soid, 120, "NO_FEASIBLE_LINE", risk_summary="no_feasible_line", would_break_slot_if_kept=False, would_break_ton_window_if_kept=break_ton, no_feasible_line=True)
+            add_candidate(soid, 120, "NO_FEASIBLE_LINE", risk_summary="no_feasible_line",
+                          would_break_slot_if_kept=False, would_break_ton_window_if_kept=break_ton,
+                          no_feasible_line=True)
 
     if not scored:
         return pd.DataFrame()
@@ -601,8 +609,10 @@ def _pick_structure_drop_candidates(
 
 
 def _structure_fallback_config(cfg, feasibility_evidence: dict, bad_slots: list[dict] | None = None):
-    summary = feasibility_evidence.get("feasibility_evidence_summary", {}) if isinstance(feasibility_evidence, dict) else {}
-    slot_safe_lb = int(summary.get("slot_safe_lower_bound", cfg.model.max_campaign_slots) or cfg.model.max_campaign_slots)
+    summary = feasibility_evidence.get("feasibility_evidence_summary", {}) if isinstance(feasibility_evidence,
+                                                                                         dict) else {}
+    slot_safe_lb = int(
+        summary.get("slot_safe_lower_bound", cfg.model.max_campaign_slots) or cfg.model.max_campaign_slots)
     raw_bad_slots = bad_slots or []
     big_bad_slots = [slot for slot in raw_bad_slots if str(slot.get("line", "")) == "big_roll"]
     slot_buffer = int(getattr(cfg.model, "structure_fallback_slot_buffer", 4) or 4)
@@ -610,13 +620,18 @@ def _structure_fallback_config(cfg, feasibility_evidence: dict, bad_slots: list[
     risk_boost = float(getattr(cfg.model, "structure_fallback_risk_boost", 1.5) or 1.5)
     if big_bad_slots:
         risk_boost = max(risk_boost, 1.75)
-    min_ratio = float(getattr(cfg.model, "structure_fallback_min_real_schedule_ratio", cfg.model.min_real_schedule_ratio) or cfg.model.min_real_schedule_ratio)
+    min_ratio = float(getattr(cfg.model, "structure_fallback_min_real_schedule_ratio",
+                              cfg.model.min_real_schedule_ratio) or cfg.model.min_real_schedule_ratio)
     new_score = replace(
         cfg.score,
-        slot_isolation_risk_penalty=max(cfg.score.slot_isolation_risk_penalty, int(cfg.score.slot_isolation_risk_penalty * risk_boost)),
-        slot_pair_gap_risk_penalty=max(cfg.score.slot_pair_gap_risk_penalty, int(cfg.score.slot_pair_gap_risk_penalty * risk_boost)),
-        slot_span_risk_penalty=max(cfg.score.slot_span_risk_penalty, int(cfg.score.slot_span_risk_penalty * risk_boost)),
-        slot_order_count_penalty=max(cfg.score.slot_order_count_penalty, int(cfg.score.slot_order_count_penalty * risk_boost)),
+        slot_isolation_risk_penalty=max(cfg.score.slot_isolation_risk_penalty,
+                                        int(cfg.score.slot_isolation_risk_penalty * risk_boost)),
+        slot_pair_gap_risk_penalty=max(cfg.score.slot_pair_gap_risk_penalty,
+                                       int(cfg.score.slot_pair_gap_risk_penalty * risk_boost)),
+        slot_span_risk_penalty=max(cfg.score.slot_span_risk_penalty,
+                                   int(cfg.score.slot_span_risk_penalty * risk_boost)),
+        slot_order_count_penalty=max(cfg.score.slot_order_count_penalty,
+                                     int(cfg.score.slot_order_count_penalty * risk_boost)),
         unassigned_real=max(20, int(cfg.score.unassigned_real * 0.8)),
     )
     new_model = replace(
@@ -651,11 +666,11 @@ def _summarize_bad_slots(slot_details) -> list[dict]:
 
 
 def _candidate_summary(
-    joint: dict,
-    *,
-    extra_drop_count: int = 0,
-    source_orders_df: pd.DataFrame | None = None,
-    extra_dropped_df: pd.DataFrame | None = None,
+        joint: dict,
+        *,
+        extra_drop_count: int = 0,
+        source_orders_df: pd.DataFrame | None = None,
+        extra_dropped_df: pd.DataFrame | None = None,
 ) -> dict | None:
     status = str(joint.get("status", ""))
     if status not in {"FEASIBLE", "ROUTING_INFEASIBLE"}:
@@ -727,9 +742,9 @@ def _candidate_better(lhs: dict | None, rhs: dict | None, *, mode: str) -> bool:
 
 
 def _planned_from_joint(
-    joint_pack: dict,
-    orders_df: pd.DataFrame | None,
-    extra_dropped: pd.DataFrame | None = None,
+        joint_pack: dict,
+        orders_df: pd.DataFrame | None,
+        extra_dropped: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame] | None:
     if orders_df is None:
         return None
@@ -758,98 +773,98 @@ def _planned_from_joint(
 
 
 def _build_meta(
-    req: ColdRollingRequest,
-    *,
-    engine_used: str,
-    main_path: str,
-    fallback_used: bool,
-    fallback_type: str,
-    fallback_reason: str,
-    fallback_trace: list[dict],
-    used_local_routing: bool,
-    local_routing_role: str,
-    input_order_count: int,
-    failure_diagnostics: dict,
-    joint_estimates: dict | None = None,
-    strict_template_edges_enabled: bool = True,
-    unroutable_slot_count: int = 0,
-    slot_route_details: list[dict] | None = None,
-    template_graph_health: str = "UNKNOWN",
-    precheck_autorelax_applied: bool = False,
-    solve_attempt_count: int = 0,
-    fallback_attempt_count: int = 0,
-    early_stop_reason: str = "",
-    early_stop_deferred_for_semantic_fallback: bool = False,
-    semantic_fallback_first_attempt_status: str = "",
-    assignment_pressure_mode: str = "normal",
-    effective_config=None,
-    template_build_seconds: float = 0.0,
-    joint_master_seconds: float = 0.0,
-    local_router_seconds: float = 0.0,
-    fallback_total_seconds: float = 0.0,
-    feasibility_evidence: dict | None = None,
-    failure_mode: str = "",
-    evidence_level: str = "OK",
-    top_infeasibility_signals: list[str] | None = None,
-    drop_strategy_applied: bool = False,
-    dropped_candidates_considered: int = 0,
-    dropped_candidates_selected: int = 0,
-    dominant_drop_reason_histogram: dict | None = None,
-    structure_fallback_applied: bool = False,
-    fallback_mode: str = "",
-    slot_count_after_fallback: int = 0,
-    drop_budget_after_fallback: int = 0,
-    best_candidate_available: bool = False,
-    best_candidate_type: str = "",
-    best_candidate_objective: float = 0.0,
-    best_candidate_search_status: str = "",
-    best_candidate_routing_feasible: bool = False,
-    best_candidate_unroutable_slot_count: int = 0,
-    drop_stage: str = "",
-    drop_budget_used: int = 0,
-    drop_budget_remaining: int = 0,
-    structure_first_applied: bool = False,
-    time_expansion_applied: bool = False,
-    slot_count_before_fallback: int = 0,
-    restructured_slot_count: int = 0,
-    bad_slots_before_restructure: list[dict] | None = None,
-    bad_slots_after_restructure: list[dict] | None = None,
-    orders_removed_from_bad_slots: list[dict] | None = None,
-    # Intermediate candidate fields (not final acceptance)
-    # FINAL acceptance is ONLY set by cold_rolling_pipeline after validation
-    candidate_has_drop: bool = False,
-    candidate_drop_count: int = 0,
-    candidate_drop_tons: float = 0.0,
-    candidate_routing_feasible: bool = False,
-    candidate_validation_pending: bool = True,  # True until pipeline validates
-    candidate_phase: str = "",  # "feasibility" or "optimize"
-    candidate_reason: str = "",  # Why this candidate was selected
-    # Two-phase solving diagnostics
-    feasibility_phase_executed: bool = False,
-    feasibility_phase_found_solution: bool = False,
-    optimize_phase_executed: bool = False,
-    optimize_phase_improved_solution: bool = False,
-    official_solution_source: str = "NONE",  # FEASIBILITY_PHASE, OPTIMIZE_PHASE, NONE
-    # Drop statistics by reason
-    drop_due_to_ton_window_count: int = 0,
-    drop_due_to_global_isolation_count: int = 0,
-    drop_due_to_no_feasible_line_count: int = 0,
-    drop_due_to_bridge_not_supported_count: int = 0,
-    drop_due_to_routing_risk_count: int = 0,
-    drop_due_to_capacity_count: int = 0,
-    drop_due_to_low_priority_count: int = 0,
-    drop_due_to_master_unassigned_count: int = 0,
-    # Block first fields
-    exported_from_alns_final: bool = False,
-    effective_selected_blocks_count: int = 0,
-    effective_assigned_slot_count: int = 0,
-    effective_campaign_count: int = 0,
-    effective_dropped_order_count: int = 0,
-    final_realized_order_count: int = 0,
-    final_realized_tons: float = 0.0,
-    realized_order_coverage_final: float = 0.0,
-    selected_order_coverage_pre_assembly: float = 0.0,
-    final_realized_schedule_rows: int = 0,
+        req: ColdRollingRequest,
+        *,
+        engine_used: str,
+        main_path: str,
+        fallback_used: bool,
+        fallback_type: str,
+        fallback_reason: str,
+        fallback_trace: list[dict],
+        used_local_routing: bool,
+        local_routing_role: str,
+        input_order_count: int,
+        failure_diagnostics: dict,
+        joint_estimates: dict | None = None,
+        strict_template_edges_enabled: bool = True,
+        unroutable_slot_count: int = 0,
+        slot_route_details: list[dict] | None = None,
+        template_graph_health: str = "UNKNOWN",
+        precheck_autorelax_applied: bool = False,
+        solve_attempt_count: int = 0,
+        fallback_attempt_count: int = 0,
+        early_stop_reason: str = "",
+        early_stop_deferred_for_semantic_fallback: bool = False,
+        semantic_fallback_first_attempt_status: str = "",
+        assignment_pressure_mode: str = "normal",
+        effective_config=None,
+        template_build_seconds: float = 0.0,
+        joint_master_seconds: float = 0.0,
+        local_router_seconds: float = 0.0,
+        fallback_total_seconds: float = 0.0,
+        feasibility_evidence: dict | None = None,
+        failure_mode: str = "",
+        evidence_level: str = "OK",
+        top_infeasibility_signals: list[str] | None = None,
+        drop_strategy_applied: bool = False,
+        dropped_candidates_considered: int = 0,
+        dropped_candidates_selected: int = 0,
+        dominant_drop_reason_histogram: dict | None = None,
+        structure_fallback_applied: bool = False,
+        fallback_mode: str = "",
+        slot_count_after_fallback: int = 0,
+        drop_budget_after_fallback: int = 0,
+        best_candidate_available: bool = False,
+        best_candidate_type: str = "",
+        best_candidate_objective: float = 0.0,
+        best_candidate_search_status: str = "",
+        best_candidate_routing_feasible: bool = False,
+        best_candidate_unroutable_slot_count: int = 0,
+        drop_stage: str = "",
+        drop_budget_used: int = 0,
+        drop_budget_remaining: int = 0,
+        structure_first_applied: bool = False,
+        time_expansion_applied: bool = False,
+        slot_count_before_fallback: int = 0,
+        restructured_slot_count: int = 0,
+        bad_slots_before_restructure: list[dict] | None = None,
+        bad_slots_after_restructure: list[dict] | None = None,
+        orders_removed_from_bad_slots: list[dict] | None = None,
+        # Intermediate candidate fields (not final acceptance)
+        # FINAL acceptance is ONLY set by cold_rolling_pipeline after validation
+        candidate_has_drop: bool = False,
+        candidate_drop_count: int = 0,
+        candidate_drop_tons: float = 0.0,
+        candidate_routing_feasible: bool = False,
+        candidate_validation_pending: bool = True,  # True until pipeline validates
+        candidate_phase: str = "",  # "feasibility" or "optimize"
+        candidate_reason: str = "",  # Why this candidate was selected
+        # Two-phase solving diagnostics
+        feasibility_phase_executed: bool = False,
+        feasibility_phase_found_solution: bool = False,
+        optimize_phase_executed: bool = False,
+        optimize_phase_improved_solution: bool = False,
+        official_solution_source: str = "NONE",  # FEASIBILITY_PHASE, OPTIMIZE_PHASE, NONE
+        # Drop statistics by reason
+        drop_due_to_ton_window_count: int = 0,
+        drop_due_to_global_isolation_count: int = 0,
+        drop_due_to_no_feasible_line_count: int = 0,
+        drop_due_to_bridge_not_supported_count: int = 0,
+        drop_due_to_routing_risk_count: int = 0,
+        drop_due_to_capacity_count: int = 0,
+        drop_due_to_low_priority_count: int = 0,
+        drop_due_to_master_unassigned_count: int = 0,
+        # Block first fields
+        exported_from_alns_final: bool = False,
+        effective_selected_blocks_count: int = 0,
+        effective_assigned_slot_count: int = 0,
+        effective_campaign_count: int = 0,
+        effective_dropped_order_count: int = 0,
+        final_realized_order_count: int = 0,
+        final_realized_tons: float = 0.0,
+        realized_order_coverage_final: float = 0.0,
+        selected_order_coverage_pre_assembly: float = 0.0,
+        final_realized_schedule_rows: int = 0,
 ) -> dict:
     joint_estimates = joint_estimates or {}
     slot_route_details = slot_route_details or []
@@ -950,17 +965,18 @@ def _build_meta(
         # Compatibility aliases mapping to final realized
         "assigned_count": int(final_realized_order_count),
         "assigned_tons": float(final_realized_tons),
-        "selected_order_coverage": float(realized_order_coverage_final),  # Redefine old alias to mean final realized coverage
+        "selected_order_coverage": float(realized_order_coverage_final),
+        # Redefine old alias to mean final realized coverage
         # Fixed drop priority order (do not change)
         "drop_priority_order": "GLOBAL_ISO > TON_WINDOW > NO_FEASIBLE_LINE > BRIDGE_NOT_SUPPORTED > ISO > LOW_PRIORITY > OUTLIER > OTHER",
     }
 
 
 def solve_master_model(
-    req: ColdRollingRequest,
-    transition_pack: dict | None = None,
-    orders_df: pd.DataFrame | None = None,
-    phase_mode: str = "feasibility_only",
+        req: ColdRollingRequest,
+        transition_pack: dict | None = None,
+        orders_df: pd.DataFrame | None = None,
+        phase_mode: str = "feasibility_only",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     """Production master solve entry; returns structured solver output plus engine metadata only.
 
@@ -1023,6 +1039,7 @@ def solve_master_model(
                 from aps_cp_sat.model.block_master import solve_block_master
                 from aps_cp_sat.model.block_realizer import realize_selected_blocks
                 from aps_cp_sat.model.block_alns import run_block_alns
+                from aps_cp_sat.model.campaign_assembly_planner import build_campaign_assembly_plan
             except ImportError as e:
                 raise ImportError(f"[APS][block_first] Failed to import block_first modules: {e}")
 
@@ -1072,6 +1089,24 @@ def solve_master_model(
                 f"in {master_seconds:.2f}s"
             )
 
+            # Step 2.5: Campaign Assembly Planner
+            assembly_plan = build_campaign_assembly_plan(
+                master_result=master_result,
+                orders_df=orders_df,
+                transition_pack=current_transition_pack,
+                cfg=current_cfg,
+            )
+            planner_summary = dict(getattr(assembly_plan, "summary", {}) or {})
+            planner_diag = dict(getattr(assembly_plan, "diagnostics", {}) or {})
+            print(
+                f"[APS][assembly_planner] skeletons={planner_summary.get('assembly_plan_campaign_skeleton_count', 0)}, "
+                f"near={planner_summary.get('assembly_plan_near_viable_count', 0)}, "
+                f"merge={planner_summary.get('assembly_plan_merge_candidate_count', 0)}, "
+                f"hopeless={planner_summary.get('assembly_plan_hopeless_count', 0)}, "
+                f"bridge_reqs={planner_summary.get('assembly_plan_bridge_requirement_count', 0)}, "
+                f"mixed_bridge={planner_summary.get('assembly_plan_mixed_bridge_required_count', 0)}"
+            )
+
             # Step 3: Block Realization
             realizer_t0 = perf_counter()
             print(f"[APS][block_first] Realizing selected blocks...")
@@ -1081,6 +1116,7 @@ def solve_master_model(
                 transition_pack=current_transition_pack,
                 cfg=current_cfg,
                 random_seed=int(getattr(current_cfg.model, "random_seed", 42)),
+                assembly_plan=assembly_plan,
             )
             realizer_seconds = perf_counter() - realizer_t0
             print(
@@ -1120,9 +1156,11 @@ def solve_master_model(
             # Final Realized Metrics Computation
             realized_df = effective_realization_result.realized_schedule_df
             if realized_df is not None and not realized_df.empty:
-                final_realized_order_count = int(realized_df["order_id"].nunique()) if "order_id" in realized_df.columns else len(realized_df)
+                final_realized_order_count = int(
+                    realized_df["order_id"].nunique()) if "order_id" in realized_df.columns else len(realized_df)
                 final_realized_tons = float(realized_df["tons"].sum()) if "tons" in realized_df.columns else 0.0
-                final_realized_order_ids = set(realized_df["order_id"].tolist()) if "order_id" in realized_df.columns else set()
+                final_realized_order_ids = set(
+                    realized_df["order_id"].tolist()) if "order_id" in realized_df.columns else set()
                 final_realized_schedule_rows = len(realized_df)
             else:
                 final_realized_order_count = 0
@@ -1132,18 +1170,19 @@ def solve_master_model(
 
             total_orders = len(orders_df)
             realized_order_coverage_final = float(final_realized_order_count / max(1, total_orders))
-            selected_order_coverage_pre_assembly = float(len(effective_master_result.selected_order_ids) / max(1, total_orders))
+            selected_order_coverage_pre_assembly = float(
+                len(effective_master_result.selected_order_ids) / max(1, total_orders))
 
             # Build schedule_df from effective realization
             schedule_df = pd.DataFrame()
             if realized_df is not None and not realized_df.empty:
                 schedule_df = realized_df.copy()
-                
+
                 # Make sure essential columns are present
-                for col in ["order_id", "block_id", "assigned_line", "assigned_slot", 
-                           "campaign_id", "block_in_slot_index", "sequence_in_block", 
-                           "sequence_in_slot", "global_sequence_on_line", 
-                           "selected_edge_type", "boundary_edge_type"]:
+                for col in ["order_id", "block_id", "assigned_line", "assigned_slot",
+                            "campaign_id", "block_in_slot_index", "sequence_in_block",
+                            "sequence_in_slot", "global_sequence_on_line",
+                            "selected_edge_type", "boundary_edge_type"]:
                     if col not in schedule_df.columns:
                         schedule_df[col] = None
 
@@ -1166,7 +1205,8 @@ def solve_master_model(
 
             # Orders are dropped if they weren't selected OR if they were selected but didn't make it to realized schedule
             dropped_order_ids_set = set(effective_master_result.dropped_order_ids)
-            additional_drops = [oid for oid in effective_master_result.selected_order_ids if oid not in final_realized_order_ids]
+            additional_drops = [oid for oid in effective_master_result.selected_order_ids if
+                                oid not in final_realized_order_ids]
             dropped_order_ids_set.update(additional_drops)
 
             effective_dropped_order_count = len(dropped_order_ids_set)
@@ -1222,7 +1262,8 @@ def solve_master_model(
                 # Block ALNS metrics
                 "block_alns_rounds_attempted": block_alns_diag.get("block_alns_rounds_attempted", 0),
                 "block_alns_rounds_accepted": block_alns_diag.get("block_alns_rounds_accepted", 0),
-                "block_alns_rejected_due_to_unresolved_regression": block_alns_diag.get("rejected_due_to_unresolved_regression", 0),
+                "block_alns_rejected_due_to_unresolved_regression": block_alns_diag.get(
+                    "rejected_due_to_unresolved_regression", 0),
                 # Timing
                 "block_generation_seconds": gen_seconds,
                 "block_master_seconds": master_seconds,
@@ -1253,6 +1294,11 @@ def solve_master_model(
                 "plan_df": schedule_df,
                 "dropped_df": dropped_df,
             }
+            engine_meta.update(planner_summary)
+            engine_meta.update(planner_diag)
+            engine_meta["campaign_assembly_plan_rows"] = list(getattr(assembly_plan, "skeleton_rows", lambda: [])())
+            engine_meta["bridge_requirement_rows"] = list(getattr(assembly_plan, "bridge_rows", lambda: [])())
+            engine_meta["donor_candidate_rows"] = list(getattr(assembly_plan, "donor_rows", lambda: [])())
 
             print(
                 f"[APS][block_first] Complete: {final_realized_order_count} orders realized, "
@@ -1274,7 +1320,8 @@ def solve_master_model(
         bridge_expansion_mode = str(getattr(current_cfg.model, "bridge_expansion_mode", "disabled"))
         allow_virtual_bridge = bool(getattr(current_cfg.model, "allow_virtual_bridge_edge_in_constructive", False))
         allow_real_bridge = bool(getattr(current_cfg.model, "allow_real_bridge_edge_in_constructive", False))
-        constructive_edge_policy = "direct_only" if (not allow_virtual_bridge and not allow_real_bridge) else ("direct_plus_real_bridge" if not allow_virtual_bridge else "all_edges_allowed")
+        constructive_edge_policy = "direct_only" if (not allow_virtual_bridge and not allow_real_bridge) else (
+            "direct_plus_real_bridge" if not allow_virtual_bridge else "all_edges_allowed")
         print(f"[APS][constructive_lns] bridge_expansion_mode={bridge_expansion_mode}")
         print(f"[APS][constructive_lns] allow_virtual_bridge_edge_in_constructive={allow_virtual_bridge}")
         print(f"[APS][constructive_lns] allow_real_bridge_edge_in_constructive={allow_real_bridge}")
@@ -1282,9 +1329,11 @@ def solve_master_model(
         if constructive_edge_policy == "direct_only":
             print(f"[APS][constructive_lns] Route C (baseline): only DIRECT_EDGE is allowed")
         elif constructive_edge_policy == "direct_plus_real_bridge":
-            print(f"[APS][constructive_lns] Route RB (mainline): DIRECT_EDGE + REAL_BRIDGE_EDGE allowed, VIRTUAL_BRIDGE_EDGE blocked, bridge_expansion_mode={bridge_expansion_mode}")
+            print(
+                f"[APS][constructive_lns] Route RB (mainline): DIRECT_EDGE + REAL_BRIDGE_EDGE allowed, VIRTUAL_BRIDGE_EDGE blocked, bridge_expansion_mode={bridge_expansion_mode}")
         else:
-            print(f"[APS][constructive_lns] edge_policy={constructive_edge_policy}, bridge_expansion_mode={bridge_expansion_mode}")
+            print(
+                f"[APS][constructive_lns] edge_policy={constructive_edge_policy}, bridge_expansion_mode={bridge_expansion_mode}")
         health = _assess_template_graph_health(current_transition_pack, current_cfg)
         precheck_autorelax_applied = False
         if health.get("template_graph_health") in {"SPARSE", "DISCONNECTED"}:
@@ -1318,11 +1367,11 @@ def solve_master_model(
         # =====================================================================
         lns_t0 = perf_counter()
         lns_result = run_constructive_lns_master(
-                orders_df=orders_df,
-                transition_pack=current_transition_pack,
-                cfg=current_cfg,
-                random_seed=int(current_cfg.model.rounds or 42),
-            )
+            orders_df=orders_df,
+            transition_pack=current_transition_pack,
+            cfg=current_cfg,
+            random_seed=int(current_cfg.model.rounds or 42),
+        )
         lns_elapsed = perf_counter() - lns_t0
         # Build engine_meta in joint_master style for compatibility
         lns_engine_meta = _build_meta(
@@ -1398,8 +1447,10 @@ def solve_master_model(
             optimize_phase_improved_solution=False,
             official_solution_source="CONSTRUCTIVE_LNS",
             candidate_has_drop=(not lns_result.dropped_df.empty) if lns_result.dropped_df is not None else False,
-            candidate_drop_count=int(lns_result.dropped_df.shape[0]) if lns_result.dropped_df is not None and not lns_result.dropped_df.empty else 0,
-            candidate_drop_tons=float(lns_result.dropped_df["tons"].sum()) if lns_result.dropped_df is not None and not lns_result.dropped_df.empty and "tons" in lns_result.dropped_df.columns else 0.0,
+            candidate_drop_count=int(lns_result.dropped_df.shape[
+                                         0]) if lns_result.dropped_df is not None and not lns_result.dropped_df.empty else 0,
+            candidate_drop_tons=float(lns_result.dropped_df[
+                                          "tons"].sum()) if lns_result.dropped_df is not None and not lns_result.dropped_df.empty and "tons" in lns_result.dropped_df.columns else 0.0,
             candidate_routing_feasible=(lns_result.status in {
                 "OPTIMAL", "FEASIBLE", "IMPROVED", "INITIAL_FEASIBLE"}),
             candidate_validation_pending=True,
@@ -1545,7 +1596,8 @@ def solve_master_model(
                     consecutive_routing_infeasible += 1
                 else:
                     consecutive_routing_infeasible = 0
-                if consecutive_routing_infeasible >= 2 and health.get("template_graph_health") in {"SPARSE", "DISCONNECTED"}:
+                if consecutive_routing_infeasible >= 2 and health.get("template_graph_health") in {"SPARSE",
+                                                                                                   "DISCONNECTED"}:
                     if _semantic_fallback_enabled(current_cfg):
                         early_stop_deferred_for_semantic_fallback = True
                         print(
@@ -1561,12 +1613,12 @@ def solve_master_model(
                         break
                     continue
                 key = (
-                    int(joint.get("unassigned_count", 10**9)),
-                    int(joint.get("low_slot_count", 10**9)),
-                    int(joint.get("ultra_low_slot_count", 10**9)),
-                    int(joint.get("global_ratio_over", 10**9)),
-                    int(joint.get("total_virtual_blocks", 10**9)),
-                    float(joint.get("objective", 10**18)),
+                    int(joint.get("unassigned_count", 10 ** 9)),
+                    int(joint.get("low_slot_count", 10 ** 9)),
+                    int(joint.get("ultra_low_slot_count", 10 ** 9)),
+                    int(joint.get("global_ratio_over", 10 ** 9)),
+                    int(joint.get("total_virtual_blocks", 10 ** 9)),
+                    float(joint.get("objective", 10 ** 18)),
                 )
                 if best_key is None or key < best_key:
                     best_key = key
@@ -1604,7 +1656,8 @@ def solve_master_model(
                         "actual_reverse_rise": int(best_joint.get("logical_reverse_total_rise", 0)),
                         "slot_route_risk_score": int(best_joint.get("slot_route_risk_score", 0)),
                     },
-                    strict_template_edges_enabled=bool(best_joint.get("strict_template_edges_enabled", current_cfg.model.strict_template_edges)),
+                    strict_template_edges_enabled=bool(
+                        best_joint.get("strict_template_edges_enabled", current_cfg.model.strict_template_edges)),
                     unroutable_slot_count=int(best_joint.get("unroutable_slot_count", 0)),
                     slot_route_details=list(best_joint.get("slot_route_details", [])),
                     template_graph_health=str(health.get("template_graph_health", "UNKNOWN")),
@@ -1614,7 +1667,8 @@ def solve_master_model(
                     early_stop_reason=early_stop_reason,
                     early_stop_deferred_for_semantic_fallback=early_stop_deferred_for_semantic_fallback,
                     semantic_fallback_first_attempt_status=semantic_fallback_first_attempt_status,
-                    assignment_pressure_mode="relaxed" if "relaxed" in str(current_cfg.model.profile_name) else "normal",
+                    assignment_pressure_mode="relaxed" if "relaxed" in str(
+                        current_cfg.model.profile_name) else "normal",
                     effective_config=current_cfg,
                     template_build_seconds=template_build_seconds,
                     joint_master_seconds=joint_master_seconds,
@@ -1637,7 +1691,8 @@ def solve_master_model(
                     # Intermediate fields - FINAL acceptance by pipeline
                     candidate_has_drop=bool(not dropped_df.empty),
                     candidate_drop_count=int(len(dropped_df)),
-                    candidate_drop_tons=float(dropped_df["tons"].sum()) if "tons" in dropped_df.columns and not dropped_df.empty else 0.0,
+                    candidate_drop_tons=float(
+                        dropped_df["tons"].sum()) if "tons" in dropped_df.columns and not dropped_df.empty else 0.0,
                     candidate_routing_feasible=True,
                     candidate_validation_pending=True,
                     candidate_phase="feasibility",
@@ -1647,11 +1702,24 @@ def solve_master_model(
                     feasibility_phase_found_solution=feasibility_phase_found_solution,
                     official_solution_source="FEASIBILITY_PHASE",  # Pipeline sets final source after validation
                     # Drop reason statistics
-                    drop_due_to_ton_window_count=int(len(dropped_df[dropped_df["dominant_drop_reason"].str.contains("TON_WINDOW", na=False)])) if not dropped_df.empty and "dominant_drop_reason" in dropped_df.columns else 0,
-                    drop_due_to_global_isolation_count=int(len(dropped_df[dropped_df["dominant_drop_reason"].str.contains("GLOBAL_ISOLATED", na=False)])) if not dropped_df.empty and "dominant_drop_reason" in dropped_df.columns else 0,
-                    drop_due_to_no_feasible_line_count=int(len(dropped_df[dropped_df["dominant_drop_reason"].str.contains("NO_FEASIBLE_LINE", na=False)])) if not dropped_df.empty and "dominant_drop_reason" in dropped_df.columns else 0,
-                    drop_due_to_routing_risk_count=int(len(dropped_df[dropped_df["dominant_drop_reason"].str.contains("ROUTING_RISK|LOCAL_ROUTER", na=False)])) if not dropped_df.empty and "dominant_drop_reason" in dropped_df.columns else 0,
-                    drop_due_to_master_unassigned_count=int(len(dropped_df[dropped_df["dominant_drop_reason"].str.contains("MASTER_UNASSIGNED", na=False)])) if not dropped_df.empty and "dominant_drop_reason" in dropped_df.columns else 0,
+                    drop_due_to_ton_window_count=int(len(dropped_df[dropped_df["dominant_drop_reason"].str.contains(
+                        "TON_WINDOW",
+                        na=False)])) if not dropped_df.empty and "dominant_drop_reason" in dropped_df.columns else 0,
+                    drop_due_to_global_isolation_count=int(len(dropped_df[
+                                                                   dropped_df["dominant_drop_reason"].str.contains(
+                                                                       "GLOBAL_ISOLATED",
+                                                                       na=False)])) if not dropped_df.empty and "dominant_drop_reason" in dropped_df.columns else 0,
+                    drop_due_to_no_feasible_line_count=int(len(dropped_df[
+                                                                   dropped_df["dominant_drop_reason"].str.contains(
+                                                                       "NO_FEASIBLE_LINE",
+                                                                       na=False)])) if not dropped_df.empty and "dominant_drop_reason" in dropped_df.columns else 0,
+                    drop_due_to_routing_risk_count=int(len(dropped_df[dropped_df["dominant_drop_reason"].str.contains(
+                        "ROUTING_RISK|LOCAL_ROUTER",
+                        na=False)])) if not dropped_df.empty and "dominant_drop_reason" in dropped_df.columns else 0,
+                    drop_due_to_master_unassigned_count=int(len(dropped_df[
+                                                                    dropped_df["dominant_drop_reason"].str.contains(
+                                                                        "MASTER_UNASSIGNED",
+                                                                        na=False)])) if not dropped_df.empty and "dominant_drop_reason" in dropped_df.columns else 0,
                 )
 
         structure_keep_df = None
@@ -1666,7 +1734,8 @@ def solve_master_model(
                 drop_stage = "STRUCTURE_FALLBACK"
                 dropped_candidates_selected = int(len(candidate_df))
                 drop_budget_used = int(len(candidate_df))
-                drop_budget_remaining = max(0, int(getattr(current_cfg.model, "max_drop_count_for_partial", 0) or 0) - drop_budget_used)
+                drop_budget_remaining = max(0, int(getattr(current_cfg.model, "max_drop_count_for_partial",
+                                                           0) or 0) - drop_budget_used)
                 dominant_drop_reason_histogram = (
                     candidate_df["drop_reason"].fillna("OTHER").value_counts().to_dict()
                     if "drop_reason" in candidate_df.columns else {}
@@ -1688,10 +1757,12 @@ def solve_master_model(
                 bad_slots_before_restructure = _summarize_bad_slots(joint.get("slot_route_details", []))
                 restructured_slot_count = int(len(bad_slots_before_restructure))
                 keep_ids = set(str(v) for v in candidate_df["order_id"].tolist())
-                structure_keep_df = orders_df[~orders_df["order_id"].astype(str).isin(keep_ids)].copy().reset_index(drop=True)
+                structure_keep_df = orders_df[~orders_df["order_id"].astype(str).isin(keep_ids)].copy().reset_index(
+                    drop=True)
                 structure_drop_df = candidate_df.copy().reset_index(drop=True)
                 drop_budget_after_fallback = int(len(candidate_df))
-                structure_cfg = _structure_fallback_config(current_cfg, feasibility_evidence, bad_slots_before_restructure)
+                structure_cfg = _structure_fallback_config(current_cfg, feasibility_evidence,
+                                                           bad_slots_before_restructure)
                 slot_count_after_fallback = int(structure_cfg.model.max_campaign_slots)
                 fallback_mode = "STRUCTURE_FIRST"
                 orders_removed_from_bad_slots = (
@@ -1699,18 +1770,18 @@ def solve_master_model(
                         [
                             c
                             for c in [
-                                "order_id",
-                                "drop_reason",
-                                "secondary_reasons",
-                                "source_bad_slot_line",
-                                "source_bad_slot_no",
-                                "source_bad_slot_order_count",
-                                "source_bad_slot_over_cap",
-                                "source_bad_slot_risk",
-                                "source_bad_slot_reason",
-                                "risk_summary",
-                                "would_break_slot_if_kept",
-                            ]
+                            "order_id",
+                            "drop_reason",
+                            "secondary_reasons",
+                            "source_bad_slot_line",
+                            "source_bad_slot_no",
+                            "source_bad_slot_order_count",
+                            "source_bad_slot_over_cap",
+                            "source_bad_slot_risk",
+                            "source_bad_slot_reason",
+                            "risk_summary",
+                            "would_break_slot_if_kept",
+                        ]
                             if c in candidate_df.columns
                         ]
                     ].assign(stage="STRUCTURE_FALLBACK").to_dict("records")
@@ -1780,7 +1851,8 @@ def solve_master_model(
                     else:
                         if _candidate_better(best_partial_candidate, cand, mode="official"):
                             best_partial_candidate = cand
-                fallback_trace.append({"mode": "STRUCTURE_FIRST_RESULT", "status": str(structure_joint.get("status", "UNKNOWN"))})
+                fallback_trace.append(
+                    {"mode": "STRUCTURE_FIRST_RESULT", "status": str(structure_joint.get("status", "UNKNOWN"))})
                 bad_slots_after_restructure = _summarize_bad_slots(structure_joint.get("slot_route_details", []))
                 fallback_trace.append(
                     {
@@ -1810,12 +1882,14 @@ def solve_master_model(
                             joint_estimates={
                                 "estimated_virtual_blocks": int(structure_joint.get("estimated_virtual_blocks", 0)),
                                 "estimated_virtual_ton10": int(structure_joint.get("estimated_virtual_ton10", 0)),
-                                "estimated_global_ratio_over": int(structure_joint.get("estimated_global_ratio_over", 0)),
+                                "estimated_global_ratio_over": int(
+                                    structure_joint.get("estimated_global_ratio_over", 0)),
                                 "estimated_reverse_count": int(structure_joint.get("estimated_reverse_count", 0)),
                                 "estimated_reverse_rise": int(structure_joint.get("estimated_reverse_rise", 0)),
                                 "slot_route_risk_score": int(structure_joint.get("slot_route_risk_score", 0)),
                             },
-                            strict_template_edges_enabled=bool(structure_joint.get("strict_template_edges_enabled", structure_cfg.model.strict_template_edges)),
+                            strict_template_edges_enabled=bool(structure_joint.get("strict_template_edges_enabled",
+                                                                                   structure_cfg.model.strict_template_edges)),
                             unroutable_slot_count=int(structure_joint.get("unroutable_slot_count", 0)),
                             slot_route_details=list(structure_joint.get("slot_route_details", [])),
                             template_graph_health=str(health.get("template_graph_health", "UNKNOWN")),
@@ -1856,7 +1930,8 @@ def solve_master_model(
                             # Intermediate fields - FINAL acceptance by pipeline
                             candidate_has_drop=bool(not dropped_df.empty),
                             candidate_drop_count=int(len(dropped_df)),
-                            candidate_drop_tons=float(dropped_df["tons"].sum()) if "tons" in dropped_df.columns and not dropped_df.empty else 0.0,
+                            candidate_drop_tons=float(dropped_df[
+                                                          "tons"].sum()) if "tons" in dropped_df.columns and not dropped_df.empty else 0.0,
                             candidate_routing_feasible=True,
                             candidate_validation_pending=True,
                             candidate_phase="feasibility",
@@ -1876,7 +1951,8 @@ def solve_master_model(
                             best_candidate_objective=float(structure_joint.get("objective", 0.0) or 0.0),
                             best_candidate_search_status=str(structure_joint.get("status", "")),
                             best_candidate_routing_feasible=True,
-                            best_candidate_unroutable_slot_count=int(structure_joint.get("unroutable_slot_count", 0) or 0),
+                            best_candidate_unroutable_slot_count=int(
+                                structure_joint.get("unroutable_slot_count", 0) or 0),
                         )
 
         if _semantic_fallback_enabled(current_cfg) or _scale_down_fallback_enabled(current_cfg):
@@ -1884,10 +1960,13 @@ def solve_master_model(
                 s in ("TIMEOUT_NO_FEASIBLE", "INFEASIBLE", "ROUTING_INFEASIBLE") for s in status_hist
             )
             if (timeout_or_infeasible or early_stop_deferred_for_semantic_fallback) and not early_stop_reason:
-                working_orders_df = structure_keep_df if isinstance(structure_keep_df, pd.DataFrame) and not structure_keep_df.empty else orders_df
-                carried_drop_df = structure_drop_df if isinstance(structure_drop_df, pd.DataFrame) and not structure_drop_df.empty else pd.DataFrame()
+                working_orders_df = structure_keep_df if isinstance(structure_keep_df,
+                                                                    pd.DataFrame) and not structure_keep_df.empty else orders_df
+                carried_drop_df = structure_drop_df if isinstance(structure_drop_df,
+                                                                  pd.DataFrame) and not structure_drop_df.empty else pd.DataFrame()
                 working_cfg = structure_cfg if structure_fallback_applied else current_cfg
-                fallback_cfgs = _semantic_fallback_configs(working_cfg) if _semantic_fallback_enabled(working_cfg) else []
+                fallback_cfgs = _semantic_fallback_configs(working_cfg) if _semantic_fallback_enabled(
+                    working_cfg) else []
                 retry = attempts[0] if attempts else {"start_penalty": 90000, "time_scale": 0.45}
                 retry_seed = seeds[0] if seeds else 2027
                 for fidx, fcfg in enumerate(fallback_cfgs, start=1):
@@ -1909,7 +1988,8 @@ def solve_master_model(
                     # Two-phase solving: phase is controlled by pipeline gate, not internal heuristic
                     # master.py always runs feasibility unless pipeline explicitly sets phase_mode="optimize_only"
                     actual_phase = "optimize" if phase_mode == "optimize_only" else "feasibility"
-                    print(f"[APS][two_phase] semantic_fallback #{fidx}: phase_mode={phase_mode}, actual_phase={actual_phase}")
+                    print(
+                        f"[APS][two_phase] semantic_fallback #{fidx}: phase_mode={phase_mode}, actual_phase={actual_phase}")
                     fallback_t0 = perf_counter()
                     joint = _run_global_joint_model(
                         working_orders_df,
@@ -1948,8 +2028,8 @@ def solve_master_model(
                             f"early_stop_deferred_for_semantic_fallback={early_stop_deferred_for_semantic_fallback}"
                         )
                         if (
-                            str(current_cfg.model.profile_name) == "feasibility_fast_slot_safe"
-                            and semantic_fallback_first_attempt_status == "ROUTING_INFEASIBLE"
+                                str(current_cfg.model.profile_name) == "feasibility_fast_slot_safe"
+                                and semantic_fallback_first_attempt_status == "ROUTING_INFEASIBLE"
                         ):
                             early_stop_reason = "fast_slot_safe_first_semantic_fallback_routing_infeasible"
                             break
@@ -1996,7 +2076,8 @@ def solve_master_model(
                             "slot_route_risk_score": int(joint.get("slot_route_risk_score", 0)),
                             "hard_cap_not_enforced": bool(joint.get("hard_cap_not_enforced", False)),
                         },
-                        strict_template_edges_enabled=bool(joint.get("strict_template_edges_enabled", fcfg.model.strict_template_edges)),
+                        strict_template_edges_enabled=bool(
+                            joint.get("strict_template_edges_enabled", fcfg.model.strict_template_edges)),
                         unroutable_slot_count=int(joint.get("unroutable_slot_count", 0)),
                         slot_route_details=list(joint.get("slot_route_details", [])),
                         template_graph_health=str(health.get("template_graph_health", "UNKNOWN")),
@@ -2015,47 +2096,48 @@ def solve_master_model(
                         feasibility_evidence=feasibility_evidence,
                         failure_mode="",
                         evidence_level=evidence_level,
-                            top_infeasibility_signals=top_infeasibility_signals,
-                            drop_strategy_applied=drop_strategy_applied,
-                            drop_stage=drop_stage,
-                            drop_budget_used=drop_budget_used,
-                            drop_budget_remaining=drop_budget_remaining,
-                            dropped_candidates_considered=dropped_candidates_considered,
-                            dropped_candidates_selected=dropped_candidates_selected,
-                            dominant_drop_reason_histogram=dominant_drop_reason_histogram,
-                            structure_fallback_applied=structure_fallback_applied,
-                            fallback_mode=fallback_mode,
-                            structure_first_applied=structure_first_applied,
-                            time_expansion_applied=time_expansion_applied,
-                            slot_count_before_fallback=slot_count_before_fallback,
-                            slot_count_after_fallback=slot_count_after_fallback,
-                            drop_budget_after_fallback=drop_budget_after_fallback,
-                            restructured_slot_count=restructured_slot_count,
-                            bad_slots_before_restructure=bad_slots_before_restructure,
-                            bad_slots_after_restructure=bad_slots_after_restructure,
-                            orders_removed_from_bad_slots=orders_removed_from_bad_slots,
-                            # Intermediate fields - FINAL acceptance by pipeline
-                            candidate_has_drop=bool(not dropped_df.empty),
-                            candidate_drop_count=int(len(dropped_df)),
-                            candidate_drop_tons=float(dropped_df["tons"].sum()) if "tons" in dropped_df.columns and not dropped_df.empty else 0.0,
-                            candidate_routing_feasible=True,
-                            candidate_validation_pending=True,
-                            candidate_phase=use_phase,
-                            candidate_reason=f"SEMANTIC_FALLBACK_{actual_phase.upper()}",
-                            # Two-phase tracking
-                            feasibility_phase_executed=True,
-                            feasibility_phase_found_solution=False,  # Set by pipeline after validation
-                            optimize_phase_executed=(phase_mode == "optimize_only"),
-                            official_solution_source="FEASIBILITY_PHASE" if phase_mode == "feasibility_only" else "OPTIMIZE_PHASE",
-                            # Drop reason statistics
-                            drop_due_to_ton_window_count=drop_due_to_ton_window_count,
-                            drop_due_to_global_isolation_count=drop_due_to_global_isolation_count,
-                            drop_due_to_no_feasible_line_count=drop_due_to_no_feasible_line_count,
-                            drop_due_to_routing_risk_count=drop_due_to_routing_risk_count,
-                            drop_due_to_master_unassigned_count=drop_due_to_master_unassigned_count,
-                            best_candidate_available=True,
-                            best_candidate_type="",  # Set by pipeline after validation
-                            best_candidate_objective=float(joint.get("objective", 0.0) or 0.0),
+                        top_infeasibility_signals=top_infeasibility_signals,
+                        drop_strategy_applied=drop_strategy_applied,
+                        drop_stage=drop_stage,
+                        drop_budget_used=drop_budget_used,
+                        drop_budget_remaining=drop_budget_remaining,
+                        dropped_candidates_considered=dropped_candidates_considered,
+                        dropped_candidates_selected=dropped_candidates_selected,
+                        dominant_drop_reason_histogram=dominant_drop_reason_histogram,
+                        structure_fallback_applied=structure_fallback_applied,
+                        fallback_mode=fallback_mode,
+                        structure_first_applied=structure_first_applied,
+                        time_expansion_applied=time_expansion_applied,
+                        slot_count_before_fallback=slot_count_before_fallback,
+                        slot_count_after_fallback=slot_count_after_fallback,
+                        drop_budget_after_fallback=drop_budget_after_fallback,
+                        restructured_slot_count=restructured_slot_count,
+                        bad_slots_before_restructure=bad_slots_before_restructure,
+                        bad_slots_after_restructure=bad_slots_after_restructure,
+                        orders_removed_from_bad_slots=orders_removed_from_bad_slots,
+                        # Intermediate fields - FINAL acceptance by pipeline
+                        candidate_has_drop=bool(not dropped_df.empty),
+                        candidate_drop_count=int(len(dropped_df)),
+                        candidate_drop_tons=float(
+                            dropped_df["tons"].sum()) if "tons" in dropped_df.columns and not dropped_df.empty else 0.0,
+                        candidate_routing_feasible=True,
+                        candidate_validation_pending=True,
+                        candidate_phase=use_phase,
+                        candidate_reason=f"SEMANTIC_FALLBACK_{actual_phase.upper()}",
+                        # Two-phase tracking
+                        feasibility_phase_executed=True,
+                        feasibility_phase_found_solution=False,  # Set by pipeline after validation
+                        optimize_phase_executed=(phase_mode == "optimize_only"),
+                        official_solution_source="FEASIBILITY_PHASE" if phase_mode == "feasibility_only" else "OPTIMIZE_PHASE",
+                        # Drop reason statistics
+                        drop_due_to_ton_window_count=drop_due_to_ton_window_count,
+                        drop_due_to_global_isolation_count=drop_due_to_global_isolation_count,
+                        drop_due_to_no_feasible_line_count=drop_due_to_no_feasible_line_count,
+                        drop_due_to_routing_risk_count=drop_due_to_routing_risk_count,
+                        drop_due_to_master_unassigned_count=drop_due_to_master_unassigned_count,
+                        best_candidate_available=True,
+                        best_candidate_type="",  # Set by pipeline after validation
+                        best_candidate_objective=float(joint.get("objective", 0.0) or 0.0),
                         best_candidate_search_status=str(joint.get("status", "")),
                         best_candidate_routing_feasible=True,
                         best_candidate_unroutable_slot_count=int(joint.get("unroutable_slot_count", 0) or 0),
@@ -2068,7 +2150,8 @@ def solve_master_model(
                             continue
                         fallback_attempt_count += 1
                         print(f"[APS][semantic_fallback] scale-down keep={n_keep}")
-                        od = working_orders_df.copy().sort_values(["due_rank", "priority", "tons"], ascending=[True, False, False], kind="mergesort")
+                        od = working_orders_df.copy().sort_values(["due_rank", "priority", "tons"],
+                                                                  ascending=[True, False, False], kind="mergesort")
                         keep_df = od.head(n_keep).copy().reset_index(drop=True)
                         drop_df = od.iloc[n_keep:].copy().reset_index(drop=True)
                         drop_df["drop_reason"] = "FALLBACK_SCALE_UNSCHEDULED"
@@ -2144,7 +2227,8 @@ def solve_master_model(
                                 "slot_route_risk_score": int(scale_joint.get("slot_route_risk_score", 0)),
                                 "hard_cap_not_enforced": bool(scale_joint.get("hard_cap_not_enforced", False)),
                             },
-                            strict_template_edges_enabled=bool(scale_joint.get("strict_template_edges_enabled", scale_cfg.model.strict_template_edges)),
+                            strict_template_edges_enabled=bool(scale_joint.get("strict_template_edges_enabled",
+                                                                               scale_cfg.model.strict_template_edges)),
                             unroutable_slot_count=int(scale_joint.get("unroutable_slot_count", 0)),
                             slot_route_details=list(scale_joint.get("slot_route_details", [])),
                             template_graph_health=str(health.get("template_graph_health", "UNKNOWN")),
@@ -2154,7 +2238,8 @@ def solve_master_model(
                             early_stop_reason=early_stop_reason,
                             early_stop_deferred_for_semantic_fallback=early_stop_deferred_for_semantic_fallback,
                             semantic_fallback_first_attempt_status=semantic_fallback_first_attempt_status,
-                            assignment_pressure_mode="relaxed" if "relaxed" in str(scale_cfg.model.profile_name) else "normal",
+                            assignment_pressure_mode="relaxed" if "relaxed" in str(
+                                scale_cfg.model.profile_name) else "normal",
                             effective_config=scale_cfg,
                             template_build_seconds=template_build_seconds,
                             joint_master_seconds=joint_master_seconds,
@@ -2185,7 +2270,8 @@ def solve_master_model(
                             # Intermediate fields - FINAL acceptance by pipeline
                             candidate_has_drop=bool(not dropped_df.empty),
                             candidate_drop_count=int(len(dropped_df)),
-                            candidate_drop_tons=float(dropped_df["tons"].sum()) if "tons" in dropped_df.columns and not dropped_df.empty else 0.0,
+                            candidate_drop_tons=float(dropped_df[
+                                                          "tons"].sum()) if "tons" in dropped_df.columns and not dropped_df.empty else 0.0,
                             candidate_routing_feasible=True,
                             candidate_validation_pending=True,
                             candidate_phase=actual_phase,
@@ -2287,7 +2373,8 @@ def solve_master_model(
                     "big_roll_order_cap_violations": int(joint.get("big_roll_order_cap_violations", 0)),
                     "avg_slot_order_count": float(joint.get("avg_slot_order_count", 0.0)),
                 },
-                strict_template_edges_enabled=bool(joint.get("strict_template_edges_enabled", current_cfg.model.strict_template_edges)),
+                strict_template_edges_enabled=bool(
+                    joint.get("strict_template_edges_enabled", current_cfg.model.strict_template_edges)),
                 unroutable_slot_count=int(joint.get("unroutable_slot_count", 0)),
                 slot_route_details=list(joint.get("slot_route_details", [])),
                 template_graph_health=str(health.get("template_graph_health", "UNKNOWN")),
@@ -2326,10 +2413,12 @@ def solve_master_model(
                 bad_slots_after_restructure=bad_slots_after_restructure,
                 orders_removed_from_bad_slots=orders_removed_from_bad_slots,
                 # Intermediate fields - FINAL acceptance by pipeline
-                candidate_has_drop=bool(best_candidate is not None and best_candidate.get("dropped_order_count", 0) > 0) if best_candidate else False,
+                candidate_has_drop=bool(best_candidate is not None and best_candidate.get("dropped_order_count",
+                                                                                          0) > 0) if best_candidate else False,
                 candidate_drop_count=int(best_candidate.get("dropped_order_count", 0)) if best_candidate else 0,
                 candidate_drop_tons=0.0,  # Not calculated for failed runs
-                candidate_routing_feasible=bool(best_candidate.get("routing_feasible", False)) if best_candidate else False,
+                candidate_routing_feasible=bool(
+                    best_candidate.get("routing_feasible", False)) if best_candidate else False,
                 candidate_validation_pending=True,
                 candidate_phase="",
                 candidate_reason="NO_FEASIBLE_SOLUTION",
@@ -2348,15 +2437,18 @@ def solve_master_model(
                 best_candidate_type="",  # Set by pipeline after validation
                 best_candidate_objective=float(best_candidate.get("objective", 0.0) or 0.0) if best_candidate else 0.0,
                 best_candidate_search_status=str(best_candidate.get("search_status", "")) if best_candidate else "",
-                best_candidate_routing_feasible=bool(best_candidate.get("routing_feasible", False)) if best_candidate else False,
-                best_candidate_unroutable_slot_count=int(best_candidate.get("unroutable_slot_count", 0) or 0) if best_candidate else 0,
+                best_candidate_routing_feasible=bool(
+                    best_candidate.get("routing_feasible", False)) if best_candidate else False,
+                best_candidate_unroutable_slot_count=int(
+                    best_candidate.get("unroutable_slot_count", 0) or 0) if best_candidate else 0,
             )
             meta["routing_feasible"] = False
             meta["routing_status"] = "ROUTING_INFEASIBLE"
             meta["template_pair_ok"] = False
             meta["adjacency_rule_ok"] = False
             meta["bridge_expand_ok"] = False
-            meta["result_acceptance_status"] = "BEST_SEARCH_CANDIDATE_ANALYSIS" if best_candidate is not None else failure_mode
+            meta[
+                "result_acceptance_status"] = "BEST_SEARCH_CANDIDATE_ANALYSIS" if best_candidate is not None else failure_mode
             meta["export_failed_result_for_debug"] = bool(current_cfg.model.export_failed_result_for_debug)
             meta["export_best_candidate_analysis"] = bool(current_cfg.model.export_best_candidate_analysis)
             meta["final_export_performed"] = False
@@ -2377,8 +2469,10 @@ def solve_master_model(
                         subset=["order_id"], keep="first"
                     ) if "order_id" in frames[0].columns else pd.concat(frames, ignore_index=True)
                 meta["best_candidate_joint"] = cand_joint if isinstance(cand_joint, dict) else {}
-                meta["best_candidate_source_orders_df"] = cand_source_orders.copy() if isinstance(cand_source_orders, pd.DataFrame) else pd.DataFrame()
-                meta["best_candidate_extra_dropped_df"] = cand_extra_drop.copy() if isinstance(cand_extra_drop, pd.DataFrame) else pd.DataFrame()
+                meta["best_candidate_source_orders_df"] = cand_source_orders.copy() if isinstance(cand_source_orders,
+                                                                                                  pd.DataFrame) else pd.DataFrame()
+                meta["best_candidate_extra_dropped_df"] = cand_extra_drop.copy() if isinstance(cand_extra_drop,
+                                                                                               pd.DataFrame) else pd.DataFrame()
             return pd.DataFrame(), pd.DataFrame(), failed_drop_df, meta
         print(f"[APS][legacy_fallback] diagnostics={diagnostics}")
         print("[APS][FALLBACK] type=legacy_fallback, reason=joint_and_semantic_failed")
@@ -2423,7 +2517,6 @@ def solve_master_model(
             evidence_level=evidence_level,
             top_infeasibility_signals=top_infeasibility_signals,
         )
-
 
     print("[APS][FALLBACK] type=legacy_fallback, reason=no_preprocessed_orders")
     final_df, rounds_df = run_legacy_schedule(

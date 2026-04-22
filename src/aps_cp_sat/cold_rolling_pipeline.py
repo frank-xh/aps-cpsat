@@ -16,7 +16,12 @@ from aps_cp_sat.preprocess import prepare_orders_for_model
 from aps_cp_sat.rules import RULE_REGISTRY
 from aps_cp_sat.transition import build_transition_templates
 from aps_cp_sat.config.parameters import build_profile_config, normalize_enforced_profile_name
-from aps_cp_sat.validate import validate_model_equivalence, validate_solution_summary
+from aps_cp_sat.config.rule_config import RuleConfig
+from aps_cp_sat.validate import (
+    validate_model_equivalence,
+    validate_solution_summary,
+    recompute_final_schedule_summary,
+)
 from aps_cp_sat.validate.final_schedule_gate import evaluate_final_schedule_gate
 
 try:
@@ -390,6 +395,8 @@ class ColdRollingPipeline:
         details = (summary or {}).get("final_schedule_audit_details", {}) if isinstance(summary, dict) else {}
         audit_summary = (summary or {}).get("final_schedule_audit_summary", {}) if isinstance(summary, dict) else {}
         rows: list[dict] = []
+        precomputed_fill_rows = engine_meta.get("shadow_virtual_fill_rows", []) if isinstance(engine_meta, dict) else []
+        precomputed_bridge_rows = engine_meta.get("shadow_virtual_bridge_events", []) if isinstance(engine_meta, dict) else []
         if not enabled:
             return rows, {
                 "virtual_enabled": bool(getattr(model_cfg, "virtual_enabled", False)),
@@ -403,6 +410,33 @@ class ColdRollingPipeline:
                 "shadow_virtual_possible_reduced_underfilled_campaigns": 0,
                 "shadow_virtual_possible_reduced_realization_rejections": 0,
                 "shadow_virtual_budget_needed_estimate": 0.0,
+            }
+
+        if isinstance(precomputed_fill_rows, list) and precomputed_fill_rows:
+            fill_rows = [dict(r) for r in precomputed_fill_rows if isinstance(r, dict)]
+            bridge_rows = [dict(r) for r in precomputed_bridge_rows if isinstance(r, dict)] if isinstance(precomputed_bridge_rows, list) else []
+            rows.extend(fill_rows)
+            rows.extend(bridge_rows)
+            fill_viable = sum(1 for r in fill_rows if bool(r.get("shadow_fill_viable", False)))
+            fill_needed_total = float(sum(float(r.get("shadow_fill_needed_tons", 0.0) or 0.0) for r in fill_rows))
+            return rows, {
+                "virtual_enabled": bool(getattr(model_cfg, "virtual_enabled", True)),
+                "virtual_shadow_mode_enabled": bool(getattr(model_cfg, "virtual_shadow_mode_enabled", True)),
+                "virtual_formal_enabled": formal,
+                "shadow_virtual_bridge_candidate_count": int(len(bridge_rows)),
+                "shadow_virtual_fill_candidate_count": int(len(fill_rows)),
+                "shadow_virtual_fill_viable_count": int(fill_viable),
+                "shadow_virtual_possible_reduced_underfilled_campaigns": int(fill_viable),
+                "shadow_virtual_possible_reduced_hard_violations": int(fill_viable),
+                "shadow_virtual_budget_needed_estimate": float(
+                    engine_meta.get("shadow_virtual_budget_needed_estimate", fill_needed_total) or fill_needed_total
+                ),
+                "shadow_virtual_fill_needed_tons_total": float(
+                    engine_meta.get("shadow_virtual_fill_needed_tons_total", fill_needed_total) or fill_needed_total
+                ),
+                "shadow_virtual_possible_reduced_drops": int(engine_meta.get("shadow_virtual_possible_reduced_drops", 0) or 0),
+                "shadow_virtual_possible_reduced_template_miss": int(engine_meta.get("shadow_virtual_possible_reduced_template_miss", 0) or 0),
+                "shadow_virtual_possible_reduced_realization_rejections": int(engine_meta.get("shadow_virtual_possible_reduced_realization_rejections", 0) or 0),
             }
 
         remaining_budget = max(0.0, budget_total)
@@ -551,6 +585,7 @@ class ColdRollingPipeline:
             dropped_df = pd.DataFrame()
         if rounds_df is None:
             rounds_df = pd.DataFrame()
+        final_schedule_summary = recompute_final_schedule_summary(schedule_df, cfg.rule if hasattr(cfg, "rule") else RuleConfig())
 
         if not schedule_df.empty and "is_virtual" in schedule_df.columns:
             scheduled_virtual = int(schedule_df["is_virtual"].fillna(False).astype(bool).sum())
@@ -615,9 +650,14 @@ class ColdRollingPipeline:
                 "scheduled_real_orders": scheduled_real,
                 "scheduled_virtual_orders": scheduled_virtual,
                 "dropped_count": dropped_count,
-                "campaign_count": int(
-                    em.get("campaign_count", cls._count_campaigns(schedule_df)) or cls._count_campaigns(schedule_df)),
-                "low_slots": int(em.get("low_slots", em.get("ultra_low_slot_count", 0)) or 0),
+                "campaign_count": int(final_schedule_summary.get("campaign_cnt", cls._count_campaigns(schedule_df)) or 0),
+                "campaign_cnt": int(final_schedule_summary.get("campaign_cnt", cls._count_campaigns(schedule_df)) or 0),
+                "underfilled_slot_count": int(final_schedule_summary.get("underfilled_slot_count", 0) or 0),
+                "campaign_ton_min_violation_count": int(final_schedule_summary.get("campaign_ton_min_violation_count", 0) or 0),
+                "campaign_ton_max_violation_count": int(final_schedule_summary.get("campaign_ton_max_violation_count", 0) or 0),
+                "final_realized_order_count": int(final_schedule_summary.get("final_realized_order_count", scheduled_real) or 0),
+                "final_realized_tons": float(final_schedule_summary.get("final_realized_tons", 0.0) or 0.0),
+                "low_slots": int(final_schedule_summary.get("campaign_ton_min_violation_count", em.get("low_slots", em.get("ultra_low_slot_count", 0))) or 0),
                 "tail_underfilled_count": int(
                     em.get(
                         "tail_underfilled_count",

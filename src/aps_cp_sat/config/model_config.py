@@ -241,11 +241,16 @@ class ModelConfig:
     mixed_bridge_allowed_forms: list[str] = field(default_factory=lambda: ["REAL_TO_GUARDED", "GUARDED_TO_REAL"])
     mixed_bridge_allowed_hotspots: list[str] = field(default_factory=lambda: ["underfill", "group_switch", "bridge_dependency", "width_tension"])
     mixed_bridge_max_attempts_per_block: int = 10
+    # ---- Segment viability bands (final campaign shaping) ----
+    near_viable_gap_tons: float = 80.0
+    merge_candidate_gap_tons: float = 250.0
     # ---- Virtual slab shadow/formal contract ----
     # Shadow mode estimates virtual bridge/fill benefits without writing virtual
     # rows into official schedules. Formal mode is intentionally off by default.
     virtual_enabled: bool = True
     virtual_shadow_mode_enabled: bool = True
+    virtual_shadow_fill_enabled: bool = True
+    virtual_shadow_bridge_enabled: bool = True
     virtual_formal_enabled: bool = False
     virtual_budget_total_tons: float = 500.0
     virtual_budget_per_campaign_tons: float = 80.0
@@ -254,8 +259,19 @@ class ModelConfig:
     virtual_penalty_per_piece: float = 1000.0
     virtual_penalty_per_ton: float = 20.0
     virtual_bridge_only_for_allowed_gaps: bool = True
+    virtual_formal_bridge_enabled: bool = False
+    shadow_bridge_max_gap_count: int = 1
+    shadow_bridge_max_virtual_count_per_gap: int = 5
+    shadow_bridge_max_total_virtual_tons_per_campaign: float = 100.0
+    shadow_bridge_same_line_only: bool = True
+    virtual_fill_unit_tons_assumption: float = 20.0
     virtual_allowed_lines: list[str] = field(default_factory=lambda: ["big_roll", "small_roll"])
     virtual_allowed_steel_groups: list[str] = field(default_factory=list)
+    # ---- Minimal formal virtual fill trial (tail-only, no bridge) ----
+    virtual_formal_fill_enabled: bool = False
+    virtual_formal_fill_max_gap_tons: float = 80.0
+    virtual_formal_fill_max_count_per_campaign: int = 3
+    virtual_formal_fill_tail_only: bool = True
     penalty_virtual_piece_count: float = 1000.0
     penalty_virtual_tons: float = 20.0
     penalty_virtual_bridge_segments: float = 500.0

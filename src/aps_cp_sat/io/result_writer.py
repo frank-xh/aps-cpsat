@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 """
 Export layer contract.
@@ -17,6 +17,7 @@ from openpyxl.utils import get_column_letter
 
 from aps_cp_sat.config.rule_config import RuleConfig
 from aps_cp_sat.rules import RULE_REGISTRY, RuleKey
+from aps_cp_sat.validate.solution_validator import recompute_final_schedule_summary
 
 
 EXPORT_RULE_KEYS = [
@@ -653,6 +654,15 @@ def export_schedule_results(
         computed_unroutable = int(len([r for r in raw_slots if str(r.get("status", "")) == "UNROUTABLE_SLOT"]))
         if computed_unroutable > 0 and unroutable_slot_count <= 0:
             unroutable_slot_count = computed_unroutable
+    final_schedule_summary = recompute_final_schedule_summary(final_df, rule)
+    if isinstance(em, dict):
+        em["campaign_cnt"] = int(final_schedule_summary.get("campaign_cnt", 0) or 0)
+        em["campaign_count"] = int(final_schedule_summary.get("campaign_cnt", 0) or 0)
+        em["underfilled_slot_count"] = int(final_schedule_summary.get("underfilled_slot_count", 0) or 0)
+        em["campaign_ton_min_violation_count"] = int(final_schedule_summary.get("campaign_ton_min_violation_count", 0) or 0)
+        em["campaign_ton_max_violation_count"] = int(final_schedule_summary.get("campaign_ton_max_violation_count", 0) or 0)
+        em["final_realized_order_count"] = int(final_schedule_summary.get("final_realized_order_count", 0) or 0)
+        em["final_realized_tons"] = float(final_schedule_summary.get("final_realized_tons", 0.0) or 0.0)
 
     summary_df = pd.DataFrame(
         [
@@ -716,6 +726,12 @@ def export_schedule_results(
     if isinstance(joint_estimates, dict):
         for k, v in joint_estimates.items():
             summary_df.loc[len(summary_df)] = (f"主模型估计.{k}", v)
+    summary_df.loc[len(summary_df)] = ("final_schedule.campaign_cnt", int(final_schedule_summary.get("campaign_cnt", 0) or 0))
+    summary_df.loc[len(summary_df)] = ("final_schedule.underfilled_slot_count", int(final_schedule_summary.get("underfilled_slot_count", 0) or 0))
+    summary_df.loc[len(summary_df)] = ("final_schedule.campaign_ton_min_violation_count", int(final_schedule_summary.get("campaign_ton_min_violation_count", 0) or 0))
+    summary_df.loc[len(summary_df)] = ("final_schedule.campaign_ton_max_violation_count", int(final_schedule_summary.get("campaign_ton_max_violation_count", 0) or 0))
+    summary_df.loc[len(summary_df)] = ("final_schedule.final_realized_order_count", int(final_schedule_summary.get("final_realized_order_count", 0) or 0))
+    summary_df.loc[len(summary_df)] = ("final_schedule.final_realized_tons", round(float(final_schedule_summary.get("final_realized_tons", 0.0) or 0.0), 3))
 
     # -------------------------------------------------------------------------
     # Constructive LNS path: add solver-specific diagnostics to summary
@@ -1794,6 +1810,8 @@ def export_schedule_results(
     if not final_df.empty:
         for _, row in final_df.iterrows():
             is_virtual = bool(row.get("is_virtual", False))
+            bridge_count_val = pd.to_numeric(row.get("bridge_count", 0), errors="coerce")
+            bridge_count_safe = 0 if pd.isna(bridge_count_val) else int(bridge_count_val)
             detail_rows.append(
                 {
                     "order_id": row.get("order_id", ""),
@@ -1804,7 +1822,7 @@ def export_schedule_results(
                     "candidate_lines": "",
                     "risk_summary": "",
                     "selected_edge_type": row.get("selected_edge_type", ""),
-                    "bridge_count": int(row.get("bridge_count", 0) or 0),
+                    "bridge_count": bridge_count_safe,
                     "bridge_type": row.get("selected_edge_type", ""),
                     "virtual_widths_used": row.get("width", "") if is_virtual else "",
                     "virtual_thicknesses_used": row.get("thickness", "") if is_virtual else "",
@@ -1850,6 +1868,376 @@ def export_schedule_results(
         candidate_big_roll_out = candidate_schedule_df[candidate_schedule_df.get("line", pd.Series(dtype=str)) == "big_roll"].copy() if not candidate_schedule_df.empty else pd.DataFrame()
     if candidate_small_roll_out.empty:
         candidate_small_roll_out = candidate_schedule_df[candidate_schedule_df.get("line", pd.Series(dtype=str)) == "small_roll"].copy() if not candidate_schedule_df.empty else pd.DataFrame()
+
+    shadow_virtual_rows = []
+    if isinstance(em.get("shadow_virtual_analysis_rows"), list):
+        shadow_virtual_rows = [dict(r) for r in em.get("shadow_virtual_analysis_rows", []) if isinstance(r, dict)]
+    elif isinstance(em.get("shadow_virtual_fill_rows"), list):
+        shadow_virtual_rows = [dict(r) for r in em.get("shadow_virtual_fill_rows", []) if isinstance(r, dict)]
+    elif isinstance(validation_summary, dict) and isinstance(validation_summary.get("shadow_virtual_fill_rows"), list):
+        shadow_virtual_rows = [dict(r) for r in validation_summary.get("shadow_virtual_fill_rows", []) if isinstance(r, dict)]
+    shadow_virtual_fill_df = pd.DataFrame(shadow_virtual_rows)
+    if shadow_virtual_fill_df.empty:
+        shadow_virtual_fill_df = pd.DataFrame(
+            columns=[
+                "line",
+                "campaign_id",
+                "current_tons",
+                "min_required_tons",
+                "gap_tons",
+                "viability_band",
+                "shadow_fill_needed_tons",
+                "shadow_fill_needed_count",
+                "shadow_fill_viable",
+                "shadow_fill_budget_ok",
+                "shadow_fill_reason_code",
+                "shadow_fill_reason_detail",
+                "shadow_fill_priority_band",
+                "shadow_virtual_fill_unit_tons_assumption",
+                "expected_gain_type",
+                "expected_gain_value",
+            ]
+        )
+    formal_fill_rows = []
+    if isinstance(em.get("formal_virtual_fill_trial_rows"), list):
+        formal_fill_rows = [dict(r) for r in em.get("formal_virtual_fill_trial_rows", []) if isinstance(r, dict)]
+    elif isinstance(validation_summary, dict) and isinstance(validation_summary.get("formal_virtual_fill_trial_rows"), list):
+        formal_fill_rows = [dict(r) for r in validation_summary.get("formal_virtual_fill_trial_rows", []) if isinstance(r, dict)]
+    formal_virtual_fill_df = pd.DataFrame(formal_fill_rows)
+    if formal_virtual_fill_df.empty:
+        formal_virtual_fill_df = pd.DataFrame(
+            columns=[
+                "line",
+                "campaign_id",
+                "current_tons_before",
+                "current_tons_after",
+                "gap_before",
+                "virtual_fill_count",
+                "virtual_fill_tons",
+                "trial_result",
+                "rollback_reason",
+            ]
+        )
+    formation_rows = []
+    if not final_df.empty and {"line", "campaign_id", "tons"}.issubset(final_df.columns):
+        formation_work = final_df.copy()
+        if "is_virtual" not in formation_work.columns:
+            formation_work["is_virtual"] = False
+        for col in ["promoted_by_local_reassemble", "hopeless_dropped_for_near_viable"]:
+            if col not in formation_work.columns:
+                formation_work[col] = False
+        total_by_campaign = formation_work.groupby(["line", "campaign_id"], as_index=False, dropna=False)["tons"].sum()
+        shadow_by_campaign = {}
+        if not shadow_virtual_fill_df.empty and {"line", "campaign_id"}.issubset(shadow_virtual_fill_df.columns):
+            for _, row in shadow_virtual_fill_df.iterrows():
+                shadow_by_campaign[(str(row.get("line", "")), str(row.get("campaign_id", "")))] = dict(row)
+        formal_success = set()
+        if not formal_virtual_fill_df.empty and {"line", "campaign_id", "trial_result"}.issubset(formal_virtual_fill_df.columns):
+            for _, row in formal_virtual_fill_df.iterrows():
+                if str(row.get("trial_result", "")) == "SUCCESS":
+                    formal_success.add((str(row.get("line", "")), str(row.get("campaign_id", ""))))
+        min_ton = float(getattr(rule, "campaign_ton_min", 700.0) or 700.0)
+        near_gap = float(em.get("near_viable_gap_tons", 80.0) or 80.0) if isinstance(em, dict) else 80.0
+        merge_gap = float(em.get("merge_candidate_gap_tons", 250.0) or 250.0) if isinstance(em, dict) else 250.0
+        for _, row in total_by_campaign.iterrows():
+            line = str(row.get("line", ""))
+            campaign_id = str(row.get("campaign_id", ""))
+            total_tons = float(row.get("tons", 0.0) or 0.0)
+            gap = max(0.0, min_ton - total_tons)
+            if gap <= 0.0:
+                band = "ALREADY_VIABLE"
+            elif gap <= near_gap:
+                band = "NEAR_VIABLE"
+            elif gap <= merge_gap:
+                band = "MERGE_CANDIDATE"
+            else:
+                band = "HOPELESS_UNDERFILLED"
+            key = (line, campaign_id)
+            shadow = shadow_by_campaign.get(key, {})
+            cdf = formation_work[(formation_work["line"].astype(str) == line) & (formation_work["campaign_id"].astype(str) == campaign_id)]
+            formation_rows.append(
+                {
+                    "line": line,
+                    "campaign_id": campaign_id,
+                    "current_tons": float(round(total_tons, 3)),
+                    "gap_tons": float(round(gap, 3)),
+                    "viability_band": band,
+                    "shadow_fill_priority_band": str(shadow.get("shadow_fill_priority_band", "")),
+                    "shadow_fill_reason_code": str(shadow.get("shadow_fill_reason_code", "")),
+                    "promoted_by_local_reassemble": bool(cdf["promoted_by_local_reassemble"].fillna(False).astype(bool).any()),
+                    "promoted_by_formal_fill": bool(key in formal_success),
+                    "hopeless_dropped_for_near_viable": bool(cdf["hopeless_dropped_for_near_viable"].fillna(False).astype(bool).any()),
+                }
+            )
+    campaign_formation_df = pd.DataFrame(
+        formation_rows,
+        columns=[
+            "line",
+            "campaign_id",
+            "current_tons",
+            "gap_tons",
+            "viability_band",
+            "shadow_fill_priority_band",
+            "shadow_fill_reason_code",
+            "promoted_by_local_reassemble",
+            "promoted_by_formal_fill",
+            "hopeless_dropped_for_near_viable",
+        ],
+    )
+    second_receiver_rows = []
+    if isinstance(validation_summary, dict) and isinstance(validation_summary.get("second_receiver_analysis_rows"), list):
+        second_receiver_rows = [dict(r) for r in validation_summary.get("second_receiver_analysis_rows", []) if isinstance(r, dict)]
+        for row in second_receiver_rows:
+            row.setdefault("second_receiver_campaign_id", row.get("campaign_id", ""))
+            row.setdefault("donor_campaign_id", "")
+            row.setdefault("donor_viability_band", "")
+            row.setdefault("donor_tons", 0.0)
+            row.setdefault("receiver_gap_before", row.get("gap_before", 0.0))
+            row.setdefault("receiver_gap_after_estimate", row.get("gap_after", 0.0))
+            row.setdefault("pair_feasible", False)
+            row.setdefault("duplicate_safe", False)
+            row.setdefault("rejection_reason", row.get("local_reallocation_reason", ""))
+            row.setdefault("selected_for_reallocation", False)
+            row.setdefault("search_space_size", validation_summary.get("second_receiver_search_space_size", 0))
+            row.setdefault("considered_count", validation_summary.get("donor_candidates_considered_count", 0))
+            row.setdefault("failure_reason", validation_summary.get("second_receiver_failure_reason", ""))
+        if isinstance(validation_summary.get("second_receiver_donor_candidate_rows"), list):
+            for row in validation_summary.get("second_receiver_donor_candidate_rows", []):
+                if not isinstance(row, dict):
+                    continue
+                second_receiver_rows.append(
+                    {
+                        "line": row.get("line", ""),
+                        "campaign_id": row.get("second_receiver_campaign_id", ""),
+                        "second_receiver_campaign_id": row.get("second_receiver_campaign_id", ""),
+                        "donor_campaign_id": row.get("donor_campaign_id", ""),
+                        "role": "donor_candidate",
+                        "tons_before": 0.0,
+                        "tons_after": 0.0,
+                        "gap_before": row.get("receiver_gap_before", 0.0),
+                        "gap_after": row.get("receiver_gap_after_estimate", 0.0),
+                        "viability_band_before": "",
+                        "viability_band_after": "",
+                        "donor_reallocated": bool(row.get("selected_for_reallocation", False)),
+                        "shadow_fill_reason_code_after": "",
+                        "shadow_fill_priority_band_after": "",
+                        "local_reallocation_reason": row.get("rejection_reason", ""),
+                        "ready_for_formal_fill_next_step": False,
+                        "donor_viability_band": row.get("donor_viability_band", ""),
+                        "donor_tons": row.get("donor_tons", 0.0),
+                        "receiver_gap_before": row.get("receiver_gap_before", 0.0),
+                        "receiver_gap_after_estimate": row.get("receiver_gap_after_estimate", 0.0),
+                        "pair_feasible": bool(row.get("pair_feasible", False)),
+                        "duplicate_safe": bool(row.get("duplicate_safe", False)),
+                        "rejection_reason": row.get("rejection_reason", ""),
+                        "selected_for_reallocation": bool(row.get("selected_for_reallocation", False)),
+                        "search_space_size": validation_summary.get("second_receiver_search_space_size", 0),
+                        "considered_count": validation_summary.get("donor_candidates_considered_count", 0),
+                        "failure_reason": validation_summary.get("second_receiver_failure_reason", ""),
+                    }
+                )
+    elif isinstance(em.get("second_receiver_reallocation_rows"), list):
+        for row in em.get("second_receiver_reallocation_rows", []):
+            if not isinstance(row, dict):
+                continue
+            second_receiver_rows.append(
+                {
+                    "line": row.get("line", ""),
+                    "campaign_id": row.get("campaign_id", ""),
+                    "second_receiver_campaign_id": row.get("campaign_id", ""),
+                    "donor_campaign_id": row.get("donor_campaign_id", ""),
+                    "role": "second_receiver",
+                    "tons_before": row.get("current_tons_before_reallocation", 0.0),
+                    "tons_after": row.get("current_tons_after_reallocation", 0.0),
+                    "gap_before": row.get("gap_before", 0.0),
+                    "gap_after": row.get("gap_after", 0.0),
+                    "viability_band_before": row.get("viability_band_before", ""),
+                    "viability_band_after": row.get("viability_band_after", ""),
+                    "donor_reallocated": bool(row.get("donor_campaign_id", "")),
+                    "shadow_fill_reason_code_after": row.get("shadow_fill_reason_code_after", ""),
+                    "shadow_fill_priority_band_after": row.get("shadow_fill_priority_band_after", ""),
+                    "local_reallocation_reason": row.get("local_reallocation_reason", row.get("shadow_fill_reason_code_after", "")),
+                    "ready_for_formal_fill_next_step": bool(em.get("second_receiver_ready_for_formal_fill", False)),
+                    "donor_viability_band": "",
+                    "donor_tons": 0.0,
+                    "receiver_gap_before": row.get("gap_before", 0.0),
+                    "receiver_gap_after_estimate": row.get("gap_after", 0.0),
+                    "pair_feasible": False,
+                    "duplicate_safe": False,
+                    "rejection_reason": row.get("local_reallocation_reason", row.get("shadow_fill_reason_code_after", "")),
+                    "selected_for_reallocation": bool(row.get("donor_campaign_id", "")),
+                    "search_space_size": em.get("second_receiver_search_space_size", 0),
+                    "considered_count": em.get("donor_candidates_considered_count", 0),
+                    "failure_reason": em.get("second_receiver_failure_reason", ""),
+                }
+            )
+    if not final_df.empty and {"line", "campaign_id", "tons"}.issubset(final_df.columns):
+        second_work = final_df.copy()
+        if "is_virtual" not in second_work.columns:
+            second_work["is_virtual"] = False
+        if "second_receiver_role" not in second_work.columns:
+            second_work["second_receiver_role"] = ""
+        if "donor_reallocated_to_second_receiver" not in second_work.columns:
+            second_work["donor_reallocated_to_second_receiver"] = False
+        role_work = second_work[second_work["second_receiver_role"].astype(str).isin(["healthy_receiver", "second_receiver", "donor"])].copy()
+        if not role_work.empty:
+            min_ton = float(getattr(rule, "campaign_ton_min", 700.0) or 700.0)
+            shadow_by_campaign = {}
+            if not shadow_virtual_fill_df.empty and {"line", "campaign_id"}.issubset(shadow_virtual_fill_df.columns):
+                for _, row in shadow_virtual_fill_df.iterrows():
+                    shadow_by_campaign[(str(row.get("line", "")), str(row.get("campaign_id", "")))] = dict(row)
+            for (line, campaign_id, role), cdf in role_work.groupby(["line", "campaign_id", "second_receiver_role"], dropna=False):
+                line = str(line)
+                campaign_id = str(campaign_id)
+                role = str(role)
+                real_cdf = cdf[~cdf["is_virtual"].fillna(False).astype(bool)]
+                tons_after = float(real_cdf["tons"].sum()) if not real_cdf.empty else float(cdf["tons"].sum())
+                gap_after = max(0.0, min_ton - tons_after)
+
+                def _first_num(col: str, default: float) -> float:
+                    if col not in cdf.columns:
+                        return default
+                    vals = pd.to_numeric(cdf[col], errors="coerce").dropna()
+                    return float(vals.iloc[0]) if not vals.empty else default
+
+                def _first_text(col: str, default: str) -> str:
+                    if col not in cdf.columns:
+                        return default
+                    vals = cdf[col].dropna().astype(str)
+                    vals = vals[vals != ""]
+                    return str(vals.iloc[0]) if not vals.empty else default
+
+                shadow = shadow_by_campaign.get((line, campaign_id), {})
+                second_receiver_rows.append(
+                    {
+                        "line": line,
+                        "campaign_id": campaign_id,
+                        "second_receiver_campaign_id": campaign_id if role == "second_receiver" else "",
+                        "donor_campaign_id": _first_text("second_receiver_donor_campaign_id", campaign_id if role == "donor" else ""),
+                        "role": role,
+                        "tons_before": _first_num("second_receiver_tons_before", tons_after),
+                        "tons_after": _first_num("second_receiver_tons_after", tons_after),
+                        "gap_before": _first_num("second_receiver_gap_before", gap_after),
+                        "gap_after": _first_num("second_receiver_gap_after", gap_after),
+                        "viability_band_before": _first_text("second_receiver_viability_band_before", ""),
+                        "viability_band_after": _first_text("second_receiver_viability_band_after", ""),
+                        "donor_reallocated": bool(cdf["donor_reallocated_to_second_receiver"].fillna(False).astype(bool).any()),
+                        "shadow_fill_reason_code_after": str(shadow.get("shadow_fill_reason_code", _first_text("second_receiver_failure_reason", ""))),
+                        "shadow_fill_priority_band_after": str(shadow.get("shadow_fill_priority_band", "")),
+                        "local_reallocation_reason": _first_text("second_receiver_failure_reason", ""),
+                        "ready_for_formal_fill_next_step": bool(cdf.get("second_receiver_ready_for_formal_fill", pd.Series([False] * len(cdf))).fillna(False).astype(bool).any()),
+                        "donor_viability_band": _first_text("second_receiver_donor_viability_band", ""),
+                        "donor_tons": _first_num("second_receiver_donor_tons", 0.0),
+                        "receiver_gap_before": _first_num("second_receiver_gap_before", gap_after),
+                        "receiver_gap_after_estimate": _first_num("second_receiver_donor_gap_after_estimate", gap_after),
+                        "pair_feasible": bool(cdf.get("second_receiver_donor_pair_feasible", pd.Series([False] * len(cdf))).fillna(False).astype(bool).any()),
+                        "duplicate_safe": bool(cdf.get("second_receiver_donor_duplicate_safe", pd.Series([False] * len(cdf))).fillna(False).astype(bool).any()),
+                        "rejection_reason": _first_text("second_receiver_donor_rejection_reason", ""),
+                        "selected_for_reallocation": bool(cdf.get("second_receiver_donor_selected", pd.Series([False] * len(cdf))).fillna(False).astype(bool).any()),
+                        "search_space_size": _first_num("second_receiver_search_space_size", 0.0),
+                        "considered_count": _first_num("second_receiver_donor_considered_count", 0.0),
+                        "failure_reason": _first_text("second_receiver_failure_reason", ""),
+                    }
+                )
+    second_near_viable_df = pd.DataFrame(
+        second_receiver_rows,
+        columns=[
+            "line",
+            "campaign_id",
+            "second_receiver_campaign_id",
+            "donor_campaign_id",
+            "role",
+            "tons_before",
+            "tons_after",
+            "gap_before",
+            "gap_after",
+            "viability_band_before",
+            "viability_band_after",
+            "donor_reallocated",
+            "shadow_fill_reason_code_after",
+            "shadow_fill_priority_band_after",
+            "local_reallocation_reason",
+            "ready_for_formal_fill_next_step",
+            "donor_viability_band",
+            "donor_tons",
+            "receiver_gap_before",
+            "receiver_gap_after_estimate",
+            "pair_feasible",
+            "duplicate_safe",
+            "rejection_reason",
+            "selected_for_reallocation",
+            "search_space_size",
+            "considered_count",
+            "failure_reason",
+        ],
+    ).drop_duplicates(subset=["line", "campaign_id", "donor_campaign_id", "role"], keep="first")
+    shadow_bridge_rows = []
+    if isinstance(validation_summary, dict) and isinstance(validation_summary.get("shadow_bridge_analysis_rows"), list):
+        shadow_bridge_rows = [dict(r) for r in validation_summary.get("shadow_bridge_analysis_rows", []) if isinstance(r, dict)]
+    elif isinstance(em.get("shadow_bridge_analysis_rows"), list):
+        shadow_bridge_rows = [dict(r) for r in em.get("shadow_bridge_analysis_rows", []) if isinstance(r, dict)]
+    shadow_bridge_df = pd.DataFrame(
+        shadow_bridge_rows,
+        columns=[
+            "line",
+            "campaign_id",
+            "current_tons",
+            "gap_tons",
+            "bridge_candidate_count",
+            "bridge_analysis_attempt_count",
+            "gap_after_estimate",
+            "viability_band_before",
+            "viability_band_after_estimate",
+            "shadow_bridge_reason_code",
+            "recommended_next_action",
+            "is_second_receiver",
+            "second_receiver_selected",
+            "second_receiver_gap_before",
+            "second_receiver_gap_after_estimate",
+        ],
+    )
+
+    campaign_assembly_plan_rows = []
+    if isinstance(validation_summary, dict) and isinstance(validation_summary.get("campaign_assembly_plan_rows"), list):
+        campaign_assembly_plan_rows = [dict(r) for r in validation_summary.get("campaign_assembly_plan_rows", []) if isinstance(r, dict)]
+    elif isinstance(em.get("campaign_assembly_plan_rows"), list):
+        campaign_assembly_plan_rows = [dict(r) for r in em.get("campaign_assembly_plan_rows", []) if isinstance(r, dict)]
+    campaign_assembly_plan_df = pd.DataFrame(
+        campaign_assembly_plan_rows,
+        columns=[
+            "line", "skeleton_id", "block_ids", "anchor_block_id", "current_real_tons",
+            "viability_band", "assembly_status", "bridge_need_level", "bridge_type_needed",
+            "donor_need_level", "notes",
+        ],
+    )
+
+    bridge_requirement_rows = []
+    if isinstance(validation_summary, dict) and isinstance(validation_summary.get("bridge_requirement_rows"), list):
+        bridge_requirement_rows = [dict(r) for r in validation_summary.get("bridge_requirement_rows", []) if isinstance(r, dict)]
+    elif isinstance(em.get("bridge_requirement_rows"), list):
+        bridge_requirement_rows = [dict(r) for r in em.get("bridge_requirement_rows", []) if isinstance(r, dict)]
+    bridge_requirements_df = pd.DataFrame(
+        bridge_requirement_rows,
+        columns=[
+            "line", "source_block_id", "target_block_id", "source_campaign_skeleton_id",
+            "target_campaign_skeleton_id", "reason_code", "bridge_type_needed",
+            "estimated_gap_closure_tons", "candidate_virtual_count", "mixed_bridge_required",
+            "template_support_status",
+        ],
+    )
+
+    donor_candidate_rows = []
+    if isinstance(validation_summary, dict) and isinstance(validation_summary.get("donor_candidate_rows"), list):
+        donor_candidate_rows = [dict(r) for r in validation_summary.get("donor_candidate_rows", []) if isinstance(r, dict)]
+    elif isinstance(em.get("donor_candidate_rows"), list):
+        donor_candidate_rows = [dict(r) for r in em.get("donor_candidate_rows", []) if isinstance(r, dict)]
+    donor_candidates_df = pd.DataFrame(
+        donor_candidate_rows,
+        columns=[
+            "donor_block_id", "donor_campaign_skeleton_id", "receiver_campaign_skeleton_id",
+            "line", "transferable_tons", "pair_feasible", "duplicate_safe", "rejection_reason",
+        ],
+    )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
@@ -2074,6 +2462,14 @@ def export_schedule_results(
         violation_out.to_excel(writer, sheet_name="违规汇总", index=False)
         _kv_to_zh(unscheduled_summary_df).to_excel(writer, sheet_name="未排汇总", index=False)
         _kv_to_zh(bridge_summary_df).to_excel(writer, sheet_name="桥接汇总", index=False)
+        shadow_virtual_fill_df.to_excel(writer, sheet_name="虚拟影子补吨分析", index=False)
+        formal_virtual_fill_df.to_excel(writer, sheet_name="正式虚拟补吨试验", index=False)
+        campaign_formation_df.to_excel(writer, sheet_name="near_viable_formation_analysis", index=False)
+        second_near_viable_df.to_excel(writer, sheet_name="second_near_viable_analysis", index=False)
+        shadow_bridge_df.to_excel(writer, sheet_name="shadow_bridge_analysis", index=False)
+        campaign_assembly_plan_df.to_excel(writer, sheet_name="campaign_assembly_plan", index=False)
+        bridge_requirements_df.to_excel(writer, sheet_name="bridge_requirements", index=False)
+        donor_candidates_df.to_excel(writer, sheet_name="donor_candidates", index=False)
         slot_summary_df.assign(产线=slot_summary_df.get("line", "").map(_zh_line)).rename(
             columns={
                 "line": "产线代码",
