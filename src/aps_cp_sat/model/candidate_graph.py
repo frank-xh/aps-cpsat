@@ -424,9 +424,13 @@ def build_candidate_graph(
     virtual_virtual_edge_count = 0
     real_virtual_edge_count = 0
     virtual_real_edge_count = 0
+    virtual_real_edge_count_effective = 0
+    accepted_virtual_chain_paths = 0
+    adjacency: dict[str, list[str]] = {}
     for edge in final_edges:
         from_virtual = str(edge.from_order_id) in virtual_node_ids
         to_virtual = str(edge.to_order_id) in virtual_node_ids
+        adjacency.setdefault(str(edge.from_order_id), []).append(str(edge.to_order_id))
         if from_virtual or to_virtual:
             virtual_edge_count += 1
         if from_virtual and to_virtual:
@@ -435,6 +439,34 @@ def build_candidate_graph(
             real_virtual_edge_count += 1
         elif from_virtual and (not to_virtual):
             virtual_real_edge_count += 1
+    max_virtual_chain_for_effective = max(1, int(max_chain))
+    for edge in final_edges:
+        start = str(edge.from_order_id)
+        first = str(edge.to_order_id)
+        if start not in virtual_node_ids:
+            continue
+        if first not in virtual_node_ids:
+            virtual_real_edge_count_effective += 1
+            accepted_virtual_chain_paths += 1
+            continue
+        frontier = [(first, 1)]
+        seen = {start, first}
+        found_real = False
+        while frontier and not found_real:
+            cur, depth = frontier.pop(0)
+            if depth >= max_virtual_chain_for_effective:
+                continue
+            for nxt in adjacency.get(cur, []):
+                if nxt in seen:
+                    continue
+                if nxt not in virtual_node_ids:
+                    found_real = True
+                    break
+                seen.add(nxt)
+                frontier.append((nxt, depth + 1))
+        if found_real:
+            virtual_real_edge_count_effective += 1
+            accepted_virtual_chain_paths += 1
     real_bridge_capable_orders = set()
     for edge in final_edges:
         if edge.edge_type != REAL_BRIDGE_EDGE:
@@ -451,6 +483,8 @@ def build_candidate_graph(
         "candidate_graph_virtual_virtual_edge_count": int(virtual_virtual_edge_count),
         "candidate_graph_real_virtual_edge_count": int(real_virtual_edge_count),
         "candidate_graph_virtual_real_edge_count": int(virtual_real_edge_count),
+        "virtual_real_edge_count_effective": int(virtual_real_edge_count_effective),
+        "accepted_virtual_chain_paths": int(accepted_virtual_chain_paths),
         "candidate_graph_real_bridge_capable_order_count": int(len(real_bridge_capable_orders)),
         "candidate_graph_direct_edge_count": int(final_type_counts.get(DIRECT_EDGE, 0)),
         "candidate_graph_real_bridge_edge_count": int(final_type_counts.get(REAL_BRIDGE_EDGE, 0)),

@@ -25,9 +25,21 @@ from typing import Dict, List, Tuple
 import pandas as pd
 
 from aps_cp_sat.config import PlannerConfig
-from aps_cp_sat.model.candidate_graph import build_candidate_graph
 from aps_cp_sat.model.candidate_graph_types import DIRECT_EDGE, REAL_BRIDGE_EDGE, VIRTUAL_BRIDGE_EDGE, VIRTUAL_BRIDGE_FAMILY_EDGE
+from aps_cp_sat.model.edge_hard_filter import sequence_pair_passes_final_hard_rules
 from aps_cp_sat.model.local_router import _template_total_cost
+
+
+def _safe_int_value(value, default: int = 0) -> int:
+    try:
+        if pd.isna(value):
+            return int(default)
+    except Exception:
+        pass
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
 
 
 @dataclass
@@ -147,9 +159,9 @@ class TemplateEdgeGraph:
         self.candidate_graph_diagnostics: Dict = {}
 
         # ---- Single graph build tracking ----
-        # candidate_graph_source: "pipeline" = reused from pipeline (normal)
-        #                          "builder_fallback" = built locally by TemplateEdgeGraph
-        self.candidate_graph_source: str = "builder_fallback"
+        # candidate_graph_source: "pipeline" = reused from pipeline. Local graph
+        # rebuilding was removed so augmented graph and solve graph cannot drift.
+        self.candidate_graph_source: str = "pipeline"
         # Full CandidateGraphBuildResult (for accessing repair_family_edges)
         self.candidate_graph_result = None
 
@@ -160,6 +172,15 @@ class TemplateEdgeGraph:
         self.accepted_direct_edge_count: int = 0
         self.accepted_real_bridge_edge_count: int = 0
         self.accepted_virtual_bridge_family_edge_count: int = 0
+        self.accepted_virtual_bridge_edge_count: int = 0
+        self.accepted_virtual_to_real_edge_count: int = 0
+        self.accepted_virtual_to_virtual_edge_count: int = 0
+        self.rejected_edges_by_hard_filter_total: int = 0
+        self.skipped_by_final_width_rule: int = 0
+        self.skipped_by_final_thickness_rule: int = 0
+        self.skipped_by_final_temp_rule: int = 0
+        self.skipped_by_final_group_rule: int = 0
+        self.skipped_by_virtual_chain_rule: int = 0
 
         # Determine edge policy string
         cfg_model = getattr(cfg, "model", None)
@@ -217,21 +238,14 @@ class TemplateEdgeGraph:
             else:
                 self.order_to_lines[oid] = ["big_roll", "small_roll"]
 
-        # ---- Use pre-built candidate graph if available (normal path) ----
-        if candidate_graph is not None:
-            self.candidate_graph_source = "pipeline"
-            self.candidate_graph_result = candidate_graph
-            self.candidate_graph_diagnostics = dict(getattr(candidate_graph, "diagnostics", {}) or {})
-        else:
-            # Fallback: build locally (legacy compat path)
-            self.candidate_graph_source = "builder_fallback"
-            candidate_graph = build_candidate_graph(self.orders_df, self.tpl_df, self.cfg)
-            self.candidate_graph_result = candidate_graph
-            self.candidate_graph_diagnostics = dict(candidate_graph.diagnostics)
-            print(
-                f"[APS][CandidateGraph][WARNING] candidate_graph built by TemplateEdgeGraph fallback "
-                f"(pipeline did not provide one). Consider passing it through transition_pack."
+        if candidate_graph is None:
+            raise RuntimeError(
+                "[APS][CandidateGraph][CANDIDATE_GRAPH_REQUIRED_FROM_PIPELINE] "
+                "constructive_sequence_builder requires the augmented CandidateGraph from pipeline"
             )
+        self.candidate_graph_source = "pipeline"
+        self.candidate_graph_result = candidate_graph
+        self.candidate_graph_diagnostics = dict(getattr(candidate_graph, "diagnostics", {}) or {})
 
         # Build adjacency lists from normalized Candidate Graph edges
         if self.tpl_df.empty:
@@ -252,6 +266,8 @@ class TemplateEdgeGraph:
             edge_type = str(candidate_edge.edge_type or DIRECT_EDGE)
             is_virtual_family = (edge_type == VIRTUAL_BRIDGE_FAMILY_EDGE)
             is_virtual_legacy = (edge_type == VIRTUAL_BRIDGE_EDGE)
+            from_is_virtual = self._is_virtual_order(from_oid)
+            to_is_virtual = self._is_virtual_order(to_oid)
 
             # Guarded family policy: legacy virtual is ALWAYS blocked
             if is_virtual_legacy:
@@ -274,6 +290,31 @@ class TemplateEdgeGraph:
                     self.filtered_virtual_bridge_edge_count += 1
                     continue  # Skip ineligible family edge
 
+            hard_ok, hard_reason = sequence_pair_passes_final_hard_rules(
+                self.order_record.get(from_oid, {}),
+                self.order_record.get(to_oid, {}),
+                self.cfg,
+                {
+                    "line": edge_line,
+                    "edge_type": edge_type,
+                    "template_row": tpl_row,
+                    "bridge_count": int(candidate_edge.effective_max_bridge_count() or 0),
+                },
+            )
+            if not hard_ok:
+                self.rejected_edges_by_hard_filter_total += 1
+                if hard_reason == "FINAL_WIDTH_RULE":
+                    self.skipped_by_final_width_rule += 1
+                elif hard_reason == "FINAL_THICKNESS_RULE":
+                    self.skipped_by_final_thickness_rule += 1
+                elif hard_reason == "FINAL_TEMP_RULE":
+                    self.skipped_by_final_temp_rule += 1
+                elif hard_reason == "FINAL_GROUP_RULE":
+                    self.skipped_by_final_group_rule += 1
+                elif hard_reason in {"FINAL_VIRTUAL_CHAIN_RULE", "FINAL_VIRTUAL_RATIO_RULE"}:
+                    self.skipped_by_virtual_chain_rule += 1
+                continue
+
             # Track accepted edge counts for diagnostics
             if edge_type == DIRECT_EDGE:
                 self.accepted_direct_edge_count += 1
@@ -281,6 +322,12 @@ class TemplateEdgeGraph:
                 self.accepted_real_bridge_edge_count += 1
             elif edge_type == VIRTUAL_BRIDGE_FAMILY_EDGE:
                 self.accepted_virtual_bridge_family_edge_count += 1
+            if from_is_virtual or to_is_virtual or is_virtual_family:
+                self.accepted_virtual_bridge_edge_count += 1
+            if from_is_virtual and not to_is_virtual:
+                self.accepted_virtual_to_real_edge_count += 1
+            if from_is_virtual and to_is_virtual:
+                self.accepted_virtual_to_virtual_edge_count += 1
 
             # Only add edge if from_oid can run on this line
             if edge_line in self.order_to_lines.get(from_oid, []):
@@ -318,6 +365,16 @@ class TemplateEdgeGraph:
             )
             self.big_deg[oid] = big_out + big_in
             self.small_deg[oid] = small_out + small_in
+
+    def _is_virtual_order(self, oid: str) -> bool:
+        rec = self.order_record.get(str(oid), {})
+        raw = rec.get("is_virtual", False)
+        try:
+            if pd.isna(raw):
+                raw = False
+        except Exception:
+            pass
+        return bool(raw) or str(rec.get("virtual_origin", "")) == "prebuilt_inventory"
 
     def get_valid_successors(
         self,
@@ -448,8 +505,8 @@ def _compute_chain_score(
     """
     penalty_hits: dict[str, int] = {}
 
-    due_rank = int(order_rec.get("due_rank", 999) or 999)
-    priority = int(order_rec.get("priority", 0) or 0)
+    due_rank = _safe_int_value(order_rec.get("due_rank", 999), 999)
+    priority = _safe_int_value(order_rec.get("priority", 0), 0)
     tons = float(order_rec.get("tons", 0) or 0)
 
     # Due rank: smaller is better (more urgent)
@@ -593,6 +650,45 @@ def _build_single_chain(
                 (soid, tpl, c) for soid, tpl, c in successors
                 if soid not in blocked_successor_bucket
             ]
+
+        current_virtual_chain_len = 0
+        for _oid in reversed(order_ids):
+            if graph._is_virtual_order(_oid):
+                current_virtual_chain_len += 1
+            else:
+                break
+        current_virtual_count = sum(1 for _oid in order_ids if graph._is_virtual_order(_oid))
+        hard_filtered_successors = []
+        for succ_oid, tpl_row, cost in successors:
+            ok, reason = sequence_pair_passes_final_hard_rules(
+                graph.order_record.get(current_oid, {}),
+                graph.order_record.get(succ_oid, {}),
+                graph.cfg,
+                {
+                    "line": line,
+                    "edge_type": str(tpl_row.get("edge_type", DIRECT_EDGE) or DIRECT_EDGE),
+                    "template_row": tpl_row,
+                    "bridge_count": int(tpl_row.get("bridge_count", 0) or 0),
+                    "current_virtual_chain_length": current_virtual_chain_len,
+                    "campaign_order_count": len(order_ids),
+                    "campaign_virtual_count": current_virtual_count,
+                },
+            )
+            if ok:
+                hard_filtered_successors.append((succ_oid, tpl_row, cost))
+            else:
+                graph.rejected_edges_by_hard_filter_total += 1
+                if reason == "FINAL_WIDTH_RULE":
+                    graph.skipped_by_final_width_rule += 1
+                elif reason == "FINAL_THICKNESS_RULE":
+                    graph.skipped_by_final_thickness_rule += 1
+                elif reason == "FINAL_TEMP_RULE":
+                    graph.skipped_by_final_temp_rule += 1
+                elif reason == "FINAL_GROUP_RULE":
+                    graph.skipped_by_final_group_rule += 1
+                elif reason in {"FINAL_VIRTUAL_CHAIN_RULE", "FINAL_VIRTUAL_RATIO_RULE"}:
+                    graph.skipped_by_virtual_chain_rule += 1
+        successors = hard_filtered_successors
 
         if not successors:
             break
@@ -803,8 +899,8 @@ def _retry_line_after_quota_release(
     # Sort retry orders by seed quality
     def retry_seed_quality_key(item: Tuple[str, dict]) -> Tuple[float, int, int]:
         oid, rec = item
-        due_rank = int(rec.get("due_rank", 999) or 999)
-        priority = int(rec.get("priority", 0) or 0)
+        due_rank = _safe_int_value(rec.get("due_rank", 999), 999)
+        priority = _safe_int_value(rec.get("priority", 0), 0)
         tons = float(rec.get("tons", 0) or 0)
         connectivity = graph.out_degree.get(oid, 0) + graph.in_degree.get(oid, 0)
         score = (priority * 10000) + ((100 - min(due_rank, 100)) * 100) + (tons * 0.1) + (connectivity * 10)
@@ -1083,7 +1179,7 @@ def build_constructive_sequences(
             small_d = graph.small_deg.get(oid, 0)
             if big_d > 0 and small_d > 0:
                 # Score: small_deg higher = more worth preserving for small_roll
-                due_rank = int(rec.get("due_rank", 999) or 999)
+                due_rank = _safe_int_value(rec.get("due_rank", 999), 999)
                 tons = float(rec.get("tons", 0) or 0)
                 score = (small_d * 100) + (tons * 0.1) + max(0, 100 - due_rank)
                 small_roll_reserve_candidates.append((-score, oid, rec))  # negative for ascending sort
@@ -1104,7 +1200,7 @@ def build_constructive_sequences(
                 key=lambda x: (
                     -graph.small_deg.get(x[0], 0),  # high small_deg first
                     -float(x[1].get("tons", 0) or 0),  # high tons first
-                    int(x[1].get("due_rank", 999) or 999),  # tight due_rank first
+                    _safe_int_value(x[1].get("due_rank", 999), 999),  # tight due_rank first
                 ),
             )
             # Truncate by quota_max (both orders and tons)
@@ -1172,7 +1268,7 @@ def build_constructive_sequences(
                 oid, rec = item
                 small_d = graph.small_deg.get(oid, 0)
                 tons = float(rec.get("tons", 0) or 0)
-                due_rank = int(rec.get("due_rank", 999) or 999)
+                due_rank = _safe_int_value(rec.get("due_rank", 999), 999)
                 score = (small_d * 10000) + (tons * 10) + max(0, 200 - due_rank)
                 return (-score, due_rank, oid)
             reserve_seeds.sort(key=reserve_seed_key)
@@ -1416,8 +1512,8 @@ def build_constructive_sequences(
         # Sort remaining orders by seed quality
         def seed_quality_key(item: Tuple[str, dict]) -> Tuple[float, int, int]:
             oid, rec = item
-            due_rank = int(rec.get("due_rank", 999) or 999)
-            priority = int(rec.get("priority", 0) or 0)
+            due_rank = _safe_int_value(rec.get("due_rank", 999), 999)
+            priority = _safe_int_value(rec.get("priority", 0), 0)
             tons = float(rec.get("tons", 0) or 0)
             # Score: prefer high priority, urgent due, large tons, good connectivity
             connectivity = graph.out_degree.get(oid, 0) + graph.in_degree.get(oid, 0)
@@ -1676,7 +1772,21 @@ def build_constructive_sequences(
         f"greedy_family_budget_blocked={graph.greedy_virtual_family_budget_blocked_count}, "
         f"accepted_direct={graph.accepted_direct_edge_count}, "
         f"accepted_real_bridge={graph.accepted_real_bridge_edge_count}, "
+        f"accepted_virtual_bridge={graph.accepted_virtual_bridge_edge_count}, "
+        f"accepted_virtual_to_real={graph.accepted_virtual_to_real_edge_count}, "
+        f"accepted_virtual_to_virtual={graph.accepted_virtual_to_virtual_edge_count}, "
+        f"accepted_virtual_chain_paths={graph.candidate_graph_diagnostics.get('accepted_virtual_chain_paths', 0)}, "
+        f"virtual_real_edge_count_effective={graph.candidate_graph_diagnostics.get('virtual_real_edge_count_effective', 0)}, "
         f"accepted_virtual_family={graph.accepted_virtual_bridge_family_edge_count}, "
+        f"accepted_direct_after_hard_filter={graph.accepted_direct_edge_count}, "
+        f"accepted_real_bridge_after_hard_filter={graph.accepted_real_bridge_edge_count}, "
+        f"accepted_virtual_bridge_after_hard_filter={graph.accepted_virtual_bridge_edge_count}, "
+        f"rejected_edges_by_hard_filter_total={graph.rejected_edges_by_hard_filter_total}, "
+        f"skipped_by_final_width_rule={graph.skipped_by_final_width_rule}, "
+        f"skipped_by_final_thickness_rule={graph.skipped_by_final_thickness_rule}, "
+        f"skipped_by_final_temp_rule={graph.skipped_by_final_temp_rule}, "
+        f"skipped_by_final_group_rule={graph.skipped_by_final_group_rule}, "
+        f"skipped_by_virtual_chain_rule={graph.skipped_by_virtual_chain_rule}, "
         f"filtered_virtual={graph.filtered_virtual_bridge_edge_count}, "
         f"filtered_real={graph.filtered_real_bridge_edge_count}, "
         f"virtual_family_in_graph={graph.candidate_graph_diagnostics.get('virtual_family_edge_count', 0)}, "
@@ -1716,6 +1826,24 @@ def build_constructive_sequences(
     diagnostics["filtered_real_bridge_edge_count"] = graph.filtered_real_bridge_edge_count
     diagnostics["accepted_direct_edge_count"] = graph.accepted_direct_edge_count
     diagnostics["accepted_real_bridge_edge_count"] = graph.accepted_real_bridge_edge_count
+    diagnostics["accepted_virtual_bridge_edge_count"] = graph.accepted_virtual_bridge_edge_count
+    diagnostics["accepted_virtual_to_real_edge_count"] = graph.accepted_virtual_to_real_edge_count
+    diagnostics["accepted_virtual_to_virtual_edge_count"] = graph.accepted_virtual_to_virtual_edge_count
+    diagnostics["accepted_direct_after_hard_filter"] = graph.accepted_direct_edge_count
+    diagnostics["accepted_real_bridge_after_hard_filter"] = graph.accepted_real_bridge_edge_count
+    diagnostics["accepted_virtual_bridge_after_hard_filter"] = graph.accepted_virtual_bridge_edge_count
+    diagnostics["rejected_edges_by_hard_filter_total"] = graph.rejected_edges_by_hard_filter_total
+    diagnostics["skipped_by_final_width_rule"] = graph.skipped_by_final_width_rule
+    diagnostics["skipped_by_final_thickness_rule"] = graph.skipped_by_final_thickness_rule
+    diagnostics["skipped_by_final_temp_rule"] = graph.skipped_by_final_temp_rule
+    diagnostics["skipped_by_final_group_rule"] = graph.skipped_by_final_group_rule
+    diagnostics["skipped_by_virtual_chain_rule"] = graph.skipped_by_virtual_chain_rule
+    diagnostics["accepted_virtual_chain_paths"] = int(
+        graph.candidate_graph_diagnostics.get("accepted_virtual_chain_paths", 0) or 0
+    )
+    diagnostics["virtual_real_edge_count_effective"] = int(
+        graph.candidate_graph_diagnostics.get("virtual_real_edge_count_effective", 0) or 0
+    )
     diagnostics["accepted_virtual_bridge_family_edge_count"] = graph.accepted_virtual_bridge_family_edge_count
     diagnostics["constructive_edge_policy"] = graph.edge_policy
     # Guarded family edge greedy diagnostics

@@ -20,7 +20,7 @@ def _infer_strategy(profile_name: str) -> str:
     if profile == DEFAULT_PROFILE:
         return DEFAULT_STRATEGY
     raise ValueError(
-        "[APS][verification][ONLY_SINGLE_ROUTE_ALLOWED] "
+        "[APS][verification][ONLY_SINGLE_PROFILE_ALLOWED] "
         f"expected strategy={DEFAULT_STRATEGY}, expected profile={DEFAULT_PROFILE}, got profile={profile!r}"
     )
 
@@ -123,7 +123,7 @@ def run_verification(
     strategy_name = str(strategy or '').strip() or _infer_strategy(profile)
     if strategy_name != DEFAULT_STRATEGY or str(profile) != DEFAULT_PROFILE:
         raise ValueError(
-            '[APS][verification][ONLY_SINGLE_ROUTE_ALLOWED] '
+            f'[APS][verification][ONLY_SINGLE_ROUTE_ALLOWED] '
             f'expected strategy={DEFAULT_STRATEGY}, expected profile={DEFAULT_PROFILE}, '
             f'got strategy={strategy_name!r}, profile={profile!r}'
         )

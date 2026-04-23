@@ -48,4 +48,11 @@ def evaluate_final_schedule_gate(
         "final_schedule_gate_reason": "OK" if passed else "FINAL_SCHEDULE_HARD_VIOLATIONS",
         "final_schedule_rejection_reasons": reasons,
         "final_hard_violation_count_total": int(total),
+        "hard_violation_source": "final_schedule_audit_summary",
+        "final_width_total_violation_count": _as_int(audit.get("width_total_violation_count", 0)),
+        "final_thickness_violation_count": _as_int(audit.get("thickness_violation_count", 0)),
+        "final_temperature_violation_count": _as_int(audit.get("temperature_violation_count", 0)),
+        "final_group_transition_violation_count": _as_int(audit.get("group_transition_violation_count", 0)),
+        "final_campaign_ton_violation_count": _as_int(audit.get("campaign_ton_min_violation_count", 0))
+        + _as_int(audit.get("campaign_ton_max_violation_count", 0)),
     }

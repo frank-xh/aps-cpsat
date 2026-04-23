@@ -35,13 +35,13 @@ from aps_cp_sat.model.campaign_cutter import (
     CampaignCutResult,
     CampaignSegment,
     cut_sequences_into_campaigns,
-    _reconstruct_underfilled_segments,
     _validate_segment_template_pairs,
 )
 from aps_cp_sat.model.constructive_sequence_builder import (
     ConstructiveBuildResult,
     build_constructive_sequences,
 )
+from aps_cp_sat.model.graph_unused_pool import collect_graph_unused_candidates
 from aps_cp_sat.model.local_inserter_cp_sat import (
     InsertStatus,
     LocalInsertRequest,
@@ -2514,6 +2514,14 @@ def _run_alns_iteration(
         "repair_family_edge_pool_seen_count": 0,
         "repair_family_edge_pool_filtered_count": 0,
         "repair_family_edge_pool_used_count": 0,
+        "candidate_source": "graph_unused_nodes",
+        "graph_unused_candidates_total": 0,
+        "graph_unused_real_candidates": 0,
+        "graph_unused_virtual_candidates": 0,
+        "graph_unused_repair_attempts": 0,
+        "graph_unused_repair_success": 0,
+        "virtual_node_repair_attempts": 0,
+        "virtual_node_repair_success": 0,
     }
 
     # ---- Step 1: Select neighborhood ----
@@ -2875,17 +2883,46 @@ def _run_alns_iteration(
         for oid in segment_reinsert_candidates:
             round_line_hint_map[oid] = line
 
-        # Dropped pool candidates: filtered by line + per-round dedup
-        # Only consider pool orders NOT already assigned to another line this round
-        unassigned_pool = [oid for oid in candidates_from_pool
-                           if oid not in already_assigned_pool_candidates]
-
-        pool_candidates, pool_diag = _pool_candidates_for_line(
+        candidate_graph = transition_pack.get("candidate_graph") if isinstance(transition_pack, dict) else None
+        graph_orders_df = transition_pack.get("graph_orders_df") if isinstance(transition_pack, dict) else orders_df
+        used_now = set()
+        for _seg in current_segs:
+            used_now.update(str(_oid) for _oid in getattr(_seg, "order_ids", []) or [])
+        used_now.difference_update(set(str(_oid) for _oid in orders_to_remove))
+        boundary_nodes = list(dict.fromkeys(fixed_orders + [str(_oid) for _oid in seg_orders if str(_oid) not in orders_to_remove]))
+        graph_pool = collect_graph_unused_candidates(
+            campaigns=current_segs,
+            used_node_ids=used_now | set(already_assigned_pool_candidates),
+            candidate_graph=candidate_graph,
+            graph_orders_df=graph_orders_df,
             line=line,
-            pool_order_ids=unassigned_pool,
-            orders_df=orders_df,
-            transition_pack=transition_pack,
-            max_count=max_destroy_orders,
+            boundary_nodes=boundary_nodes,
+            cfg=cfg,
+        )
+        pool_candidates = list(dict.fromkeys(graph_pool.real_candidates + graph_pool.virtual_candidates))[:max_destroy_orders]
+        pool_diag = dict(graph_pool.diagnostics or {})
+        pool_diag.setdefault("filtered_by_capability_count", 0)
+        pool_diag.setdefault("filtered_by_connectivity_count", 0)
+        pool_diag.setdefault("skipped_already_tried_count", 0)
+        tail_repair_diag["candidate_source"] = "graph_unused_nodes"
+        tail_repair_diag["graph_unused_candidates_total"] = (
+            tail_repair_diag.get("graph_unused_candidates_total", 0)
+            + int(pool_diag.get("graph_unused_candidates_total", 0) or 0)
+        )
+        tail_repair_diag["graph_unused_real_candidates"] = (
+            tail_repair_diag.get("graph_unused_real_candidates", 0)
+            + int(pool_diag.get("graph_unused_real_candidates", 0) or 0)
+        )
+        tail_repair_diag["graph_unused_virtual_candidates"] = (
+            tail_repair_diag.get("graph_unused_virtual_candidates", 0)
+            + int(pool_diag.get("graph_unused_virtual_candidates", 0) or 0)
+        )
+        tail_repair_diag["graph_unused_repair_attempts"] = (
+            tail_repair_diag.get("graph_unused_repair_attempts", 0) + len(pool_candidates)
+        )
+        tail_repair_diag["virtual_node_repair_attempts"] = (
+            tail_repair_diag.get("virtual_node_repair_attempts", 0)
+            + sum(1 for oid in pool_candidates if str(oid) in set(graph_pool.virtual_candidates))
         )
 
         # Per-round dedup: mark these as assigned so the other line won't retry them
@@ -3008,6 +3045,12 @@ def _run_alns_iteration(
             f"window_size={_destroy_hotspot_diag.get('hotspot_window_size', 0)}, "
             f"backfill={_destroy_hotspot_diag.get('hotspot_random_backfill_count', 0)}"
         )
+        _order_context_by_id = {}
+        if isinstance(orders_df, pd.DataFrame) and not orders_df.empty and "order_id" in orders_df.columns:
+            _order_context_by_id = {
+                str(row.get("order_id", "")): dict(row)
+                for row in orders_df.to_dict("records")
+            }
 
         req = LocalInsertRequest(
             line=line,
@@ -3030,6 +3073,7 @@ def _run_alns_iteration(
             hotspot_type=str(neighborhood.value),
             hotspot_center_order_id=_hs_center,
             hotspot_reason=_hs_reason,
+            order_context_by_id=_order_context_by_id,
         )
 
         import time as _time_module
@@ -3072,7 +3116,11 @@ def _run_alns_iteration(
                     _round_alns_family_budget_block += 1
                 # ---- Family repair value metrics (guarded profile) ----
                 # These are tracked in round_diag, then aggregated to LnsEngineDiag
-                _gain_dropped = len(accepted_pool) if result.status in (InsertStatus.OPTIMAL, InsertStatus.FEASIBLE) else 0
+                _gain_dropped = (
+                    len(set(getattr(result, "inserted_order_ids", []) or []) & set(dropped_pool_candidates))
+                    if result.status in (InsertStatus.OPTIMAL, InsertStatus.FEASIBLE)
+                    else 0
+                )
                 _gain_underfilled = 1 if (_local_family_selected > 0 and _underfill_detected) else 0
                 _gain_scheduled = len(accepted_ids) if _local_family_selected > 0 else 0
                 tail_repair_diag["family_repair_attempt_count"] += 1
@@ -3090,6 +3138,18 @@ def _run_alns_iteration(
         if result.status in (InsertStatus.OPTIMAL, InsertStatus.FEASIBLE):
             repair_count += 1
             accepted_ids = set(result.inserted_order_ids)
+            tail_repair_diag["graph_unused_repair_success"] = (
+                tail_repair_diag.get("graph_unused_repair_success", 0)
+                + len(accepted_ids & set(dropped_pool_candidates))
+            )
+            tail_repair_diag["virtual_node_repair_success"] = (
+                tail_repair_diag.get("virtual_node_repair_success", 0)
+                + sum(
+                    1
+                    for oid in accepted_ids & set(dropped_pool_candidates)
+                    if str(oid).startswith(("VIRTUAL_", "PREBUILT_VIRTUAL_"))
+                )
+            )
 
             # Rescue candidates that WERE in LNS_REPAIR_REJECTED and got accepted
             for oid in accepted_ids:
@@ -3476,9 +3536,10 @@ def run_constructive_lns_master(
     )
     constructive_build_seconds = time.perf_counter() - t_build_start
 
-    # Extract repair_family_edges for guarded family ALNS/local rebuild
-    repair_family_edges: List = list(getattr(build_result, "repair_family_edges", []) or [])
-    print(f"[APS][repair_family] pool_size={len(repair_family_edges)}")
+    # Legacy family/bridge repair pools are removed from the mainline. ALNS
+    # repair candidates now come from graph_unused_nodes only.
+    repair_family_edges: List = []
+    print("[APS][GRAPH_UNUSED_REPAIR] legacy_repair_family_pool_disabled=true, candidate_source=graph_unused_nodes")
 
     # Track family repair already attempted (for reconstruction dedup)
     family_repair_already_attempted_keys: set = set()
@@ -3487,41 +3548,30 @@ def run_constructive_lns_master(
     # cut_sequences_into_campaigns expects chains_by_line: Dict[str, List[ConstructiveChain]]
     t_cutter_start = time.perf_counter()
     chains_by_line: Dict[str, List] = build_result.chains_by_line
+    candidate_graph = transition_pack.get("candidate_graph") if isinstance(transition_pack, dict) else None
+    graph_orders_df = transition_pack.get("graph_orders_df") if isinstance(transition_pack, dict) else orders_for_build
     cut_result: CampaignCutResult = cut_sequences_into_campaigns(
-        chains_by_line, orders_for_build, cfg, tpl_df,
+        chains_by_line,
+        orders_for_build,
+        cfg,
+        tpl_df,
+        candidate_graph=candidate_graph,
+        graph_orders_df=graph_orders_df,
     )
     campaign_cutter_seconds = time.perf_counter() - t_cutter_start
 
     # Collect initial segments
     initial_segments: List[CampaignSegment] = list(cut_result.segments)
     underfilled_segments: List[CampaignSegment] = list(cut_result.underfilled_segments)
-    order_tons_for_recon: Dict[str, float] = {}
-    if not orders_for_build.empty:
-        for _, row in orders_for_build.iterrows():
-            order_tons_for_recon[str(row["order_id"])] = float(row.get("tons", 0.0) or 0.0)
-    recon_valid, recon_underfilled, recon_diag = _reconstruct_underfilled_segments(
-        initial_segments,
-        underfilled_segments,
-        transition_pack,
-        float(cfg.rule.campaign_ton_min),
-        float(cfg.rule.campaign_ton_max),
-        cut_result.diagnostics if isinstance(cut_result.diagnostics, dict) else {},
-        allow_real_bridge=bool(getattr(cfg.model, "repair_only_real_bridge_enabled", True)),
-        allow_virtual_bridge=bool(getattr(cfg.model, "repair_only_virtual_bridge_enabled", False)),
-        order_tons=order_tons_for_recon,
-        orders_df=orders_for_build,
-        cfg=cfg,
-        family_repair_already_attempted_keys=family_repair_already_attempted_keys,
-    )
+    recon_diag = {
+        "underfilled_reconstruction_enabled": False,
+        "underfilled_reconstruction_not_entered_reason": "REMOVED_REPAIR_BRIDGE_POOL_MAINLINE",
+        "reconstruction_no_gain": True,
+        "candidate_source": "graph_unused_nodes",
+    }
     if isinstance(cut_result.diagnostics, dict):
         cut_result.diagnostics.update({"underfilled_reconstruction": dict(recon_diag), **dict(recon_diag)})
-    if bool(recon_diag.get("reconstruction_no_gain", True)):
-        print("[APS][UNDERFILLED_RECON] reconstruction_no_gain=true, keeping cutter output")
-    else:
-        initial_segments = list(recon_valid)
-        underfilled_segments = list(recon_underfilled)
-        cut_result.segments = list(recon_valid)
-        cut_result.underfilled_segments = list(recon_underfilled)
+    print("[APS][UNDERFILLED_RECON] removed_from_mainline=true, candidate_source=graph_unused_nodes")
     if isinstance(cut_result.diagnostics, dict):
         cut_result.diagnostics["total_valid_segments"] = int(len(initial_segments))
         cut_result.diagnostics["total_underfilled_segments"] = int(len(underfilled_segments))

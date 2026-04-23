@@ -126,8 +126,13 @@ def _lightweight_decode_constructive_lns(
 
     # 2. Handle bridge expansion based on mode
     if bridge_expand_mode == "disabled":
-        # Route B: No virtual expansion, all rows are real
-        df["is_virtual"] = False
+        # In constructive + prebuilt-virtual-inventory mode, rows may already
+        # carry real/virtual identity from the graph. Preserve it instead of
+        # forcibly demoting all rows to real.
+        if "is_virtual" in df.columns:
+            df["is_virtual"] = df["is_virtual"].fillna(False).astype(bool)
+        else:
+            df["is_virtual"] = False
         # Ensure bridge metadata fields exist (even if disabled)
         for col in [
             "selected_edge_type", "selected_bridge_expandable",

@@ -31,7 +31,13 @@ import pandas as pd
 from ortools.sat.python import cp_model
 
 from aps_cp_sat.config import PlannerConfig
+from aps_cp_sat.model.edge_hard_filter import edge_passes_final_hard_rules
 from aps_cp_sat.model.local_router import _template_total_cost
+
+
+def _is_virtual_order_like_id(order_id: str) -> bool:
+    oid = str(order_id or "")
+    return oid.startswith("VIRTUAL_PREBUILT__") or oid.startswith("VIRTUAL_")
 
 
 class InsertStatus(Enum):
@@ -93,6 +99,7 @@ class LocalInsertRequest:
     guarded_virtual_family_reason: str = ""
     # ALNS-round-level repair family edge admission keys
     repair_family_edge_keys: List[tuple] = field(default_factory=list)
+    order_context_by_id: Dict[str, dict] = field(default_factory=dict)
     # Hotspot-driven destroy context (hotspot neighborhood only)
     # Used by local CP-SAT to bias scoring near the destroy hotspot center
     hotspot_type: str = ""
@@ -228,6 +235,8 @@ class _StrictTemplateGraph:
         self.req_repair_family_edge_keys: set = set(getattr(req, "repair_family_edge_keys", []) or [])
         self.rebuild_repair_family_edge_keys_count: int = len(self.req_repair_family_edge_keys)
         self.rebuild_repair_family_edge_keys_used_count: int = 0
+        self.order_context_by_id: Dict[str, dict] = dict(getattr(req, "order_context_by_id", {}) or {})
+        self.rejected_arcs_by_hard_filter: int = 0
 
         # Determine edge policy string
         # Policy determines which arc types are allowed in local inserter:
@@ -289,27 +298,50 @@ class _StrictTemplateGraph:
             edge_type = str(row.get("edge_type", "DIRECT_EDGE") or "DIRECT_EDGE")
             is_virtual_family = (edge_type == "VIRTUAL_BRIDGE_FAMILY_EDGE")
             is_virtual_legacy = (edge_type == "VIRTUAL_BRIDGE_EDGE")
+            touches_prebuilt_virtual = _is_virtual_order_like_id(from_oid) or _is_virtual_order_like_id(to_oid)
+            # Treat graph edges touching prebuilt virtual inventory as virtual-bridge-aware
+            # arcs in local repair. They are already vetted by template rules; what was
+            # missing is runtime admission into repair neighborhoods.
+            is_virtual_graph_arc = touches_prebuilt_virtual and not is_virtual_legacy
 
             # ---- Bridge edge type filtering (Route RB / Route C / guarded family) ----
             # Guarded family policy: legacy VIRTUAL_BRIDGE_EDGE is ALWAYS blocked
-            if is_virtual_legacy:
+            if is_virtual_legacy and not is_virtual_graph_arc:
                 self.virtual_bridge_legacy_arcs_blocked += 1
                 self.virtual_bridge_arcs_blocked += 1
-                continue  # Legacy virtual: always blocked in guarded mode
+                continue  # Legacy virtual path blocked unless it is a graph arc touching virtual inventory
 
-            if is_virtual_family and not self.allow_virtual:
+            if (is_virtual_family or is_virtual_graph_arc) and not self.allow_virtual:
                 self.virtual_bridge_arcs_blocked += 1
-                continue  # Skip family edge if allow_virtual=False
+                continue  # Skip virtual-aware edge if allow_virtual=False
 
             if edge_type == "REAL_BRIDGE_EDGE" and not self.allow_real:
                 self.real_bridge_arcs_blocked += 1
                 continue  # Skip real bridge edge
 
+            prev_ctx = self.order_context_by_id.get(from_oid, {})
+            next_ctx = self.order_context_by_id.get(to_oid, {})
+            if prev_ctx and next_ctx:
+                hard_ok, _hard_reason = edge_passes_final_hard_rules(
+                    prev_ctx,
+                    next_ctx,
+                    cfg,
+                    {
+                        "line": self.line,
+                        "edge_type": edge_type,
+                        "template_row": dict(row),
+                        "bridge_count": bridge_count,
+                    },
+                )
+                if not hard_ok:
+                    self.rejected_arcs_by_hard_filter += 1
+                    continue
+
             # Guarded family: apply request-level + profile-level eligibility checks
             if is_virtual_family and self.edge_policy_used == "direct_plus_real_plus_guarded_family":
-                from aps_cp_sat.model.candidate_graph_types import is_virtual_family_frontload_eligible
-                # Build a minimal CandidateEdge from row for eligibility check
                 from aps_cp_sat.model.candidate_graph_types import CandidateEdge as _CE
+                from aps_cp_sat.model.candidate_graph_types import is_virtual_family_frontload_eligible
+
                 bridge_family = str(row.get("bridge_family", "MIXED")).upper()
                 if bridge_family not in {"WIDTH_GROUP", "THICKNESS", "GROUP_TRANSITION", "MIXED"}:
                     bridge_family = "MIXED"
@@ -356,17 +388,12 @@ class _StrictTemplateGraph:
                     continue
 
                 # (d) ALNS-round-level repair family edge key gate
-                # If req_repair_family_edge_keys is non-empty, only admit edges whose
-                # (line, from_order_id, to_order_id, bridge_family) key is in the set.
-                # This is the mechanism by which ALNS round picks specific family edges
-                # from the repair pool to try in local CP-SAT rebuild.
                 if self.req_repair_family_edge_keys:
                     _edge_key = (tpl_line, from_oid, to_oid, bridge_family)
                     if _edge_key not in self.req_repair_family_edge_keys:
                         self.virtual_bridge_arcs_blocked += 1
                         continue
-                    # Key found: admit this family edge
-                    self.rebuild_repair_family_edge_keys_used_count: int = getattr(
+                    self.rebuild_repair_family_edge_keys_used_count = getattr(
                         self, "rebuild_repair_family_edge_keys_used_count", 0
                     ) + 1
 
@@ -379,7 +406,7 @@ class _StrictTemplateGraph:
                 self.direct_arcs_allowed += 1
             elif edge_type == "REAL_BRIDGE_EDGE" and self.allow_real:
                 self.real_bridge_arcs_allowed += 1
-            elif is_virtual_family and self.allow_virtual:
+            elif (is_virtual_family or is_virtual_graph_arc) and self.allow_virtual:
                 self.virtual_bridge_family_arcs_allowed += 1
             # DIRECT_EDGE is always allowed
 
@@ -388,7 +415,7 @@ class _StrictTemplateGraph:
                 to_idx=to_idx,
                 cost=cost,
                 bridge_count=bridge_count,
-                is_virtual_bridge=is_virtual_family,
+                is_virtual_bridge=(is_virtual_family or is_virtual_graph_arc),
                 tpl_row=dict(row),
             )
             self.edges.append(edge_info)
@@ -422,6 +449,7 @@ class _StrictTemplateGraph:
             "real_bridge_arcs_blocked": int(self.real_bridge_arcs_blocked),
             "virtual_bridge_arcs_blocked": int(self.virtual_bridge_arcs_blocked),
             "virtual_bridge_legacy_arcs_blocked": int(self.virtual_bridge_legacy_arcs_blocked),
+            "rejected_arcs_by_hard_filter": int(getattr(self, "rejected_arcs_by_hard_filter", 0)),
             "edge_policy_used": str(self.edge_policy_used),
             "rebuild_guarded_virtual_family_allowed": bool(self.rebuild_guarded_virtual_family_allowed),
             "rebuild_virtual_family_candidate_count": int(self.rebuild_virtual_family_candidate_count),
@@ -750,6 +778,8 @@ def solve_local_insertion_subproblem(
         for _, row in orders_df.iterrows():
             oid = str(row["order_id"])
             order_lookup[oid] = dict(row)
+    if not getattr(req, "order_context_by_id", None):
+        req.order_context_by_id = dict(order_lookup)
 
     # Filter: only orders that exist in orders_df
     all_fixed = [oid for oid in fixed_ids if oid in order_lookup]

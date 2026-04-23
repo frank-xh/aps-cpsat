@@ -31,6 +31,7 @@ import pandas as pd
 
 from aps_cp_sat.config import PlannerConfig
 from aps_cp_sat.model.constructive_sequence_builder import ConstructiveChain
+from aps_cp_sat.model.graph_unused_pool import collect_graph_unused_candidates
 from aps_cp_sat.transition.bridge_rules import _is_pc, _temp_overlap_len, _thick_ok, _txt
 
 
@@ -528,6 +529,8 @@ def _try_fill_from_dropped(
     placed_oids: set,
     cfg: PlannerConfig,
     tpl_df: pd.DataFrame | None = None,
+    candidate_graph=None,
+    graph_orders_df: pd.DataFrame | None = None,
     max_candidates: int = 20,
 ) -> Tuple[bool, Optional[CampaignSegment], dict]:
     """
@@ -599,19 +602,38 @@ def _try_fill_from_dropped(
 
     tail_last_oid = tail_seg.order_ids[-1]
 
-    # Build template keyset (direct-only, no bridge)
-    tpl_keys: set = set()
-    if tpl_df is not None and not tpl_df.empty:
-        for _, trow in tpl_df.iterrows():
-            tpl_keys.add((str(trow.get("from_order_id", "")), str(trow.get("to_order_id", ""))))
+    pool = collect_graph_unused_candidates(
+        campaigns=[],
+        used_node_ids=set(placed_oids or set()).union(set(tail_seg.order_ids or [])),
+        candidate_graph=candidate_graph,
+        graph_orders_df=graph_orders_df if isinstance(graph_orders_df, pd.DataFrame) else orders_df,
+        line=tail_seg.line,
+        boundary_nodes=[tail_last_oid],
+        cfg=cfg,
+    )
+    pool_diag = dict(pool.diagnostics or {})
+    diagnostics.update(pool_diag)
+    edge_by_to_oid = {str(edge.get("to_order_id", "")): edge for edge in pool.candidate_edges}
+    graph_successors = set(pool.real_candidates) | set(pool.virtual_candidates)
 
     # Find candidate orders from orders_df.
     # Candidates must satisfy:
     #   1. NOT already in placed_oids (not in any segment at all)
     #   2. NOT already in tail_seg.order_ids
     #   3. Same line as tail_seg
-    #   4. Template pair (tail_last_oid -> candidate) is valid (direct-only)
+    #   4. It is an unused graph successor of tail_last_oid
     line_col = "line" if "line" in orders_df.columns else None
+    virtual_by_oid: dict[str, bool] = {}
+    if "order_id" in orders_df.columns:
+        for _, row in orders_df.iterrows():
+            oid = str(row.get("order_id", ""))
+            raw = row.get("is_virtual", False)
+            try:
+                if pd.isna(raw):
+                    raw = False
+            except Exception:
+                pass
+            virtual_by_oid[oid] = bool(raw) or str(row.get("virtual_origin", "")) == "prebuilt_inventory"
     candidates = []
     for _, row in orders_df.iterrows():
         oid = str(row.get("order_id", ""))
@@ -624,21 +646,34 @@ def _try_fill_from_dropped(
         if line_col and str(row.get(line_col, "")) != tail_seg.line:
             diagnostics["pool_filtered_by_line"] += 1
             continue
+        if oid not in graph_successors:
+            diagnostics["pool_filtered_by_template"] += 1
+            continue
         candidates.append(oid)
 
     diagnostics["candidates_considered"] = len(candidates)
+    diagnostics["candidate_source"] = "graph_unused_nodes"
+    diagnostics["graph_unused_candidates_total"] = len(candidates)
+    diagnostics["graph_unused_virtual_candidates"] = int(sum(1 for oid in candidates if virtual_by_oid.get(oid, False)))
+    diagnostics["graph_unused_real_candidates"] = int(len(candidates) - diagnostics["graph_unused_virtual_candidates"])
+    diagnostics["graph_unused_repair_attempts"] = int(pool_diag.get("graph_unused_candidates_total", 0) or 0)
+    diagnostics["virtual_node_repair_attempts"] = int(pool_diag.get("graph_unused_virtual_candidates", 0) or 0)
 
     # Print candidate pool summary BEFORE template filtering
     print(
         f"[APS][TAIL_FILL_POOL] "
+        f"candidate_source=graph_unused_nodes, "
         f"tail_seg={tail_seg.campaign_local_id}, "
         f"tail_tons={tail_seg.total_tons:.0f}, "
         f"gap={gap:.0f}, "
+        f"graph_unused_candidates_total={diagnostics['graph_unused_candidates_total']}, "
+        f"graph_unused_real_candidates={diagnostics['graph_unused_real_candidates']}, "
+        f"graph_unused_virtual_candidates={diagnostics['graph_unused_virtual_candidates']}, "
         f"pool_total_rows={diagnostics['pool_total_rows']}, "
         f"filtered_by_already_placed={diagnostics['pool_filtered_by_already_placed']}, "
         f"filtered_by_already_in_tail={diagnostics['pool_filtered_by_already_in_tail']}, "
         f"filtered_by_line={diagnostics['pool_filtered_by_line']}, "
-        f"filtered_by_template=0 (pending), "
+        f"filtered_by_graph_adjacency={diagnostics['pool_filtered_by_template']}, "
         f"remaining_for_test={len(candidates)}"
     )
 
@@ -663,11 +698,6 @@ def _try_fill_from_dropped(
         diagnostics["fill_candidates_tested"] += 1
         cand_tons = order_tons.get(oid, 0.0)
         new_tons = tail_seg.total_tons + cand_tons
-
-        # Template pair validation: tail_last_oid -> oid must be valid (direct-only)
-        if tpl_keys and (tail_last_oid, oid) not in tpl_keys:
-            diagnostics["pool_filtered_by_template"] += 1
-            continue
 
         # Hard cap: never exceed ton_max
         if new_tons > ton_max + 1e-6:
@@ -4301,22 +4331,26 @@ def _reconstruct_underfilled_segments(
     family_repair_already_attempted_keys: set | None = None,
 ) -> tuple[list[CampaignSegment], list[CampaignSegment], dict]:
     """
-    Repair-only local reconstruction for underfilled segments.
+    Deprecated legacy underfilled reconstruction path.
 
-    Initial constructive and initial cutter remain direct-only. This stage only
-    rebuilds same-line underfilled blocks and optionally allows REAL_BRIDGE_EDGE
-    as a repair candidate after direct-only reconstruction has no gain.
+    The constructive mainline no longer uses the old template-row / endpoint-key
+    matching repair path. Underfilled repair candidates must come from
+    graph_unused_nodes and be consumed by tail fill / local insertion / ALNS
+    on top of the pipeline-provided candidate_graph.
+
+    This function is intentionally reduced to a no-op passthrough so the old
+    REPAIR_BRIDGE_LOOKUP / REPAIR_BRIDGE_POOL / VIRTUAL_BRIDGE_PILOT logging
+    and control flow cannot remain on the formal mainline.
     """
     t0 = perf_counter()
-    # Initialize family_repair_already_attempted_keys if None (for compatibility)
     _family_dedup_keys: set = set(family_repair_already_attempted_keys) if family_repair_already_attempted_keys else set()
 
     diag = {
-        "underfilled_reconstruction_enabled": True,
+        "underfilled_reconstruction_enabled": False,
         "underfilled_reconstruction_attempts": 0,
         "underfilled_reconstruction_success": 0,
         "underfilled_reconstruction_blocks_tested": 0,
-        "underfilled_reconstruction_blocks_skipped": 0,
+        "underfilled_reconstruction_blocks_skipped": int(len(underfilled_segments)),
         "underfilled_reconstruction_valid_before": int(len(valid_segments)),
         "underfilled_reconstruction_valid_after": int(len(valid_segments)),
         "underfilled_reconstruction_underfilled_before": int(len(underfilled_segments)),
@@ -4325,7 +4359,7 @@ def _reconstruct_underfilled_segments(
         "underfilled_reconstruction_orders_salvaged": 0,
         "underfilled_reconstruction_valid_delta": 0,
         "underfilled_reconstruction_underfilled_delta": 0,
-        "underfilled_reconstruction_not_entered_reason": "",
+        "underfilled_reconstruction_not_entered_reason": "REMOVED_REPAIR_BRIDGE_POOL_MAINLINE",
         "repair_only_real_bridge_enabled": bool(allow_real_bridge),
         "repair_only_real_bridge_attempts": 0,
         "repair_only_real_bridge_success": 0,
@@ -4343,2246 +4377,65 @@ def _reconstruct_underfilled_segments(
         "repair_only_real_bridge_filtered_line_mismatch": 0,
         "repair_only_real_bridge_filtered_block_membership_mismatch": 0,
         "repair_only_real_bridge_filtered_bridge_path_payload_empty": 0,
+        "repair_only_real_bridge_not_entered_reason": "REMOVED_REPAIR_BRIDGE_POOL_MAINLINE",
         "repair_bridge_pack_has_real_rows": False,
         "repair_bridge_raw_rows_total": 0,
         "repair_bridge_matched_rows_total": 0,
         "repair_bridge_kept_rows_total": 0,
-        # Family repair dedup diagnostics (for ALNS vs reconstruction role clarity)
         "family_repair_already_attempted_key_count": len(_family_dedup_keys),
         "repair_virtual_family_skipped_due_to_existing_attempt_count": 0,
         "repair_bridge_endpoint_key_mismatch_count": 0,
         "repair_bridge_field_name_mismatch_count": 0,
         "repair_bridge_inconsistency_count": 0,
-        "repair_bridge_boundary_band_enabled": True,
+        "repair_bridge_boundary_band_enabled": False,
         "repair_bridge_band_pairs_tested": 0,
         "repair_bridge_band_hits": 0,
         "repair_bridge_single_point_hits": 0,
         "repair_bridge_band_only_hits": 0,
-        "repair_bridge_band_best_distance": -1,
-        "repair_bridge_endpoint_adjustment_enabled": True,
         "repair_bridge_adjustments_generated": 0,
-        "repair_bridge_adjustment_pairs_tested": 0,
         "repair_bridge_adjustment_hits": 0,
         "repair_bridge_adjustment_only_hits": 0,
-        "repair_bridge_best_adjustment_cost": -1,
-        "repair_bridge_candidates_matched": 0,
-        "repair_bridge_candidates_rejected_pair_invalid": 0,
-        "repair_bridge_candidates_rejected_ton_invalid": 0,
-        "repair_bridge_candidates_rejected_score_worse": 0,
-        "repair_bridge_candidates_accepted": 0,
-        "repair_bridge_exact_invalid_pair_count": 0,
-        "repair_bridge_frontier_mismatch_count": 0,
-        "repair_bridge_pair_invalid_width": 0,
-        "repair_bridge_pair_invalid_thickness": 0,
-        "repair_bridge_pair_invalid_temp": 0,
-        "repair_bridge_pair_invalid_group": 0,
-        "repair_bridge_pair_invalid_context": 0,
-        "repair_bridge_pair_invalid_unknown": 0,
-        "repair_bridge_pair_fail_thickness": 0,
-        "repair_bridge_prefilter_fail_thickness": 0,
-        "repair_bridge_rank_pass_thickness": 0,
-        "repair_bridge_rank_fail_thickness": 0,
-        "repair_bridge_template_no_edge_count": 0,
-        "repair_bridge_prefilter_all_fail_count": 0,
+        "repair_bridge_endpoint_missing_count": 0,
+        "repair_bridge_boundary_band_enabled_reason": "REMOVED_REPAIR_BRIDGE_POOL_MAINLINE",
+        "repair_bridge_endpoint_class_counts": {},
+        "repair_bridge_endpoint_class_dominant": "REMOVED_REPAIR_BRIDGE_POOL_MAINLINE",
+        "repair_bridge_same_line_graph_key_count": 0,
+        "repair_bridge_near_graph_key_count": 0,
+        "repair_bridge_prefilter_fail_counts": {},
+        "repair_bridge_boundary_key_count": 0,
+        "repair_bridge_boundary_key_examples": [],
+        "repair_bridge_near_key_examples": [],
+        "repair_bridge_adjustment_examples": [],
+        "repair_bridge_rule_prefilter_all_fail_count": 0,
+        "repair_bridge_template_graph_no_edge_count": 0,
         "repair_bridge_band_too_narrow_count": 0,
-        "repair_bridge_prefilter_reject_count": 0,
-        "repair_bridge_endpoint_early_stop_count": 0,
-        "repair_bridge_local_band_retry_count": 0,
-        "underfilled_reconstruction_improvement_recorded_count": 0,
-        "underfilled_reconstruction_improvement_applied_count": 0,
-        "underfilled_reconstruction_apply_reject_count": 0,
-        "bridgeability_route_suggestion": "",
-        "bridgeability_census": {},
-        "bridgeability_census_items": [],
-        # ---- Legacy virtual pilot: 降级为单一布尔字段 ----
-        # 旧有细粒度 virtual_pilot 字段已从此处移除；
-        # 只保留一个总布尔字段，表明 virtual_pilot 在本运行中被禁用。
-        # 旧有字段仍在 internal virtual pilot 代码路径中兼容记录，
-        # 但不在此处输出（避免大量空值污染 engine_meta）。
-        "virtual_pilot_skipped_due_to_disabled": True,  # 主线始终 True（pilot disabled）
-        # ---- Internal compat counters: 内部代码路径会写入这些字段；
-        #     不暴露到 engine_meta/writer summary（避免大量空值污染）。
-        #     初始化为 0 / {} 以保证 +=1 操作安全。
-        "virtual_pilot_attempt_count": 0,
-        "virtual_pilot_success_count": 0,
-        "virtual_pilot_apply_count": 0,
-        "virtual_pilot_reject_count": 0,
-        "virtual_pilot_skipped_block_count": 0,
-        "virtual_pilot_skipped_due_to_disabled_count": 0,
-        "virtual_pilot_skipped_due_to_limit_count": 0,
-        "virtual_pilot_skipped_due_to_no_pilotable_candidate_count": 0,
-        "virtual_pilot_selected_block_count": 0,
-        "virtual_pilot_selected_unique_pilot_key_count": 0,
-        "virtual_pilot_structural_eligible_block_count": 0,
-        "virtual_pilot_runtime_enabled_block_count": 0,
-        "virtual_pilot_final_eligible_block_count": 0,
-        "virtual_pilot_eligible_block_count": 0,
-        "virtual_pilot_duplicate_candidate_skipped_count": 0,
-        "virtual_pilot_dedup_group_count": 0,
-        "virtual_pilot_small_block_soft_penalty_count": 0,
-        "virtual_pilot_spec_enum_total": 0,
-        "virtual_pilot_spec_enum_both_valid_count": 0,
-        "virtual_pilot_spec_enum_done_count": 0,
-        "virtual_pilot_family_prefilter_fail_count": 0,
-        "virtual_pilot_width_group_family_attempt_count": 0,
-        "virtual_pilot_thickness_family_attempt_count": 0,
-        "virtual_pilot_ton_fill_attempt_count": 0,
-        "virtual_pilot_ton_fill_success_count": 0,
-        "virtual_pilot_selected_candidate_count": 0,
-        "virtual_pilot_dedup_kept_count": 0,
-        "virtual_pilot_dedup_skipped_count": 0,
-        "virtual_pilot_attempt_started_count": 0,
-        "virtual_pilot_recut_entered_count": 0,
-        "virtual_pilot_segment_valid_count": 0,
-        "virtual_pilot_ton_fill_entered_count": 0,
-        "virtual_pilot_apply_check_entered_count": 0,
-        "virtual_pilot_apply_success_count": 0,
-        "virtual_pilot_selected_by_bucket_count": {},
-        "virtual_pilot_selected_by_family_count": {},
-        "virtual_pilot_fail_stage_count": {},
-        "virtual_pilot_post_spec_fail_stage_count": {},
-        "virtual_pilot_reject_by_reason_count": {},
-        "conservative_apply_attempt_count": 0,
-        "conservative_apply_success_count": 0,
-        "conservative_apply_reject_count": 0,
-        "repair_bridge_ton_rescue_attempts": 0,
-        "repair_bridge_ton_rescue_success": 0,
-        "repair_bridge_ton_rescue_windows_tested": 0,
-        "repair_bridge_ton_rescue_valid_delta": 0,
-        "repair_bridge_ton_rescue_underfilled_delta": 0,
-        "repair_bridge_ton_rescue_scheduled_orders_delta": 0,
-        "repair_bridge_ton_rescue_extract_attempts": 0,
-        "repair_bridge_ton_rescue_extract_success": 0,
-        "repair_bridge_ton_rescue_partial_success": 0,
-        "repair_bridge_ton_rescue_full_success": 0,
-        "repair_bridge_ton_rescue_residual_underfilled_count": 0,
-        "repair_bridge_ton_rescue_pair_fail_width": 0,
-        "repair_bridge_ton_rescue_pair_fail_thickness": 0,
-        "repair_bridge_ton_rescue_pair_fail_temp": 0,
-        "repair_bridge_ton_rescue_pair_fail_group": 0,
-        "repair_bridge_ton_rescue_pair_fail_context": 0,
-        "repair_bridge_ton_rescue_pair_fail_template": 0,
-        "repair_bridge_ton_rescue_pair_fail_multi": 0,
-        "repair_bridge_ton_rescue_pair_fail_unknown": 0,
-        "repair_bridge_filtered_ton_below_min_current_block": 0,
-        "repair_bridge_filtered_ton_below_min_even_after_neighbor_expansion": 0,
-        "repair_bridge_filtered_ton_above_max_after_expansion": 0,
-        "repair_bridge_filtered_ton_split_not_found": 0,
-        "repair_bridge_filtered_ton_rescue_no_gain": 0,
-        "repair_bridge_filtered_ton_rescue_impossible": 0,
-        "repair_only_real_bridge_used_segments": 0,
-        "repair_only_real_bridge_used_orders": 0,
-        "repair_only_real_bridge_not_entered_reason": "",
+        "repair_bridge_thickness_fail_count": 0,
+        "repair_bridge_width_fail_count": 0,
+        "repair_bridge_temp_fail_count": 0,
+        "repair_bridge_group_fail_count": 0,
+        "repair_bridge_multi_fail_count": 0,
+        "repair_bridge_ton_rescue_entered_count": 0,
+        "repair_bridge_ton_rescue_success_count": 0,
+        "repair_bridge_ton_rescue_window_tested_count": 0,
+        "repair_bridge_improvement_recorded_count": 0,
+        "repair_bridge_improvement_applied_count": 0,
+        "repair_bridge_apply_reject_count": 0,
+        "repair_bridge_conservative_apply_attempt_count": 0,
+        "repair_bridge_conservative_apply_success_count": 0,
+        "repair_bridge_conservative_apply_reject_count": 0,
         "reconstruction_no_gain": True,
-        "underfilled_reconstruction_seconds": 0.0,
+        "underfilled_reconstruction_seconds": round(perf_counter() - t0, 6),
         "repair_only_real_bridge_seconds": 0.0,
-        "reconstruction_seconds": 0.0,
+        "reconstruction_seconds": round(perf_counter() - t0, 6),
         "repair_bridge_real_seconds": 0.0,
+        "bridgeability_route_suggestion": "REMOVED_REPAIR_BRIDGE_POOL_MAINLINE",
+        "candidate_source": "graph_unused_nodes",
+        "legacy_repair_bridge_pool_removed": True,
     }
-    lines = sorted({str(s.line) for s in underfilled_segments})
-    tpl_df = _transition_templates_df(transition_pack)
-    order_specs_by_id = _build_order_spec_map_from_transition_context(transition_pack, tpl_df, orders_df=orders_df)
-    bridgeability_census = BridgeabilityCensus()
-    pack_meta = _pack_debug_meta(transition_pack)
-    diag.update(
-        {
-            "repair_bridge_pack_type": pack_meta.get("transition_pack_type", ""),
-            "repair_bridge_pack_keys": pack_meta.get("keys", []),
-            "repair_bridge_pack_line_keys": pack_meta.get("line_keys", []),
-            "repair_bridge_pack_has_real_rows": bool(len(_bridge_rows_for_line(tpl_df, None)) > 0),
-            "repair_bridge_pack_real_rows_total": int(len(_bridge_rows_for_line(tpl_df, None))),
-            "repair_bridge_pack_virtual_rows_total": int(len(_virtual_bridge_rows_for_line(tpl_df, None))),
-        }
-    )
-    print(
-        f"[APS][REPAIR_BRIDGE_PACK] transition_pack_type={pack_meta.get('transition_pack_type')}, "
-        f"keys={pack_meta.get('keys')}, line_keys={pack_meta.get('line_keys')}, "
-        f"has_transition_df={pack_meta.get('has_transition_df')}, "
-        f"has_template_df={pack_meta.get('has_template_df')}, "
-        f"has_bridge_paths={pack_meta.get('has_bridge_paths')}, "
-        f"has_real_bridge_edges={pack_meta.get('has_real_bridge_edges')}, "
-        f"has_virtual_bridge_edges={pack_meta.get('has_virtual_bridge_edges')}, "
-        f"has_transition_lookup={pack_meta.get('has_transition_lookup')}, "
-        f"has_edge_lookup={pack_meta.get('has_edge_lookup')}, "
-        f"has_path_lookup={pack_meta.get('has_path_lookup')}"
-    )
-    for line in sorted(set(lines + [str(r.get("line")) for r in _bridge_rows_for_line(tpl_df, None) if r.get("line", None) is not None])):
-        real_rows_line = _bridge_rows_for_line(tpl_df, line)
-        virtual_rows_line = _virtual_bridge_rows_for_line(tpl_df, line)
-        if line:
-            print(
-                f"[APS][REPAIR_BRIDGE_PACK_LINE] line={line}, "
-                f"size={len(tpl_df) if not tpl_df.empty else 0}, "
-                f"real_bridge_rows={len(real_rows_line)}, virtual_bridge_rows={len(virtual_rows_line)}"
-            )
-    print(
-        f"[APS][UNDERFILLED_RECON_ENTER] enabled=True, valid_in={len(valid_segments)}, "
-        f"underfilled_in={len(underfilled_segments)}, lines={lines}"
-    )
-
-    # =========================================================================
-    # Gain precheck: only continue if there's a realistic improvement signal
-    # =========================================================================
-    # Add cutter optimization diagnostics
-    diag.update({
-        "cutter_blocks_touched": 0,
-        "cutter_blocks_improved": 0,
-        "cutter_blocks_skipped_by_precheck": 0,
-        "cutter_blocks_skipped_by_no_gain_set": 0,
-        "cutter_no_gain_streak_max": 0,
-    })
-
-    # Precheck: build useful signals
-    _all_under = valid_segments + underfilled_segments
-    _has_underfilled = bool(underfilled_segments)
-    _gap_to_min_tons = max(0.0, campaign_ton_min - min((s.total_tons for s in underfilled_segments), default=0.0))
-    _gap_threshold = campaign_ton_min * 0.15  # 15% of min = clear signal
-    _has_significant_gap = _gap_to_min_tons > _gap_threshold
-    _has_real_bridge = bool(allow_real_bridge)
-    # Guarded family is profile-specific; check from config
-    _has_guard_family = bool(getattr(cfg.model, "virtual_family_frontload_enabled", False)) if cfg and cfg.model else False
-    _precheck_pass = (
-        _has_underfilled
-        or _has_significant_gap
-        or _has_real_bridge
-        or _has_guard_family
-    )
-    if not _precheck_pass:
-        diag["cutter_blocks_skipped_by_precheck"] = len(underfilled_segments)
-        diag["underfilled_reconstruction_not_entered_reason"] = "PRECHECK_FAILED_NO_GAIN_SIGNAL"
-        diag["underfilled_reconstruction_seconds"] = round(perf_counter() - t0, 6)
-        diag["reconstruction_seconds"] = diag["underfilled_reconstruction_seconds"]
-        print(
-            f"[APS][UNDERFILLED_RECON_PRECHECK] SKIP — no gain signal: "
-            f"has_underfilled={_has_underfilled}, gap={_gap_to_min_tons:.0f}/{_gap_threshold:.0f}, "
-            f"has_real_bridge={_has_real_bridge}, has_guard_family={_has_guard_family}"
-        )
-        return list(valid_segments), list(underfilled_segments), diag
-
-    # =========================================================================
-    # No-gain skip set: blocks that showed zero improvement twice → skip
-    # =========================================================================
-    # Note: no_gain_skip_set is initialized empty here. In the ALNS main loop,
-    # it persists across round calls via a module-level variable.
-    no_gain_skip_set: set[int] = set()
-
-    # =========================================================================
-    # Early stop: consecutive no-gain streak
-    # =========================================================================
-    no_gain_streak = 0
-    early_stop_no_gain_limit = 5  # Stop after N consecutive blocks with no gain
-    reconstruction_early_stopped = False
-
-    if not underfilled_segments:
-        census_dict = bridgeability_census.to_dict()
-        suggestion = _suggest_next_phase_from_census(census_dict)
-        diag["bridgeability_census"] = census_dict
-        diag["bridgeability_census_items"] = list(census_dict.get("items", []))
-        diag["bridgeability_route_suggestion"] = str(suggestion.get("suggestion", "CONTINUE_REAL_BRIDGE_ONLY"))
-        diag["underfilled_reconstruction_not_entered_reason"] = "NO_UNDERFILLED_SEGMENTS"
-        diag["repair_only_real_bridge_not_entered_reason"] = "NO_UNDERFILLED_SEGMENTS"
-        diag["underfilled_reconstruction_seconds"] = round(perf_counter() - t0, 6)
-        diag["reconstruction_seconds"] = diag["underfilled_reconstruction_seconds"]
-        print("[APS][UNDERFILLED_RECON_SKIP] line=ALL, block_id=0, reason=NO_UNDERFILLED_SEGMENTS")
-        print(
-            "[APS][BRIDGEABILITY_CENSUS] total_blocks=0, has_endpoint_edge_count=0, "
-            "template_graph_no_edge_count=0, rule_prefilter_all_fail_count=0, "
-            "band_too_narrow_count=0, candidate_pool_empty_count=0, candidate_pool_nonempty_count=0, "
-            "ton_rescue_entered_count=0, ton_rescue_success_count=0, improvement_recorded_count=0, "
-            "improvement_applied_count=0, thickness_fail_dominant_count=0, width_fail_dominant_count=0, "
-            "temp_fail_dominant_count=0, group_fail_dominant_count=0, multi_fail_dominant_count=0"
-        )
-        print(
-            f"[APS][BRIDGEABILITY_ROUTE_SUGGESTION] suggestion={diag['bridgeability_route_suggestion']}, "
-            f"reasons={list(suggestion.get('reasons', []))}"
-        )
-        print(
-            f"[APS][UNDERFILLED_RECON_SUMMARY] attempts=0, success=0, blocks_tested=0, "
-            f"valid_delta=0, underfilled_delta=0, salvaged_segments=0, salvaged_orders=0, "
-            f"cutter_blocks_touched=0, cutter_blocks_improved=0, "
-            f"cutter_blocks_skipped_by_precheck={diag.get('cutter_blocks_skipped_by_precheck', 0)}, "
-            f"cutter_blocks_skipped_by_no_gain_set=0, cutter_no_gain_streak_max=0, "
-            f"reconstruction_early_stopped=False, prefilter_reject_count=0, "
-            f"endpoint_early_stop_count=0, local_band_retry_count=0, "
-            f"improvement_recorded_count=0, improvement_applied_count=0, apply_reject_count=0, "
-            f"bridgeability_route_suggestion={diag['bridgeability_route_suggestion']}, "
-            f"virtual_pilot_skipped_due_to_disabled={bool(diag.get('virtual_pilot_skipped_due_to_disabled', True))}, "
-            f"conservative_apply_attempt_count=0, conservative_apply_success_count=0, "
-            f"conservative_apply_reject_count=0"
-        )
-        return list(valid_segments), [], diag
-
-    direct_edges, real_edges = _build_reconstruction_edge_maps(transition_pack)
-    tons_by_order = _infer_order_tons_from_underfilled(underfilled_segments, order_tons)
-    ton_target = float(getattr(cfg.rule, "campaign_ton_target", (campaign_ton_min + campaign_ton_max) / 2.0) if cfg and cfg.rule else (campaign_ton_min + campaign_ton_max) / 2.0)
-    max_real = int(getattr(cfg.model, "repair_only_bridge_max_per_segment", 1) if cfg and cfg.model else 1)
-    bridge_penalty = float(getattr(cfg.model, "repair_only_bridge_cost_penalty", 100000.0) if cfg and cfg.model else 100000.0)
-    left_band_k = int(getattr(cfg.model, "repair_bridge_left_band_k", 3) if cfg and cfg.model else 3)
-    right_band_k = int(getattr(cfg.model, "repair_bridge_right_band_k", 3) if cfg and cfg.model else 3)
-    max_band_pairs = int(getattr(cfg.model, "repair_bridge_band_max_pairs_per_split", 9) if cfg and cfg.model else 9)
-    left_trim_max = int(getattr(cfg.model, "repair_bridge_left_trim_max", 2) if cfg and cfg.model else 2)
-    right_trim_max = int(getattr(cfg.model, "repair_bridge_right_trim_max", 2) if cfg and cfg.model else 2)
-    adjustment_limit = int(getattr(cfg.model, "repair_bridge_endpoint_adjustment_limit_per_split", 9) if cfg and cfg.model else 9)
-    enable_left_trim = bool(getattr(cfg.model, "repair_bridge_adjustment_enable_left_trim", True) if cfg and cfg.model else True)
-    enable_right_trim = bool(getattr(cfg.model, "repair_bridge_adjustment_enable_right_trim", True) if cfg and cfg.model else True)
-    ton_rescue_max_neighbor_blocks = int(getattr(cfg.model, "repair_bridge_ton_rescue_max_neighbor_blocks", 2) if cfg and cfg.model else 2)
-    ton_rescue_enable_backward = bool(getattr(cfg.model, "repair_bridge_ton_rescue_enable_backward", True) if cfg and cfg.model else True)
-    ton_rescue_enable_forward = bool(getattr(cfg.model, "repair_bridge_ton_rescue_enable_forward", True) if cfg and cfg.model else True)
-    ton_rescue_enable_bidirectional = bool(getattr(cfg.model, "repair_bridge_ton_rescue_enable_bidirectional", True) if cfg and cfg.model else True)
-    ton_rescue_max_orders_per_window = int(getattr(cfg.model, "repair_bridge_ton_rescue_max_orders_per_window", 50) if cfg and cfg.model else 50)
-    ton_rescue_max_failed_after_min = int(getattr(cfg.model, "repair_bridge_ton_rescue_max_failed_windows_after_min", 2) if cfg and cfg.model else 2)
-    ton_rescue_max_left_expand = int(getattr(cfg.model, "repair_bridge_ton_rescue_max_left_expand", 12) if cfg and cfg.model else 12)
-    ton_rescue_max_right_expand = int(getattr(cfg.model, "repair_bridge_ton_rescue_max_right_expand", 12) if cfg and cfg.model else 12)
-    ton_rescue_max_extract_windows = int(getattr(cfg.model, "repair_bridge_ton_rescue_max_windows_per_candidate", 60) if cfg and cfg.model else 60)
-    virtual_pilot_enabled = bool(getattr(cfg.model, "repair_only_virtual_bridge_pilot_enabled", False) if cfg and cfg.model else False)
-    virtual_pilot_max_blocks = int(getattr(cfg.model, "virtual_bridge_pilot_max_blocks_per_run", 5) if cfg and cfg.model else 5)
-    virtual_pilot_max_per_block = int(getattr(cfg.model, "virtual_bridge_pilot_max_per_block", 1) if cfg and cfg.model else 1)
-    virtual_pilot_max_tons = float(getattr(cfg.model, "virtual_bridge_pilot_max_virtual_tons", 30.0) if cfg and cfg.model else 30.0)
-    virtual_pilot_penalty = float(getattr(cfg.model, "virtual_bridge_pilot_penalty", 1000000.0) if cfg and cfg.model else 1000000.0)
-    endpoint_class_cfg = getattr(cfg.model, "virtual_bridge_pilot_only_when_endpoint_class", None) if cfg and cfg.model else None
-    fail_reason_cfg = getattr(cfg.model, "virtual_bridge_pilot_only_when_dominant_fail", None) if cfg and cfg.model else None
-    virtual_pilot_endpoint_classes = set(endpoint_class_cfg or ["HAS_ENDPOINT_EDGE", "BAND_TOO_NARROW"])
-    virtual_pilot_fail_reasons = set(fail_reason_cfg or ["THICKNESS_RULE_FAIL", "WIDTH_RULE_FAIL", "GROUP_SWITCH_FAIL", "MULTI_RULE_FAIL"])
-    virtual_edges, virtual_tons_by_edge = _build_virtual_reconstruction_edges(transition_pack)
-    diag["virtual_pilot_scheduler_budget"] = int(virtual_pilot_max_blocks)
-    print(
-        f"[APS][VIRTUAL_BRIDGE_PILOT_CONFIG] enabled={bool(virtual_pilot_enabled)}, "
-        f"max_blocks_per_run={int(virtual_pilot_max_blocks)}, "
-        f"max_per_block={int(virtual_pilot_max_per_block)}, "
-        f"max_virtual_tons={float(virtual_pilot_max_tons):.1f}, "
-        f"penalty={float(virtual_pilot_penalty):.1f}"
-    )
-
-    frozen_oids = Counter()
-    for seg in valid_segments:
-        frozen_oids.update([str(v) for v in seg.order_ids])
-    under_oids = Counter()
-    for seg in underfilled_segments:
-        under_oids.update([str(v) for v in seg.order_ids])
-    overlap = [oid for oid in under_oids if oid in frozen_oids]
-    if overlap:
-        diag["reconstruction_no_gain"] = True
-        diag["frozen_underfilled_overlap_count"] = len(overlap)
-        diag["frozen_underfilled_overlap_examples"] = overlap[:10]
-        diag["underfilled_reconstruction_not_entered_reason"] = "FROZEN_UNDERFILLED_OVERLAP"
-        diag["repair_only_real_bridge_not_entered_reason"] = "FROZEN_UNDERFILLED_OVERLAP"
-        diag["underfilled_reconstruction_seconds"] = round(perf_counter() - t0, 6)
-        diag["reconstruction_seconds"] = diag["underfilled_reconstruction_seconds"]
-        print("[APS][UNDERFILLED_RECON_SKIP] line=ALL, block_id=0, reason=BLOCK_ORDER_MISMATCH")
-        return list(valid_segments), list(underfilled_segments), diag
-
-    new_valid = list(valid_segments)
-    remaining_under: list[CampaignSegment] = []
-    max_local_id = max([s.campaign_local_id for s in valid_segments + underfilled_segments] or [0])
-    virtual_pilot_tried_blocks: set[tuple[str, int]] = set()
-    virtual_pilot_seen_keys: set[tuple[str, str, str]] = set()
-    virtual_pilot_selected_by_line: Counter = Counter()
-    virtual_pilot_selected_by_bucket: Counter = Counter()
-    virtual_pilot_selected_by_family: Counter = Counter()
-    virtual_pilot_scheduler_selected_blocks: list[dict] = []
-    virtual_pilot_scheduler_skipped_due_to_limit: list[dict] = []
-    virtual_pilot_line_quota = max(2, int(virtual_pilot_max_blocks) // max(1, len(lines)))
-    virtual_pilot_bucket_quota = max(3, int(virtual_pilot_max_blocks) // 3)
-    virtual_pilot_family_quota = {
-        "WIDTH_GROUP": min(5, int(virtual_pilot_max_blocks)),
-        "THICKNESS": min(5, int(virtual_pilot_max_blocks)),
-        "OTHER": max(0, int(virtual_pilot_max_blocks) - 10),
-    }
-    if int(virtual_pilot_max_blocks) > sum(virtual_pilot_family_quota.values()):
-        virtual_pilot_family_quota["OTHER"] += int(virtual_pilot_max_blocks) - sum(virtual_pilot_family_quota.values())
-
-    for line in sorted({s.line for s in underfilled_segments}):
-        # ---- Early stop: consecutive no-gain streak limit ----
-        if reconstruction_early_stopped:
-            print(f"[APS][RECON_EARLY_STOP] line={line}, reason=NO_GAIN_STREAK_LIMIT({early_stop_no_gain_limit})")
-            diag["reconstruction_stage_early_stopped"] = True
-            break
-
-        line_under = sorted([s for s in underfilled_segments if s.line == line], key=lambda s: s.campaign_local_id)
-        line_pair_rows_by_key = _build_template_pair_rows_by_key(tpl_df, str(line))
-        line_bridge_schema = _print_bridge_schema_samples(tpl_df, str(line))
-        line_raw_real_rows = int(line_bridge_schema.get("raw_real_rows", 0) or 0)
-        if bool(line_bridge_schema.get("field_name_mismatch", False)):
-            diag["repair_bridge_field_name_mismatch_count"] += 1
-        if not line_under:
-            diag["underfilled_reconstruction_blocks_skipped"] += 1
-            print(f"[APS][UNDERFILLED_RECON_SKIP] line={line}, block_id=0, reason=NO_UNDERFILLED_SEGMENTS")
-            continue
-        i = 0
-        while i < len(line_under):
-            # ---- No-gain skip set: block already tried with no gain twice ----
-            block_uid = f"{line}:{i}"
-            if block_uid in no_gain_skip_set:
-                diag["cutter_blocks_skipped_by_no_gain_set"] = diag.get("cutter_blocks_skipped_by_no_gain_set", 0) + 1
-                remaining_under.append(line_under[i])
-                i += 1
-                continue
-            best = None
-            best_size = 1
-            block_id = i
-            if len(line_under) - i < 2:
-                diag["underfilled_reconstruction_blocks_skipped"] += 1
-                print(f"[APS][UNDERFILLED_RECON_SKIP] line={line}, block_id={block_id}, reason=BLOCK_TOO_SMALL")
-                remaining_under.append(line_under[i])
-                i += 1
-                continue
-            # Block will be processed — count as touched
-            diag["cutter_blocks_touched"] = diag.get("cutter_blocks_touched", 0) + 1
-            for block_size in (4, 3, 2):
-                if i + block_size > len(line_under):
-                    continue
-                block = line_under[i : i + block_size]
-                block_orders = [oid for seg in block for oid in seg.order_ids]
-                _print_order_context_lookup_sample(order_specs_by_id, [str(oid) for oid in block_orders[:8]], limit=4)
-                block_tons = sum(float(tons_by_order.get(str(oid), 0.0) or 0.0) for oid in block_orders)
-                block_real_rows = _bridge_rows_for_line(tpl_df, str(line))
-                block_virtual_rows = _virtual_bridge_rows_for_line(tpl_df, str(line))
-                real_bridge_lookup = _build_real_bridge_lookup(block_real_rows)
-                virtual_bridge_lookup = _build_virtual_bridge_lookup(block_virtual_rows)
-                single_point_keys = _block_single_point_boundary_keys(block)
-                base_boundary_keys, base_band_logs = _block_boundary_band_keys(
-                    block,
-                    left_band_k=left_band_k,
-                    right_band_k=right_band_k,
-                    max_pairs_per_split=max_band_pairs,
-                    order_context_by_id=order_specs_by_id,
-                    block_id=int(block_id),
-                    rule=cfg.rule if cfg and cfg.rule else None,
-                )
-                adjustment_boundary_keys: list[tuple[str, str, str]] = []
-                adjustment_band_logs: list[dict] = []
-                frontier_boundary_keys: list[tuple[str, str, str]] = []
-                frontier_contexts: dict[tuple[str, str, str], list[dict]] = {}
-                adjustment_generated_total = 0
-                adjustment_pairs_tested_total = 0
-                adjustment_hits_total = 0
-                adjustment_only_hits_total = 0
-                adjustment_best_cost: int | None = None
-                endpoint_class = "UNKNOWN_ENDPOINT_MISS"
-                dominant_fail_reason = "UNKNOWN"
-                final_decision_for_census = "NO_DIRECT_OR_BRIDGE_CANDIDATE"
-                ton_rescue_entered_for_census = False
-                ton_rescue_success_for_census = False
-                prefilter_rejected_for_census = False
-                single_match_diag = _count_real_bridge_matches(real_bridge_lookup, set(single_point_keys))
-                base_match_diag = _count_real_bridge_matches(real_bridge_lookup, set(base_boundary_keys))
-                base_band_only_hit = int(base_match_diag.get("matched_rows", 0) or 0) > 0 and int(single_match_diag.get("matched_rows", 0) or 0) <= 0
-                available_real_keys = list(real_bridge_lookup.keys())[:5]
-                left_tail_ids = [str(seg.order_ids[-1]) for seg in block if seg.order_ids][:4]
-                right_head_ids = [str(seg.order_ids[0]) for seg in block if seg.order_ids][:4]
-                print(
-                    f"[APS][UNDERFILLED_RECON_BLOCK] line={line}, block_id={block_id}, "
-                    f"block_size={block_size}, orders={len(block_orders)}, tons={block_tons:.1f}, "
-                    f"direct_only_enabled=True, real_bridge_enabled={bool(allow_real_bridge)}"
-                )
-                print(
-                    f"[APS][REPAIR_BRIDGE_BOUNDARY_KEYS] line={line}, block_id={block_id}, "
-                    f"split_count={len(base_boundary_keys)}, boundary_keys={base_boundary_keys[:8]}"
-                )
-                for band_item in base_band_logs:
-                    split_id = int(band_item.get("split_id", 0) or 0)
-                    band_pairs = list(band_item.get("band_pairs", []))
-                    matched_pairs = [key for key in band_pairs if key in real_bridge_lookup]
-                    matched_rows_count = sum(len(real_bridge_lookup.get(key, [])) for key in matched_pairs)
-                    print(
-                        f"[APS][REPAIR_BRIDGE_BAND] line={line}, block_id={block_id}, split_id={split_id}, "
-                        f"left_band={band_item.get('left_band', [])}, right_band={band_item.get('right_band', [])}, "
-                        f"band_pairs={band_pairs}"
-                    )
-                    print(
-                        f"[APS][REPAIR_BRIDGE_BAND_MATCH] line={line}, block_id={block_id}, split_id={split_id}, "
-                        f"matched_pairs={matched_pairs}, matched_rows={matched_rows_count}"
-                    )
-                    if matched_rows_count > 0:
-                        single_key = single_point_keys[split_id - 1] if 0 <= split_id - 1 < len(single_point_keys) else None
-                        single_hit = bool(single_key in real_bridge_lookup) if single_key else False
-                        if not single_hit:
-                            print(
-                                f"[APS][REPAIR_BRIDGE_BAND_HIT] line={line}, block_id={block_id}, split_id={split_id}, "
-                                f"single_point_miss=True, band_hit=True"
-                            )
-                endpoint_miss_result = _classify_endpoint_miss(
-                    line=str(line),
-                    block_id=int(block_id),
-                    boundary_keys=base_boundary_keys,
-                    real_bridge_lookup=real_bridge_lookup,
-                    order_context_by_id=order_specs_by_id,
-                    rule=cfg.rule if cfg and cfg.rule else None,
-                )
-                endpoint_class = str(endpoint_miss_result.get("class", "") or "")
-                if endpoint_class == "TEMPLATE_GRAPH_NO_EDGE":
-                    diag["repair_bridge_template_no_edge_count"] += 1
-                elif endpoint_class == "RULE_PREFILTER_ALL_FAIL":
-                    diag["repair_bridge_prefilter_all_fail_count"] += 1
-                elif endpoint_class == "BAND_TOO_NARROW":
-                    diag["repair_bridge_band_too_narrow_count"] += 1
-                endpoint_early_stop = endpoint_class in {"TEMPLATE_GRAPH_NO_EDGE", "RULE_PREFILTER_ALL_FAIL"}
-                if endpoint_early_stop:
-                    diag["repair_bridge_endpoint_early_stop_count"] += 1
-                    print(
-                        f"[APS][REPAIR_BRIDGE_EARLY_STOP] line={line}, block_id={block_id}, "
-                        f"endpoint_class={endpoint_class}, reason={endpoint_class}"
-                    )
-                elif endpoint_class == "BAND_TOO_NARROW":
-                    diag["repair_bridge_local_band_retry_count"] += 1
-                    print(
-                        f"[APS][REPAIR_BRIDGE_LOCAL_BAND_RETRY] line={line}, block_id={block_id}, "
-                        f"split_id=ALL, expand_side=right, extra=1"
-                    )
-                if not endpoint_early_stop:
-                    for split_id, (left_seg, right_seg) in enumerate(zip(block, block[1:]), start=1):
-                        left_orders = [str(v) for v in left_seg.order_ids]
-                        right_orders = [str(v) for v in right_seg.order_ids]
-                        adjustments = _generate_endpoint_adjustments(
-                            left_orders,
-                            right_orders,
-                            left_trim_max=left_trim_max,
-                            right_trim_max=right_trim_max,
-                            adjustment_limit=adjustment_limit,
-                            enable_left_trim=enable_left_trim,
-                            enable_right_trim=enable_right_trim,
-                            order_context_by_id=order_specs_by_id,
-                            rule=cfg.rule if cfg and cfg.rule else None,
-                        )
-                        adjustment_generated_total += int(len(adjustments))
-                        split_adjustment_hits = 0
-                        split_adjustment_pairs = 0
-                        split_best_adjust_cost: int | None = None
-                        base_split_pairs = list(base_band_logs[split_id - 1].get("band_pairs", [])) if 0 <= split_id - 1 < len(base_band_logs) else []
-                        base_split_hit = any(key in real_bridge_lookup for key in base_split_pairs)
-                        for adjustment_id, adjustment in enumerate(adjustments, start=1):
-                            adjusted_left_orders = [str(v) for v in adjustment.get("adjusted_left_orders", [])]
-                            adjusted_right_orders = [str(v) for v in adjustment.get("adjusted_right_orders", [])]
-                            band_pairs, adjusted_left_band, adjusted_right_band, adjusted_left_generation, adjusted_right_generation = _build_adjustment_band_pairs(
-                                line=str(line),
-                                adjusted_left_orders=adjusted_left_orders,
-                                adjusted_right_orders=adjusted_right_orders,
-                                left_band_k=left_band_k,
-                                right_band_k=right_band_k,
-                                max_pairs_per_split=max_band_pairs,
-                                order_context_by_id=order_specs_by_id,
-                                block_id=int(block_id),
-                                split_id=int(split_id),
-                                rule=cfg.rule if cfg and cfg.rule else None,
-                            )
-                            left_trim = int(adjustment.get("left_trim", 0) or 0)
-                            right_trim = int(adjustment.get("right_trim", 0) or 0)
-                            base_adjustment_cost = left_trim + right_trim
-                            score_pair = (str(adjusted_left_orders[-1]), str(adjusted_right_orders[0])) if adjusted_left_orders and adjusted_right_orders else ("", "")
-                            score_metrics = _quick_pair_rank_metrics(order_specs_by_id, score_pair[0], score_pair[1], rule=cfg.rule if cfg and cfg.rule else None) if score_pair[0] and score_pair[1] else {}
-                            thickness_penalty = float(score_metrics.get("thickness_penalty", 0.0) or 0.0)
-                            width_penalty = float(score_metrics.get("width_penalty", 0.0) or 0.0)
-                            temp_penalty = float(score_metrics.get("temp_penalty", 0.0) or 0.0)
-                            group_penalty = float(score_metrics.get("group_penalty", 0.0) or 0.0)
-                            hard_penalty = float(score_metrics.get("hard_prefilter_fail_penalty", 0.0) or 0.0)
-                            adjustment_cost = int(base_adjustment_cost + round(hard_penalty + thickness_penalty + width_penalty + temp_penalty + group_penalty))
-                            print(
-                                f"[APS][REPAIR_BRIDGE_ADJUST_SCORE] line={line}, block_id={block_id}, "
-                                f"split_id={split_id}, adjustment_id={adjustment_id}, "
-                                f"pair=({score_pair[0]},{score_pair[1]}), base_cost={base_adjustment_cost}, "
-                                f"thickness_penalty={thickness_penalty:.3f}, width_penalty={width_penalty:.3f}, "
-                                f"temp_penalty={temp_penalty:.3f}, group_penalty={group_penalty:.3f}, "
-                                f"final_cost={adjustment_cost}"
-                            )
-                            matched_pairs = [key for key in band_pairs if key in real_bridge_lookup]
-                            matched_rows_count = sum(len(real_bridge_lookup.get(key, [])) for key in matched_pairs)
-                            adjustment_pairs_tested_total += int(len(band_pairs))
-                            split_adjustment_pairs += int(len(band_pairs))
-                            adjustment_boundary_keys.extend(band_pairs)
-                            frontier_key: tuple[str, str, str] | None = None
-                            if adjusted_left_orders and adjusted_right_orders:
-                                frontier_key = (
-                                    str(line),
-                                    str(adjusted_left_orders[-1]),
-                                    str(adjusted_right_orders[0]),
-                                )
-                                frontier_boundary_keys.append(frontier_key)
-                                frontier_contexts.setdefault(frontier_key, []).append(
-                                    {
-                                        "split_id": split_id,
-                                        "adjustment_id": adjustment_id,
-                                        "left_trim": left_trim,
-                                        "right_trim": right_trim,
-                                        "adjusted_left_orders": list(adjusted_left_orders),
-                                        "adjusted_right_orders": list(adjusted_right_orders),
-                                        "actual_left_tail": str(adjusted_left_orders[-1]),
-                                        "actual_right_head": str(adjusted_right_orders[0]),
-                                    }
-                                )
-                            adjustment_band_logs.append(
-                                {
-                                    "split_id": split_id,
-                                    "adjustment_id": adjustment_id,
-                                    "left_trim": left_trim,
-                                    "right_trim": right_trim,
-                                    "base_cost": int(base_adjustment_cost),
-                                    "thickness_penalty": float(thickness_penalty),
-                                    "width_penalty": float(width_penalty),
-                                    "temp_penalty": float(temp_penalty),
-                                    "group_penalty": float(group_penalty),
-                                    "final_cost": int(adjustment_cost),
-                                    "left_band": adjusted_left_band,
-                                    "right_band": adjusted_right_band,
-                                    "left_generation_order": list(adjusted_left_generation),
-                                    "right_generation_order": list(adjusted_right_generation),
-                                    "band_pairs": band_pairs,
-                                }
-                            )
-                            print(
-                                f"[APS][REPAIR_BRIDGE_ADJUST] line={line}, block_id={block_id}, "
-                                f"split_id={split_id}, adjustment_id={adjustment_id}, "
-                                f"left_trim={left_trim}, right_trim={right_trim}"
-                            )
-                            print(
-                                f"[APS][REPAIR_BRIDGE_ADJUST_BAND] line={line}, block_id={block_id}, "
-                                f"split_id={split_id}, adjustment_id={adjustment_id}, "
-                                f"left_band={adjusted_left_band}, right_band={adjusted_right_band}, "
-                                f"band_pairs={band_pairs}"
-                            )
-                            print(
-                                f"[APS][REPAIR_BRIDGE_ADJUST_MATCH] line={line}, block_id={block_id}, "
-                                f"split_id={split_id}, adjustment_id={adjustment_id}, "
-                                f"matched_pairs={matched_pairs}, matched_rows={matched_rows_count}"
-                            )
-                            if matched_rows_count > 0:
-                                adjustment_hits_total += int(matched_rows_count)
-                                split_adjustment_hits += int(matched_rows_count)
-                                adjustment_best_cost = adjustment_cost if adjustment_best_cost is None else min(adjustment_best_cost, adjustment_cost)
-                                split_best_adjust_cost = adjustment_cost if split_best_adjust_cost is None else min(split_best_adjust_cost, adjustment_cost)
-                                if not base_split_hit and adjustment_cost > 0:
-                                    adjustment_only_hits_total += int(matched_rows_count)
-                                    print(
-                                        f"[APS][REPAIR_BRIDGE_ADJUST_HIT] line={line}, block_id={block_id}, "
-                                        f"split_id={split_id}, adjustment_id={adjustment_id}, "
-                                        f"left_trim={left_trim}, right_trim={right_trim}, "
-                                        f"base_hit=False, adjusted_hit=True"
-                                    )
-                        print(
-                            f"[APS][REPAIR_BRIDGE_ADJUST_SUMMARY] line={line}, block_id={block_id}, "
-                            f"split_id={split_id}, adjustments_generated={len(adjustments)}, "
-                            f"pairs_tested={split_adjustment_pairs}, adjustment_hits={split_adjustment_hits}, "
-                            f"best_adjustment_cost={-1 if split_best_adjust_cost is None else int(split_best_adjust_cost)}"
-                        )
-                boundary_keys = list(dict.fromkeys(base_boundary_keys + adjustment_boundary_keys))
-                frontier_keys = list(dict.fromkeys(frontier_boundary_keys))
-                band_logs = base_band_logs + adjustment_band_logs
-                real_edge_distance = _boundary_band_distance_map(band_logs)
-                real_edge_adjustment_cost = _endpoint_adjustment_cost_map(band_logs)
-                bridge_match_diag = _count_real_bridge_matches(real_bridge_lookup, set(boundary_keys))
-                frontier_match_diag = _count_real_bridge_matches(real_bridge_lookup, set(frontier_keys))
-                adjustment_match_diag = _count_real_bridge_matches(real_bridge_lookup, set(adjustment_boundary_keys))
-                band_only_hit = int(base_match_diag.get("matched_rows", 0) or 0) > 0 and int(single_match_diag.get("matched_rows", 0) or 0) <= 0
-                matched_bridge_keys = _rank_pair_keys_by_rules(
-                    [key for key in boundary_keys if key in real_bridge_lookup],
-                    order_specs_by_id,
-                    adjustment_cost_by_pair=real_edge_adjustment_cost,
-                    rule=cfg.rule if cfg and cfg.rule else None,
-                )
-                frontier_matched_keys = _rank_pair_keys_by_rules(
-                    [key for key in frontier_keys if key in real_bridge_lookup],
-                    order_specs_by_id,
-                    adjustment_cost_by_pair=real_edge_adjustment_cost,
-                    rule=cfg.rule if cfg and cfg.rule else None,
-                )
-                virtual_frontier_keys = _rank_pair_keys_by_rules(
-                    [key for key in frontier_keys if key in virtual_bridge_lookup],
-                    order_specs_by_id,
-                    adjustment_cost_by_pair=real_edge_adjustment_cost,
-                    rule=cfg.rule if cfg and cfg.rule else None,
-                )
-                bridge_candidate_audit = _repair_bridge_candidate_audit(
-                    line=str(line),
-                    block_id=int(block_id),
-                    block=block,
-                    real_bridge_lookup=real_bridge_lookup,
-                    matched_keys=matched_bridge_keys,
-                    frontier_contexts=frontier_contexts,
-                    direct_edges=direct_edges,
-                    real_edges=real_edges,
-                    pair_rows_by_key=line_pair_rows_by_key,
-                    order_specs_by_id=order_specs_by_id,
-                    rule=cfg.rule if cfg and cfg.rule else None,
-                    real_edge_adjustment_cost=real_edge_adjustment_cost,
-                    endpoint_class=endpoint_class,
-                    order_tons=tons_by_order,
-                    campaign_ton_min=campaign_ton_min,
-                    campaign_ton_max=campaign_ton_max,
-                ) if matched_bridge_keys else {
-                    "matched": 0,
-                    "rejected_pair_invalid": 0,
-                    "rejected_ton_invalid": 0,
-                    "rejected_score_worse": 0,
-                    "accepted": 0,
-                    "exact_invalid_pair_count": 0,
-                    "frontier_mismatch": 0,
-                    "pair_invalid_width": 0,
-                    "pair_invalid_thickness": 0,
-                    "pair_invalid_temp": 0,
-                    "pair_invalid_group": 0,
-                    "pair_invalid_context": 0,
-                    "pair_invalid_unknown": 0,
-                    "prefilter_fail_thickness": 0,
-                    "rank_pass_thickness": 0,
-                    "rank_fail_thickness": 0,
-                    "prefilter_reject_count": 0,
-                    "pilot_candidates": [],
-                    "reject_buckets": Counter(),
-                }
-                print(
-                    f"[APS][REPAIR_BRIDGE_LOOKUP] line={line}, "
-                    f"total_real_rows={len(block_real_rows)}, unique_keys={len(real_bridge_lookup)}"
-                )
-                print(
-                    f"[APS][REPAIR_BRIDGE_KEYS] line={line}, block_id={block_id}, "
-                    f"left_tail_ids={left_tail_ids}, right_head_ids={right_head_ids}, "
-                    f"lookup_key_mode=(line,from_order_id,to_order_id), expected_key_sample={boundary_keys[:5]}"
-                )
-                print(
-                    f"[APS][REPAIR_BRIDGE_RAW] line={line}, block_id={block_id}, "
-                    f"raw_rows={line_raw_real_rows}"
-                )
-                print(
-                    f"[APS][REPAIR_BRIDGE_MATCH] line={line}, block_id={block_id}, "
-                    f"matched_rows={int(bridge_match_diag.get('matched_rows', 0))}, "
-                    f"frontier_matched_rows={int(frontier_match_diag.get('matched_rows', 0))}"
-                )
-                diag["repair_bridge_raw_rows_total"] += int(line_raw_real_rows)
-                diag["repair_bridge_matched_rows_total"] += int(bridge_match_diag.get("matched_rows", 0))
-                diag["repair_bridge_band_pairs_tested"] += int(len(base_boundary_keys))
-                diag["repair_bridge_band_hits"] += int(base_match_diag.get("matched_rows", 0) or 0)
-                diag["repair_bridge_single_point_hits"] += int(single_match_diag.get("matched_rows", 0) or 0)
-                diag["repair_bridge_adjustments_generated"] += int(adjustment_generated_total)
-                diag["repair_bridge_adjustment_pairs_tested"] += int(adjustment_pairs_tested_total)
-                diag["repair_bridge_adjustment_hits"] += int(adjustment_hits_total)
-                diag["repair_bridge_adjustment_only_hits"] += int(adjustment_only_hits_total)
-                diag["repair_bridge_candidates_matched"] += int(bridge_candidate_audit.get("matched", 0) or 0)
-                diag["repair_bridge_candidates_rejected_pair_invalid"] += int(bridge_candidate_audit.get("rejected_pair_invalid", 0) or 0)
-                diag["repair_bridge_candidates_rejected_ton_invalid"] += int(bridge_candidate_audit.get("rejected_ton_invalid", 0) or 0)
-                diag["repair_bridge_candidates_rejected_score_worse"] += int(bridge_candidate_audit.get("rejected_score_worse", 0) or 0)
-                diag["repair_bridge_candidates_accepted"] += int(bridge_candidate_audit.get("accepted", 0) or 0)
-                diag["repair_bridge_exact_invalid_pair_count"] += int(bridge_candidate_audit.get("exact_invalid_pair_count", 0) or 0)
-                diag["repair_bridge_frontier_mismatch_count"] += int(bridge_candidate_audit.get("frontier_mismatch", 0) or 0)
-                diag["repair_bridge_pair_invalid_width"] += int(bridge_candidate_audit.get("pair_invalid_width", 0) or 0)
-                diag["repair_bridge_pair_invalid_thickness"] += int(bridge_candidate_audit.get("pair_invalid_thickness", 0) or 0)
-                diag["repair_bridge_pair_invalid_temp"] += int(bridge_candidate_audit.get("pair_invalid_temp", 0) or 0)
-                diag["repair_bridge_pair_invalid_group"] += int(bridge_candidate_audit.get("pair_invalid_group", 0) or 0)
-                diag["repair_bridge_pair_invalid_context"] += int(bridge_candidate_audit.get("pair_invalid_context", 0) or 0)
-                diag["repair_bridge_pair_invalid_unknown"] += int(bridge_candidate_audit.get("pair_invalid_unknown", 0) or 0)
-                diag["repair_bridge_pair_fail_thickness"] += int(bridge_candidate_audit.get("pair_invalid_thickness", 0) or 0)
-                diag["repair_bridge_prefilter_fail_thickness"] += int(bridge_candidate_audit.get("prefilter_fail_thickness", 0) or 0)
-                diag["repair_bridge_rank_pass_thickness"] += int(bridge_candidate_audit.get("rank_pass_thickness", 0) or 0)
-                diag["repair_bridge_rank_fail_thickness"] += int(bridge_candidate_audit.get("rank_fail_thickness", 0) or 0)
-                diag["repair_bridge_prefilter_reject_count"] += int(bridge_candidate_audit.get("prefilter_reject_count", 0) or 0)
-                diag["repair_bridge_filtered_ton_below_min_current_block"] += int(bridge_candidate_audit.get("filtered_ton_below_min_current_block", 0) or 0)
-                if adjustment_best_cost is not None:
-                    old_adjust_cost = int(diag.get("repair_bridge_best_adjustment_cost", -1) or -1)
-                    diag["repair_bridge_best_adjustment_cost"] = int(adjustment_best_cost) if old_adjust_cost < 0 else min(old_adjust_cost, int(adjustment_best_cost))
-                if base_band_only_hit:
-                    diag["repair_bridge_band_only_hits"] += int(base_match_diag.get("matched_rows", 0) or 0)
-                if int(base_match_diag.get("matched_rows", 0) or 0) > 0:
-                    matched_distances = [
-                        real_edge_distance.get((str(key[1]), str(key[2])), 999)
-                        for key in base_boundary_keys
-                        if key in real_bridge_lookup
-                    ]
-                    if matched_distances:
-                        best_distance = int(min(matched_distances))
-                        old_distance = int(diag.get("repair_bridge_band_best_distance", -1) or -1)
-                        diag["repair_bridge_band_best_distance"] = best_distance if old_distance < 0 else min(old_distance, best_distance)
-                diag["repair_only_real_bridge_filtered_line_mismatch"] += int(bridge_match_diag.get("line_mismatch", 0))
-                diag["repair_only_real_bridge_filtered_block_membership_mismatch"] += int(bridge_match_diag.get("block_membership_mismatch", 0))
-                diag["repair_only_real_bridge_filtered_bridge_path_payload_empty"] += int(bridge_match_diag.get("payload_empty", 0))
-                if line_raw_real_rows > 0 and int(bridge_match_diag.get("matched_rows", 0)) <= 0:
-                    diag["repair_bridge_endpoint_key_mismatch_count"] += 1
-                    print(
-                        f"[APS][REPAIR_BRIDGE_MATCH_FAIL] line={line}, block_id={block_id}, "
-                        f"reason=ENDPOINT_KEY_MISMATCH"
-                    )
-                    print(
-                        f"[APS][REPAIR_BRIDGE_ENDPOINT_FAIL] line={line}, block_id={block_id}, "
-                        f"boundary_keys={boundary_keys[:8]}, sample_available_real_keys={available_real_keys}"
-                    )
-                print(
-                    f"[APS][REPAIR_BRIDGE_BAND_SUMMARY] line={line}, block_id={block_id}, "
-                    f"band_pairs_tested={len(base_boundary_keys)}, "
-                    f"band_hits={int(base_match_diag.get('matched_rows', 0) or 0)}, "
-                    f"single_point_hits={int(single_match_diag.get('matched_rows', 0) or 0)}, "
-                    f"band_only_hits={int(base_match_diag.get('matched_rows', 0) or 0) if band_only_hit else 0}"
-                )
-                print(
-                    f"[APS][REPAIR_BRIDGE_ADJUST_SUMMARY] line={line}, block_id={block_id}, "
-                    f"adjustments_generated={adjustment_generated_total}, "
-                    f"pairs_tested={adjustment_pairs_tested_total}, "
-                    f"adjustment_hits={adjustment_hits_total}, "
-                    f"adjustment_only_hits={adjustment_only_hits_total}"
-                )
-                if int(bridge_match_diag.get("payload_empty", 0) or 0) > 0:
-                    for key in boundary_keys:
-                        for row in real_bridge_lookup.get(key, [])[:2]:
-                            if _bridge_payload_empty(row):
-                                src, _ = _extract_bridge_endpoint(row, "from")
-                                dst, _ = _extract_bridge_endpoint(row, "to")
-                                print(
-                                    f"[APS][REPAIR_BRIDGE_PAYLOAD_NOTICE] line={line}, block_id={block_id}, "
-                                    f"from={src}, to={dst}, payload_empty=True, edge_kept=True"
-                                )
-                if line_raw_real_rows <= 0 and int(diag.get("repair_bridge_pack_real_rows_total", 0) or 0) > 0:
-                    diag["repair_bridge_inconsistency_count"] += 1
-                    print(
-                        f"[APS][REPAIR_BRIDGE_INCONSISTENCY] line={line}, "
-                        f"template_real_bridge_count={int(diag.get('repair_bridge_pack_real_rows_total', 0) or 0)}, "
-                        f"reconstruction_raw_rows=0"
-                    )
-                diag["underfilled_reconstruction_attempts"] += 1
-                diag["underfilled_reconstruction_blocks_tested"] += 1
-                direct_valid, direct_under, direct_diag = _solve_underfilled_reconstruction_block(
-                    block,
-                    direct_edges=direct_edges,
-                    real_edges=real_edges,
-                    order_tons=tons_by_order,
-                    campaign_ton_min=campaign_ton_min,
-                    campaign_ton_max=campaign_ton_max,
-                    campaign_ton_target=ton_target,
-                    allow_real_bridge=False,
-                    allow_virtual_bridge=False,
-                    max_real_bridge_per_segment=0,
-                    bridge_cost_penalty=bridge_penalty,
-                    next_local_id=max_local_id,
-                )
-                if direct_valid:
-                    best = (direct_valid, direct_under, direct_diag, "DIRECT", block)
-                    best_size = block_size
-                    _record_bridgeability_census_item(
-                        bridgeability_census,
-                        {
-                            "line": str(line),
-                            "block_id": int(block_id),
-                            "block_size": int(block_size),
-                            "orders": int(len(block_orders)),
-                            "tons": float(block_tons),
-                            "endpoint_class": str(endpoint_class),
-                            "dominant_fail_reason": "DIRECT_ONLY_FEASIBLE",
-                            "candidate_count": int(bridge_match_diag.get("matched_rows", 0) or 0),
-                            "frontier_candidate_count": int(frontier_match_diag.get("matched_rows", 0) or 0),
-                            "prefilter_rejected": False,
-                            "ton_rescue_entered": False,
-                            "ton_rescue_success": False,
-                            "final_decision": "DIRECT_IMPROVEMENT_FOUND",
-                        },
-                    )
-                    break
-                if allow_real_bridge:
-                    real_t0 = perf_counter()
-                    diag["repair_only_real_bridge_attempts"] += 1
-                    print(
-                        f"[APS][REPAIR_BRIDGE_ENTER] line={line}, block_id={block_id}, "
-                        f"repair_only_real_bridge_enabled={bool(allow_real_bridge)}, "
-                        f"repair_only_virtual_bridge_enabled={bool(allow_virtual_bridge)}"
-                    )
-                    real_valid, real_under, real_diag = _solve_underfilled_reconstruction_block(
-                        block,
-                        direct_edges=direct_edges,
-                        real_edges={(str(k[1]), str(k[2])) for k in frontier_matched_keys},
-                        order_tons=tons_by_order,
-                        campaign_ton_min=campaign_ton_min,
-                        campaign_ton_max=campaign_ton_max,
-                        campaign_ton_target=ton_target,
-                        allow_real_bridge=True,
-                        allow_virtual_bridge=allow_virtual_bridge,
-                        max_real_bridge_per_segment=max_real,
-                        bridge_cost_penalty=bridge_penalty,
-                        next_local_id=max_local_id,
-                        real_edge_distance=real_edge_distance,
-                        real_edge_adjustment_cost=real_edge_adjustment_cost,
-                    )
-                    diag["repair_bridge_real_seconds"] += perf_counter() - real_t0
-                    diag["repair_only_real_bridge_seconds"] = diag["repair_bridge_real_seconds"]
-                    real_diag_report = dict(real_diag)
-                    if int(bridge_match_diag.get("matched_rows", 0) or 0) > 0:
-                        real_diag_report["repair_only_real_bridge_filtered_pair_invalid"] = max(
-                            int(real_diag_report.get("repair_only_real_bridge_filtered_pair_invalid", 0) or 0),
-                            int(bridge_candidate_audit.get("rejected_pair_invalid", 0) or 0),
-                        )
-                        real_diag_report["repair_only_real_bridge_filtered_ton_invalid"] = max(
-                            int(real_diag_report.get("repair_only_real_bridge_filtered_ton_invalid", 0) or 0),
-                            int(bridge_candidate_audit.get("rejected_ton_invalid", 0) or 0),
-                        )
-                    for key in _bridge_filter_diag_template():
-                        diag[key] += int(real_diag_report.get(key, 0) or 0)
-                    if bool(direct_diag.get("direct_only_feasible", False)):
-                        diag["repair_only_real_bridge_filtered_direct_feasible"] += 1
-                    print(
-                        f"[APS][REPAIR_BRIDGE_POOL] line={line}, block_id={block_id}, "
-                        f"total_candidates={int(bridge_match_diag.get('matched_rows', 0) or 0)}, "
-                        f"real_candidates={int(frontier_match_diag.get('matched_rows', 0) or 0)}, "
-                        f"virtual_candidates=0, "
-                        f"kept_after_basic_filter={int(real_diag_report.get('repair_only_real_bridge_candidates_kept', 0) or 0)}"
-                    )
-                    diag["repair_bridge_kept_rows_total"] += int(real_diag_report.get("repair_only_real_bridge_candidates_kept", 0) or 0)
-                    if int(bridge_match_diag.get("matched_rows", 0) or 0) > 0 and int(real_diag_report.get("repair_only_real_bridge_candidates_kept", 0) or 0) <= 0:
-                        print(f"[APS][REPAIR_BRIDGE_FILTER_FAIL] line={line}, block_id={block_id}, reason=ALL_FILTERED")
-                    print(
-                        f"[APS][REPAIR_BRIDGE_FILTER_SUMMARY] line={line}, block_id={block_id}, "
-                        f"attempts=1, raw={line_raw_real_rows}, "
-                        f"matched={int(bridge_match_diag.get('matched_rows', 0) or 0)}, "
-                        f"frontier_matched={int(frontier_match_diag.get('matched_rows', 0) or 0)}, "
-                        f"kept={int(real_diag_report.get('repair_only_real_bridge_candidates_kept', 0) or 0)}, "
-                        f"filtered_direct_feasible={int(real_diag_report.get('repair_only_real_bridge_filtered_direct_feasible', 0) or 0)}, "
-                        f"filtered_pair_invalid={int(real_diag_report.get('repair_only_real_bridge_filtered_pair_invalid', 0) or 0)}, "
-                        f"filtered_ton_invalid={int(real_diag_report.get('repair_only_real_bridge_filtered_ton_invalid', 0) or 0)}, "
-                        f"filtered_score_worse={int(real_diag_report.get('repair_only_real_bridge_filtered_score_worse', 0) or 0)}, "
-                        f"filtered_line_mismatch={int(bridge_match_diag.get('line_mismatch', 0) or 0)}, "
-                        f"filtered_block_membership_mismatch={int(bridge_match_diag.get('block_membership_mismatch', 0) or 0)}, "
-                        f"filtered_bridge_path_payload_empty={int(bridge_match_diag.get('payload_empty', 0) or 0)}, "
-                        f"endpoint_missing={int(bridge_match_diag.get('endpoint_missing', 0) or 0)}"
-                    )
-                    if real_valid:
-                        diag["repair_bridge_candidates_accepted"] += max(1, int(real_diag_report.get("repair_only_real_bridge_candidates_kept", 0) or 0))
-                        best = (real_valid, real_under, real_diag, "REAL", block)
-                        best_size = block_size
-                        _record_bridgeability_census_item(
-                            bridgeability_census,
-                            {
-                                "line": str(line),
-                                "block_id": int(block_id),
-                                "block_size": int(block_size),
-                                "orders": int(len(block_orders)),
-                                "tons": float(block_tons),
-                                "endpoint_class": str(endpoint_class),
-                                "dominant_fail_reason": "REAL_BRIDGE_FEASIBLE",
-                                "candidate_count": int(bridge_match_diag.get("matched_rows", 0) or 0),
-                                "frontier_candidate_count": int(frontier_match_diag.get("matched_rows", 0) or 0),
-                                "prefilter_rejected": bool(int(bridge_candidate_audit.get("prefilter_reject_count", 0) or 0) > 0),
-                                "ton_rescue_entered": False,
-                                "ton_rescue_success": False,
-                                "final_decision": "REAL_IMPROVEMENT_FOUND",
-                            },
-                        )
-                        break
-                    ton_rescue_candidates = list(bridge_candidate_audit.get("ton_rescue_candidates", []) or [])
-                    rescue_result = None
-                    rescue_reason_counts: Counter = Counter()
-                    if ton_rescue_candidates and int(frontier_match_diag.get("matched_rows", 0) or 0) > 0:
-                        for rescue_candidate in ton_rescue_candidates:
-                            candidate_key = rescue_candidate.get("key")
-                            if not candidate_key:
-                                continue
-                            rescue_edge = (str(candidate_key[1]), str(candidate_key[2]))
-                            diag["repair_bridge_ton_rescue_attempts"] += 1
-                            max_back = min(int(ton_rescue_max_neighbor_blocks), i)
-                            max_fwd = min(int(ton_rescue_max_neighbor_blocks), max(0, len(line_under) - (i + block_size)))
-                            theoretical_start = max(0, i - max_back)
-                            theoretical_end = min(len(line_under), i + block_size + max_fwd)
-                            theoretical_orders = [
-                                str(oid)
-                                for seg in line_under[theoretical_start:theoretical_end]
-                                for oid in seg.order_ids
-                            ]
-                            theoretical_max_tons = sum(float(tons_by_order.get(str(oid), 0.0) or 0.0) for oid in theoretical_orders)
-                            if theoretical_max_tons < float(campaign_ton_min) - 1e-6:
-                                diag["repair_bridge_filtered_ton_rescue_impossible"] += 1
-                                rescue_reason_counts["TON_RESCUE_IMPOSSIBLE"] += 1
-                                print(
-                                    f"[APS][REPAIR_BRIDGE_TON_RESCUE_IMPOSSIBLE] "
-                                    f"candidate_id={rescue_candidate.get('candidate_id')}, "
-                                    f"theoretical_max_tons={theoretical_max_tons:.1f}, "
-                                    f"campaign_ton_min={float(campaign_ton_min):.1f}"
-                                )
-                                continue
-                            rescue_windows = _generate_ton_rescue_windows(
-                                line_under=line_under,
-                                current_block_idx=i,
-                                current_block_size=block_size,
-                                order_tons=tons_by_order,
-                                campaign_ton_min=campaign_ton_min,
-                                max_neighbor_blocks=ton_rescue_max_neighbor_blocks,
-                                max_orders_per_window=ton_rescue_max_orders_per_window,
-                                enable_backward=ton_rescue_enable_backward,
-                                enable_forward=ton_rescue_enable_forward,
-                                enable_bidirectional=ton_rescue_enable_bidirectional,
-                            )
-                            failed_after_min = 0
-                            last_tons: float | None = None
-                            current_block_segment_ids = [int(seg.campaign_local_id) for seg in block]
-                            current_block_segment_count = len(block)
-                            for window_id, window in enumerate(rescue_windows, start=1):
-                                combined_tons = float(window.get("tons", 0.0) or 0.0)
-                                if last_tons is not None and abs(combined_tons - last_tons) <= 1e-6:
-                                    continue
-                                last_tons = combined_tons
-                                expansion_block = list(window.get("block", []))
-                                diag["repair_bridge_ton_rescue_windows_tested"] += 1
-                                diag["repair_bridge_ton_rescue_extract_attempts"] += 1
-                                result = _try_bridge_ton_rescue_recut(
-                                    candidate=rescue_candidate,
-                                    line=str(line),
-                                    block_id=int(block_id),
-                                    window_id=int(window_id),
-                                    direction=str(window.get("direction", "")),
-                                    expansion_block=expansion_block,
-                                    current_block_segment_count=current_block_segment_count,
-                                    current_block_segment_ids=current_block_segment_ids,
-                                    direct_edges=direct_edges,
-                                    real_edge=rescue_edge,
-                                    order_tons=tons_by_order,
-                                    campaign_ton_min=campaign_ton_min,
-                                    campaign_ton_max=campaign_ton_max,
-                                    campaign_ton_target=ton_target,
-                                    max_real_bridge_per_segment=max_real,
-                                    bridge_cost_penalty=bridge_penalty,
-                                    next_local_id=max_local_id,
-                                    ton_rescue_max_left_expand=ton_rescue_max_left_expand,
-                                    ton_rescue_max_right_expand=ton_rescue_max_right_expand,
-                                    ton_rescue_max_windows_per_candidate=ton_rescue_max_extract_windows,
-                                    pair_rows_by_key=line_pair_rows_by_key,
-                                    order_specs_by_id=order_specs_by_id,
-                                    rule=cfg.rule if cfg and cfg.rule else None,
-                                    real_edge_distance=real_edge_distance,
-                                    real_edge_adjustment_cost=real_edge_adjustment_cost,
-                                )
-                                result_diag = dict(result.get("diag", {}) or {})
-                                fail_counts = dict(result_diag.get("fail_counts_by_reason", {}) or {})
-                                diag["repair_bridge_ton_rescue_pair_fail_width"] += int(fail_counts.get("WIDTH_RULE_FAIL", 0) or 0)
-                                diag["repair_bridge_ton_rescue_pair_fail_thickness"] += int(fail_counts.get("THICKNESS_RULE_FAIL", 0) or 0)
-                                diag["repair_bridge_ton_rescue_pair_fail_temp"] += int(fail_counts.get("TEMP_OVERLAP_FAIL", 0) or 0)
-                                diag["repair_bridge_ton_rescue_pair_fail_group"] += int(fail_counts.get("GROUP_SWITCH_FAIL", 0) or 0)
-                                diag["repair_bridge_ton_rescue_pair_fail_context"] += int(fail_counts.get("ORDER_CONTEXT_MISSING", 0) or 0)
-                                diag["repair_bridge_ton_rescue_pair_fail_template"] += int(fail_counts.get("TEMPLATE_KEY_MISSING", 0) or 0)
-                                diag["repair_bridge_ton_rescue_pair_fail_multi"] += int(fail_counts.get("MULTI_RULE_FAIL", 0) or 0)
-                                diag["repair_bridge_ton_rescue_pair_fail_unknown"] += int(fail_counts.get("UNKNOWN_PAIR_INVALID", 0) or 0)
-                                if result.get("success"):
-                                    rescue_result = result
-                                    best = (
-                                        list(result.get("valid", [])),
-                                        list(result.get("underfilled", [])),
-                                        dict(result.get("diag", {})),
-                                        "REAL",
-                                        expansion_block,
-                                    )
-                                    best_size = int(window.get("end", i + block_size)) - i
-                                    diag["repair_bridge_ton_rescue_success"] += 1
-                                    diag["repair_bridge_ton_rescue_valid_delta"] += int(result.get("valid_delta", 0) or 0)
-                                    diag["repair_bridge_ton_rescue_underfilled_delta"] += int(result.get("underfilled_delta", 0) or 0)
-                                    diag["repair_bridge_ton_rescue_scheduled_orders_delta"] += int(result.get("scheduled_orders_delta", 0) or 0)
-                                    if bool(result_diag.get("extract_success", False)):
-                                        diag["repair_bridge_ton_rescue_extract_success"] += 1
-                                    if bool(result_diag.get("partial_success", False)):
-                                        diag["repair_bridge_ton_rescue_partial_success"] += 1
-                                    if bool(result_diag.get("full_success", False)):
-                                        diag["repair_bridge_ton_rescue_full_success"] += 1
-                                    diag["repair_bridge_ton_rescue_residual_underfilled_count"] += int(result_diag.get("residual_underfilled_count", 0) or 0)
-                                    diag["repair_bridge_candidates_accepted"] += 1
-                                    break
-                                reject_reason = str(result.get("reject_reason", "") or "")
-                                if reject_reason:
-                                    rescue_reason_counts[reject_reason] += 1
-                                if reject_reason == "TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION":
-                                    diag["repair_bridge_filtered_ton_below_min_even_after_neighbor_expansion"] += 1
-                                elif reject_reason == "TON_SPLIT_NOT_FOUND":
-                                    diag["repair_bridge_filtered_ton_split_not_found"] += 1
-                                    if bool(window.get("reaches_min", False)):
-                                        failed_after_min += 1
-                                elif reject_reason == "TON_RESCUE_NO_GAIN":
-                                    diag["repair_bridge_filtered_ton_rescue_no_gain"] += 1
-                                    if bool(window.get("reaches_min", False)):
-                                        failed_after_min += 1
-                                elif reject_reason == "TON_ABOVE_MAX_AFTER_EXPANSION":
-                                    diag["repair_bridge_filtered_ton_above_max_after_expansion"] += 1
-                                if failed_after_min >= int(ton_rescue_max_failed_after_min):
-                                    break
-                            if rescue_result is not None:
-                                break
-                        if rescue_result is not None:
-                            _record_bridgeability_census_item(
-                                bridgeability_census,
-                                {
-                                    "line": str(line),
-                                    "block_id": int(block_id),
-                                    "block_size": int(block_size),
-                                    "orders": int(len(block_orders)),
-                                    "tons": float(block_tons),
-                                    "endpoint_class": str(endpoint_class),
-                                    "dominant_fail_reason": "TON_RESCUE_SUCCESS",
-                                    "candidate_count": int(bridge_match_diag.get("matched_rows", 0) or 0),
-                                    "frontier_candidate_count": int(frontier_match_diag.get("matched_rows", 0) or 0),
-                                    "prefilter_rejected": bool(int(bridge_candidate_audit.get("prefilter_reject_count", 0) or 0) > 0),
-                                    "ton_rescue_entered": True,
-                                    "ton_rescue_success": True,
-                                    "final_decision": "TON_RESCUE_IMPROVEMENT_FOUND",
-                                },
-                            )
-                            break
-                    ton_subtotal = (
-                        int(bridge_candidate_audit.get("filtered_ton_below_min_current_block", 0) or 0)
-                        + int(rescue_reason_counts.get("TON_RESCUE_IMPOSSIBLE", 0) or 0)
-                        + int(rescue_reason_counts.get("TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION", 0) or 0)
-                        + int(rescue_reason_counts.get("TON_SPLIT_NOT_FOUND", 0) or 0)
-                        + int(rescue_reason_counts.get("TON_RESCUE_NO_GAIN", 0) or 0)
-                        + int(rescue_reason_counts.get("TON_ABOVE_MAX_AFTER_EXPANSION", 0) or 0)
-                    )
-                    filtered_ton_invalid_effective = int(real_diag_report.get("repair_only_real_bridge_filtered_ton_invalid", 0) or 0)
-                    if ton_subtotal <= 0:
-                        filtered_ton_invalid_effective = 0
-                    reason_buckets = {
-                        "ORDER_CONTEXT_MISSING": int(bridge_candidate_audit.get("pair_invalid_context", 0) or 0),
-                        "TEMPLATE_PAIR_INVALID": int(real_diag_report.get("repair_only_real_bridge_filtered_pair_invalid", 0) or 0),
-                        "TON_BELOW_MIN_CURRENT_BLOCK": int(bridge_candidate_audit.get("filtered_ton_below_min_current_block", 0) or 0),
-                        "TON_RESCUE_IMPOSSIBLE": int(rescue_reason_counts.get("TON_RESCUE_IMPOSSIBLE", 0) or 0),
-                        "TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION": int(rescue_reason_counts.get("TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION", 0) or 0),
-                        "TON_SPLIT_NOT_FOUND": int(rescue_reason_counts.get("TON_SPLIT_NOT_FOUND", 0) or 0),
-                        "TON_RESCUE_NO_GAIN": int(rescue_reason_counts.get("TON_RESCUE_NO_GAIN", 0) or 0),
-                        "TON_WINDOW_INVALID": int(filtered_ton_invalid_effective),
-                        "SCORE_WORSE_THAN_DIRECT_ONLY": int(real_diag_report.get("repair_only_real_bridge_filtered_score_worse", 0) or 0),
-                        "BRIDGE_LIMIT_EXCEEDED": int(real_diag_report.get("repair_only_real_bridge_filtered_bridge_limit_exceeded", 0) or 0),
-                        "BLOCK_MEMBERSHIP_MISMATCH": int(bridge_match_diag.get("block_membership_mismatch", 0) or 0),
-                        "LINE_MISMATCH": int(bridge_match_diag.get("line_mismatch", 0) or 0),
-                    }
-                    has_reject_bucket = any(v > 0 for v in reason_buckets.values())
-                    dominant_bucket = max(reason_buckets.items(), key=lambda kv: kv[1])[0] if has_reject_bucket else "NO_DIRECT_OR_BRIDGE_CANDIDATE"
-                    reason = dominant_bucket
-                    if not has_reject_bucket and line_raw_real_rows <= 0:
-                        reason = "PACK_HAS_NO_REAL_BRIDGE_ROWS"
-                    elif not has_reject_bucket and bool(line_bridge_schema.get("field_name_mismatch", False)):
-                        reason = "BRIDGE_FIELD_NAME_MISMATCH"
-                    elif not has_reject_bucket and int(bridge_match_diag.get("matched_rows", 0) or 0) <= 0:
-                        reason = endpoint_class if endpoint_class and endpoint_class != "HAS_ENDPOINT_EDGE" else "ENDPOINT_KEY_MISMATCH"
-                    dominant_fail_reason = _dominant_bridge_fail_reason(bridge_candidate_audit, reason_buckets)
-                    print(
-                        f"[APS][REPAIR_BRIDGE_RULE_AUDIT] line={line}, block_id={block_id}, "
-                        f"thickness_fail_count={int(bridge_candidate_audit.get('pair_invalid_thickness', 0) or 0)}, "
-                        f"width_fail_count={int(bridge_candidate_audit.get('pair_invalid_width', 0) or 0)}, "
-                        f"temp_fail_count={int(bridge_candidate_audit.get('pair_invalid_temp', 0) or 0)}, "
-                        f"group_fail_count={int(bridge_candidate_audit.get('pair_invalid_group', 0) or 0)}, "
-                        f"template_no_edge_count={1 if endpoint_class == 'TEMPLATE_GRAPH_NO_EDGE' else 0}, "
-                        f"prefilter_all_fail_count={1 if endpoint_class == 'RULE_PREFILTER_ALL_FAIL' else 0}, "
-                        f"band_too_narrow_count={1 if endpoint_class == 'BAND_TOO_NARROW' else 0}, "
-                        f"thickness_prefilter_fail_count={int(bridge_candidate_audit.get('prefilter_fail_thickness', 0) or 0)}, "
-                        f"thickness_rank_pass_count={int(bridge_candidate_audit.get('rank_pass_thickness', 0) or 0)}, "
-                        f"thickness_rank_fail_count={int(bridge_candidate_audit.get('rank_fail_thickness', 0) or 0)}"
-                    )
-                    print(
-                        f"[APS][REPAIR_BRIDGE_REASON_AUDIT] line={line}, block_id={block_id}, "
-                        f"filtered_pair_invalid={int(real_diag_report.get('repair_only_real_bridge_filtered_pair_invalid', 0) or 0)}, "
-                        f"filtered_context_missing={int(bridge_candidate_audit.get('pair_invalid_context', 0) or 0)}, "
-                        f"filtered_ton_invalid={int(filtered_ton_invalid_effective)}, "
-                        f"filtered_ton_below_min_current_block={int(bridge_candidate_audit.get('filtered_ton_below_min_current_block', 0) or 0)}, "
-                        f"filtered_ton_rescue_impossible={int(rescue_reason_counts.get('TON_RESCUE_IMPOSSIBLE', 0) or 0)}, "
-                        f"filtered_ton_below_min_even_after_neighbor_expansion={int(rescue_reason_counts.get('TON_BELOW_MIN_EVEN_AFTER_NEIGHBOR_EXPANSION', 0) or 0)}, "
-                        f"filtered_ton_split_not_found={int(diag.get('repair_bridge_filtered_ton_split_not_found', 0) or 0)}, "
-                        f"filtered_ton_rescue_no_gain={int(diag.get('repair_bridge_filtered_ton_rescue_no_gain', 0) or 0)}, "
-                        f"filtered_score_worse={int(real_diag_report.get('repair_only_real_bridge_filtered_score_worse', 0) or 0)}, "
-                        f"dominant_bucket={dominant_bucket}, "
-                        f"final_reason={reason}"
-                    )
-                    if reason != dominant_bucket and int(bridge_match_diag.get("matched_rows", 0) or 0) > 0:
-                        print(
-                            f"[APS][REPAIR_BRIDGE_REASON_MISMATCH] line={line}, block_id={block_id}, "
-                            f"final_reason={reason}, dominant_bucket={dominant_bucket}"
-                        )
-                    print(f"[APS][REPAIR_BRIDGE_NO_HIT] line={line}, block_id={block_id}, reason={reason}")
-                    _record_bridgeability_census_item(
-                        bridgeability_census,
-                        {
-                            "line": str(line),
-                            "block_id": int(block_id),
-                            "block_size": int(block_size),
-                            "orders": int(len(block_orders)),
-                            "tons": float(block_tons),
-                            "endpoint_class": str(endpoint_class),
-                            "dominant_fail_reason": str(dominant_fail_reason),
-                            "candidate_count": int(bridge_match_diag.get("matched_rows", 0) or 0),
-                            "frontier_candidate_count": int(frontier_match_diag.get("matched_rows", 0) or 0),
-                            "prefilter_rejected": bool(int(bridge_candidate_audit.get("prefilter_reject_count", 0) or 0) > 0),
-                            "ton_rescue_entered": bool(len(ton_rescue_candidates) > 0 and int(frontier_match_diag.get("matched_rows", 0) or 0) > 0),
-                            "ton_rescue_success": False,
-                            "final_decision": str(reason),
-                        },
-                    )
-                    pilot_target_candidates = _select_virtual_pilot_targets(
-                        list(bridge_candidate_audit.get("pilot_candidates", []) or []),
-                        endpoint_class=str(endpoint_class),
-                        max_targets=1,
-                        allowed_fail_reasons=virtual_pilot_fail_reasons,
-                        campaign_ton_min=float(campaign_ton_min),
-                    )
-                    small_hard_reject, small_block_penalty = _small_block_pilot_score(
-                        int(len(block_orders)),
-                        float(block_tons),
-                        float(campaign_ton_min),
-                    )
-                    if float(small_block_penalty) > 0.0 and not bool(small_hard_reject):
-                        diag["virtual_pilot_small_block_soft_penalty_count"] += 1
-                    print(
-                        f"[APS][VIRTUAL_BRIDGE_SMALL_BLOCK_SCORE] line={line}, block_id={block_id}, "
-                        f"block_orders={int(len(block_orders))}, block_tons={float(block_tons):.1f}, "
-                        f"small_block_penalty={float(small_block_penalty):.3f}, hard_reject={bool(small_hard_reject)}"
-                    )
-                    eligible_result = _evaluate_virtual_pilot_eligibility(
-                        endpoint_class=str(endpoint_class),
-                        candidate_count=int(bridge_match_diag.get("matched_rows", 0) or 0),
-                        frontier_candidate_count=int(frontier_match_diag.get("matched_rows", 0) or 0),
-                        pilot_candidates=pilot_target_candidates,
-                        block_orders_count=int(len(block_orders)),
-                        block_tons=float(block_tons),
-                        campaign_ton_min=float(campaign_ton_min),
-                        attempts_so_far=int(diag.get("virtual_pilot_attempt_count", 0) or 0),
-                        max_attempts=int(virtual_pilot_max_blocks),
-                        allowed_endpoint_classes=virtual_pilot_endpoint_classes,
-                        already_tried=(str(line), int(block_id)) in virtual_pilot_tried_blocks,
-                        applied_improvement_count=int(diag.get("underfilled_reconstruction_improvement_applied_count", 0) or 0),
-                        enabled=bool(virtual_pilot_enabled),
-                    )
-                    pilot_eligible = bool(eligible_result.final_eligible)
-                    reject_by_reason = diag.setdefault("virtual_pilot_reject_by_reason_count", {})
-                    if bool(eligible_result.structural_eligible):
-                        diag["virtual_pilot_structural_eligible_block_count"] += 1
-                    if bool(eligible_result.runtime_enabled):
-                        diag["virtual_pilot_runtime_enabled_block_count"] += 1
-                    if bool(eligible_result.final_eligible):
-                        diag["virtual_pilot_final_eligible_block_count"] += 1
-                        diag["virtual_pilot_eligible_block_count"] += 1
-                    else:
-                        diag["virtual_pilot_skipped_block_count"] += 1
-                        reject_by_reason[str(eligible_result.reject_reason)] = int(reject_by_reason.get(str(eligible_result.reject_reason), 0) or 0) + 1
-                        if str(eligible_result.reject_reason) == "PILOT_DISABLED":
-                            diag["virtual_pilot_skipped_due_to_disabled_count"] += 1
-                        elif str(eligible_result.reject_reason) == "RUN_LIMIT_REACHED":
-                            diag["virtual_pilot_skipped_due_to_limit_count"] += 1
-                        elif str(eligible_result.reject_reason) in {"NO_PILOTABLE_CANDIDATE", "DOMINANT_FAIL_NOT_PILOTABLE"}:
-                            diag["virtual_pilot_skipped_due_to_no_pilotable_candidate_count"] += 1
-                    print(
-                        f"[APS][VIRTUAL_BRIDGE_PILOT_ELIGIBLE] line={line}, block_id={block_id}, "
-                        f"endpoint_class={endpoint_class}, dominant_fail_reason={dominant_fail_reason}, "
-                        f"eligible={bool(pilot_eligible)}"
-                    )
-                    print(
-                        f"[APS][VIRTUAL_BRIDGE_PILOT_ELIGIBILITY_AUDIT] line={line}, block_id={block_id}, "
-                        f"endpoint_class={endpoint_class}, "
-                        f"candidate_count={int(bridge_match_diag.get('matched_rows', 0) or 0)}, "
-                        f"frontier_candidate_count={int(frontier_match_diag.get('matched_rows', 0) or 0)}, "
-                        f"structural_eligible={bool(eligible_result.structural_eligible)}, "
-                        f"runtime_enabled={bool(eligible_result.runtime_enabled)}, "
-                        f"final_eligible={bool(eligible_result.final_eligible)}, "
-                        f"reject_reason={eligible_result.reject_reason}, "
-                        f"reject_details={eligible_result.reject_details}"
-                    )
-                    print(
-                        f"[APS][VIRTUAL_BRIDGE_PILOT_TARGETS] line={line}, block_id={block_id}, "
-                        f"selected_candidates={[{'candidate_id': c.get('candidate_id'), 'pair': c.get('pair'), 'fail_reasons': c.get('fail_reasons'), 'rank_score': c.get('rank_score')} for c in pilot_target_candidates]}, "
-                        f"reason={eligible_result.reject_reason}"
-                    )
-                    if pilot_eligible:
-                        target = dict(pilot_target_candidates[0])
-                        scheduler_family = _virtual_pilot_failure_family(target)
-                        scheduler_bucket = scheduler_family
-                        pilot_key = _virtual_pilot_key(str(line), target)
-                        _record_virtual_pilot_execution_stage(
-                            diag,
-                            line=str(line),
-                            block_id=int(block_id),
-                            candidate_id=str(target.get("candidate_id", "")),
-                            family=scheduler_family,
-                            stage="SELECTED",
-                            details={"pilot_key": pilot_key},
-                        )
-                        if pilot_key in virtual_pilot_seen_keys:
-                            diag["virtual_pilot_skipped_block_count"] += 1
-                            diag["virtual_pilot_duplicate_candidate_skipped_count"] += 1
-                            _record_virtual_pilot_execution_stage(
-                                diag,
-                                line=str(line),
-                                block_id=int(block_id),
-                                candidate_id=str(target.get("candidate_id", "")),
-                                family=scheduler_family,
-                                stage="DEDUP_SKIPPED",
-                                details={"pilot_key": pilot_key, "reason": "DUPLICATE_PILOT_KEY"},
-                            )
-                            reject_by_reason = diag.setdefault("virtual_pilot_reject_by_reason_count", {})
-                            reject_by_reason["DUPLICATE_PILOT_KEY"] = int(reject_by_reason.get("DUPLICATE_PILOT_KEY", 0) or 0) + 1
-                            print(
-                                f"[APS][VIRTUAL_BRIDGE_PILOT_DEDUP] candidate_id={target.get('candidate_id')}, "
-                                f"pilot_key={pilot_key}, kept=False, reason=DUPLICATE_PILOT_KEY"
-                            )
-                            continue
-                        virtual_pilot_seen_keys.add(pilot_key)
-                        diag["virtual_pilot_dedup_group_count"] += 1
-                        _record_virtual_pilot_execution_stage(
-                            diag,
-                            line=str(line),
-                            block_id=int(block_id),
-                            candidate_id=str(target.get("candidate_id", "")),
-                            family=scheduler_family,
-                            stage="DEDUP_KEPT",
-                            details={"pilot_key": pilot_key},
-                        )
-                        print(
-                            f"[APS][VIRTUAL_BRIDGE_PILOT_DEDUP] candidate_id={target.get('candidate_id')}, "
-                            f"pilot_key={pilot_key}, kept=True, reason=BEST_OF_DUP_GROUP"
-                        )
-                        scheduler_allowed = (
-                            int(diag.get("virtual_pilot_attempt_count", 0) or 0) < int(virtual_pilot_max_blocks)
-                            and int(virtual_pilot_selected_by_line[str(line)]) < int(virtual_pilot_line_quota)
-                            and int(virtual_pilot_selected_by_bucket[scheduler_bucket]) < int(virtual_pilot_family_quota.get(scheduler_bucket, virtual_pilot_bucket_quota))
-                        )
-                        if not scheduler_allowed:
-                            diag["virtual_pilot_skipped_block_count"] += 1
-                            diag["virtual_pilot_skipped_due_to_limit_count"] += 1
-                            skip_item = {
-                                "line": str(line),
-                                "block_id": int(block_id),
-                                "bucket": scheduler_bucket,
-                                "family": scheduler_family,
-                                "pilot_key": pilot_key,
-                                "line_selected": int(virtual_pilot_selected_by_line[str(line)]),
-                                "bucket_selected": int(virtual_pilot_selected_by_bucket[scheduler_bucket]),
-                                "bucket_quota": int(virtual_pilot_family_quota.get(scheduler_bucket, virtual_pilot_bucket_quota)),
-                            }
-                            virtual_pilot_scheduler_skipped_due_to_limit.append(skip_item)
-                            reject_by_reason = diag.setdefault("virtual_pilot_reject_by_reason_count", {})
-                            reject_by_reason["RUN_LIMIT_REACHED"] = int(reject_by_reason.get("RUN_LIMIT_REACHED", 0) or 0) + 1
-                            continue
-                        diag["virtual_pilot_selected_block_count"] += 1
-                        diag["virtual_pilot_selected_unique_pilot_key_count"] += 1
-                        virtual_pilot_tried_blocks.add((str(line), int(block_id)))
-                        virtual_pilot_selected_by_line[str(line)] += 1
-                        virtual_pilot_selected_by_bucket[scheduler_bucket] += 1
-                        virtual_pilot_selected_by_family[scheduler_family] += 1
-                        selected_by_family_diag = diag.setdefault("virtual_pilot_selected_by_family_count", {})
-                        selected_by_family_diag[scheduler_family] = int(selected_by_family_diag.get(scheduler_family, 0) or 0) + 1
-                        pair = (str(target.get("from_order_id", "")), str(target.get("to_order_id", "")))
-                        pilot_virtual_edges = {pair}
-                        pilot_virtual_tons = max(float(virtual_tons_by_edge.get(pair, 0.0) or 0.0), 0.0)
-                        virtual_pilot_scheduler_selected_blocks.append(
-                            {"line": str(line), "block_id": int(block_id), "bucket": scheduler_bucket, "family": scheduler_family, "pilot_key": pilot_key, "pair": pair}
-                        )
-                        left_meta = _order_pair_meta(order_specs_by_id, pair[0])
-                        right_meta = _order_pair_meta(order_specs_by_id, pair[1])
-                        print(
-                            f"[APS][VIRTUAL_BRIDGE_SPEC_FAMILY] candidate_id={target.get('candidate_id')}, "
-                            f"family={scheduler_family}"
-                        )
-                        specs, spec_diag, selected_spec = _enumerate_virtual_pilot_specs(
-                            left_meta,
-                            right_meta,
-                            cfg.rule if cfg and cfg.rule else None,
-                            max_specs=5,
-                            family=scheduler_family,
-                        )
-                        diag["virtual_pilot_spec_enum_total"] += int(spec_diag.get("specs_tested", 0) or 0)
-                        diag["virtual_pilot_spec_enum_both_valid_count"] += int(spec_diag.get("both_valid_count", 0) or 0)
-                        _record_virtual_pilot_execution_stage(
-                            diag,
-                            line=str(line),
-                            block_id=int(block_id),
-                            candidate_id=str(target.get("candidate_id", "")),
-                            family=scheduler_family,
-                            stage="SPEC_ENUM_DONE",
-                            details=dict(spec_diag),
-                        )
-                        print(
-                            f"[APS][VIRTUAL_BRIDGE_SPEC_ENUM] line={line}, block_id={block_id}, "
-                            f"candidate_id={target.get('candidate_id')}, family={scheduler_family}, "
-                            f"specs_tested={int(spec_diag.get('specs_tested', 0) or 0)}, "
-                            f"left_valid_count={int(spec_diag.get('left_valid_count', 0) or 0)}, "
-                            f"right_valid_count={int(spec_diag.get('right_valid_count', 0) or 0)}, "
-                            f"both_valid_count={int(spec_diag.get('both_valid_count', 0) or 0)}"
-                        )
-                        family_prefilter_ok, family_prefilter_reason = _virtual_pilot_family_prefilter(scheduler_family, selected_spec)
-                        width_group_guaranteed = False
-                        if (
-                            scheduler_family == "WIDTH_GROUP"
-                            and selected_spec is not None
-                            and not bool(family_prefilter_ok)
-                        ):
-                            family_prefilter_ok = True
-                            width_group_guaranteed = True
-                            diag["virtual_pilot_width_group_guarantee_attempted"] = True
-                        print(
-                            f"[APS][VIRTUAL_BRIDGE_FAMILY_PREFILTER] candidate_id={target.get('candidate_id')}, "
-                            f"family={scheduler_family}, pass={bool(family_prefilter_ok)}, reason={family_prefilter_reason}"
-                        )
-                        if scheduler_family == "WIDTH_GROUP":
-                            print(
-                                f"[APS][VIRTUAL_BRIDGE_FAMILY_GUARANTEE] family=WIDTH_GROUP, "
-                                f"guaranteed_attempt={bool(width_group_guaranteed)}, "
-                                f"reason={'WIDTH_GROUP_PREFILTER_BYPASS' if width_group_guaranteed else family_prefilter_reason}"
-                            )
-                        if selected_spec is None:
-                            diag["virtual_pilot_reject_count"] += 1
-                            fail_stage, fail_reason, fail_details = _classify_virtual_transition_spec_failure(specs, spec_diag)
-                            _record_virtual_pilot_fail_stage(
-                                diag,
-                                line=str(line),
-                                block_id=int(block_id),
-                                candidate_id=str(target.get("candidate_id", "")),
-                                fail_stage=str(fail_stage),
-                                reason=str(fail_reason),
-                                details=dict(fail_details),
-                            )
-                            print(
-                                f"[APS][VIRTUAL_BRIDGE_PILOT_FAIL] line={line}, block_id={block_id}, "
-                                f"reason={fail_reason}"
-                            )
-                            _record_virtual_pilot_execution_stage(
-                                diag,
-                                line=str(line),
-                                block_id=int(block_id),
-                                candidate_id=str(target.get("candidate_id", "")),
-                                family=scheduler_family,
-                                stage="FAIL",
-                                details={"reason": str(fail_reason), "fail_stage": str(fail_stage)},
-                            )
-                            continue
-                        if not family_prefilter_ok:
-                            diag["virtual_pilot_reject_count"] += 1
-                            diag["virtual_pilot_family_prefilter_fail_count"] += 1
-                            _record_virtual_pilot_fail_stage(
-                                diag,
-                                line=str(line),
-                                block_id=int(block_id),
-                                candidate_id=str(target.get("candidate_id", "")),
-                                fail_stage="FAMILY_PREFILTER_FAIL",
-                                reason=str(family_prefilter_reason),
-                                details={"family": scheduler_family, "selected_spec": selected_spec},
-                            )
-                            print(
-                                f"[APS][VIRTUAL_BRIDGE_PILOT_FAIL] line={line}, block_id={block_id}, "
-                                f"reason=FAMILY_PREFILTER_FAIL"
-                            )
-                            _record_virtual_pilot_execution_stage(
-                                diag,
-                                line=str(line),
-                                block_id=int(block_id),
-                                candidate_id=str(target.get("candidate_id", "")),
-                                family=scheduler_family,
-                                stage="FAIL",
-                                details={"reason": "FAMILY_PREFILTER_FAIL"},
-                            )
-                            continue
-                        print(
-                            f"[APS][VIRTUAL_BRIDGE_SPEC_SELECTED] line={line}, block_id={block_id}, "
-                            f"candidate_id={target.get('candidate_id')}, family={scheduler_family}, "
-                            f"selected_spec={{width:{selected_spec.get('width')}, thickness:{selected_spec.get('thickness')}, "
-                            f"temp_low:{selected_spec.get('temp_low')}, temp_high:{selected_spec.get('temp_high')}}}"
-                        )
-                        diag["virtual_pilot_attempt_count"] += 1
-                        _record_virtual_pilot_execution_stage(
-                            diag,
-                            line=str(line),
-                            block_id=int(block_id),
-                            candidate_id=str(target.get("candidate_id", "")),
-                            family=scheduler_family,
-                            stage="ATTEMPT_STARTED",
-                            details={"pair": pair, "virtual_tons": float(pilot_virtual_tons)},
-                        )
-                        if scheduler_family == "WIDTH_GROUP":
-                            diag["virtual_pilot_width_group_family_attempt_count"] += 1
-                        elif scheduler_family == "THICKNESS":
-                            diag["virtual_pilot_thickness_family_attempt_count"] += 1
-                        print(
-                            f"[APS][VIRTUAL_BRIDGE_PILOT_ATTEMPT] line={line}, block_id={block_id}, "
-                            f"candidate_id={target.get('candidate_id')}, pair=({pair[0]},{pair[1]}), "
-                            f"virtual_tons={pilot_virtual_tons:.1f}, "
-                            f"penalty={float(virtual_pilot_penalty):.1f}"
-                        )
-                        if pilot_virtual_tons > float(virtual_pilot_max_tons) + 1e-6:
-                            diag["virtual_pilot_reject_count"] += 1
-                            _record_virtual_pilot_fail_stage(
-                                diag,
-                                line=str(line),
-                                block_id=int(block_id),
-                                candidate_id=str(target.get("candidate_id", "")),
-                                fail_stage="VIRTUAL_TON_BELOW_MIN",
-                                reason="VIRTUAL_TON_LIMIT_EXCEEDED",
-                                details={"virtual_tons": float(pilot_virtual_tons), "max_virtual_tons": float(virtual_pilot_max_tons)},
-                            )
-                            print(
-                                f"[APS][VIRTUAL_BRIDGE_PILOT_FAIL] line={line}, block_id={block_id}, "
-                                f"reason=VIRTUAL_TON_LIMIT_EXCEEDED"
-                            )
-                            _record_virtual_pilot_execution_stage(
-                                diag,
-                                line=str(line),
-                                block_id=int(block_id),
-                                candidate_id=str(target.get("candidate_id", "")),
-                                family=scheduler_family,
-                                stage="FAIL",
-                                details={"reason": "VIRTUAL_TON_LIMIT_EXCEEDED"},
-                            )
-                        else:
-                            _record_virtual_pilot_execution_stage(
-                                diag,
-                                line=str(line),
-                                block_id=int(block_id),
-                                candidate_id=str(target.get("candidate_id", "")),
-                                family=scheduler_family,
-                                stage="RECUT_ENTERED",
-                                details={"block_size": int(block_size)},
-                            )
-                            print(
-                                f"[APS][VIRTUAL_BRIDGE_RECUT_ENTER] line={line}, block_id={block_id}, "
-                                f"candidate_id={target.get('candidate_id')}, family={scheduler_family}"
-                            )
-                            pilot_valid, pilot_under, pilot_diag = _solve_underfilled_reconstruction_block(
-                                block,
-                                direct_edges=direct_edges,
-                                real_edges={(str(k[1]), str(k[2])) for k in frontier_matched_keys},
-                                order_tons=tons_by_order,
-                                campaign_ton_min=campaign_ton_min,
-                                campaign_ton_max=campaign_ton_max,
-                                campaign_ton_target=ton_target,
-                                allow_real_bridge=True,
-                                allow_virtual_bridge=True,
-                                max_real_bridge_per_segment=max_real,
-                                bridge_cost_penalty=bridge_penalty,
-                                next_local_id=max_local_id,
-                                real_edge_distance=real_edge_distance,
-                                real_edge_adjustment_cost=real_edge_adjustment_cost,
-                                virtual_edges=pilot_virtual_edges,
-                                max_virtual_bridge_per_segment=int(virtual_pilot_max_per_block),
-                                virtual_tons_by_edge=virtual_tons_by_edge,
-                                virtual_bridge_penalty=float(virtual_pilot_penalty),
-                            )
-                            pilot_virtual_used = int(pilot_diag.get("virtual_bridge_used", 0) or 0)
-                            pilot_virtual_used_tons = float(pilot_diag.get("virtual_bridge_tons", 0.0) or 0.0)
-                            print(
-                                f"[APS][VIRTUAL_BRIDGE_SEGMENT_VALIDATE] line={line}, block_id={block_id}, "
-                                f"candidate_id={target.get('candidate_id')}, family={scheduler_family}, "
-                                f"pilot_valid={bool(pilot_valid)}, virtual_used={pilot_virtual_used}, "
-                                f"virtual_tons={pilot_virtual_used_tons:.1f}"
-                            )
-                            if pilot_valid:
-                                diag["virtual_pilot_segment_valid_count"] += 1
-                            if (not pilot_valid) and int(pilot_diag.get("candidate_cutpoints_ton_window_valid", 0) or 0) <= 0:
-                                diag["virtual_pilot_ton_fill_attempt_count"] += 1
-                                _record_virtual_pilot_execution_stage(
-                                    diag,
-                                    line=str(line),
-                                    block_id=int(block_id),
-                                    candidate_id=str(target.get("candidate_id", "")),
-                                    family=scheduler_family,
-                                    stage="TON_FILL_ENTERED",
-                                    details={"reason": "NO_TON_WINDOW_VALID_CUTPOINT"},
-                                )
-                                print(
-                                    f"[APS][VIRTUAL_BRIDGE_TON_FILL_ENTER] line={line}, block_id={block_id}, "
-                                    f"candidate_id={target.get('candidate_id')}, family={scheduler_family}"
-                                )
-                                fill_block = list(block)
-                                fill_success = False
-                                fill_after_tons = float(block_tons)
-                                if i + block_size < len(line_under):
-                                    fill_block = list(block) + [line_under[i + block_size]]
-                                    fill_after_tons = sum(
-                                        float(tons_by_order.get(str(oid), 0.0) or 0.0)
-                                        for seg in fill_block
-                                        for oid in seg.order_ids
-                                    )
-                                    fill_valid, fill_under, fill_diag = _solve_underfilled_reconstruction_block(
-                                        fill_block,
-                                        direct_edges=direct_edges,
-                                        real_edges={(str(k[1]), str(k[2])) for k in frontier_matched_keys},
-                                        order_tons=tons_by_order,
-                                        campaign_ton_min=campaign_ton_min,
-                                        campaign_ton_max=campaign_ton_max,
-                                        campaign_ton_target=ton_target,
-                                        allow_real_bridge=True,
-                                        allow_virtual_bridge=True,
-                                        max_real_bridge_per_segment=max_real,
-                                        bridge_cost_penalty=bridge_penalty,
-                                        next_local_id=max_local_id,
-                                        real_edge_distance=real_edge_distance,
-                                        real_edge_adjustment_cost=real_edge_adjustment_cost,
-                                        virtual_edges=pilot_virtual_edges,
-                                        max_virtual_bridge_per_segment=int(virtual_pilot_max_per_block),
-                                        virtual_tons_by_edge=virtual_tons_by_edge,
-                                        virtual_bridge_penalty=float(virtual_pilot_penalty),
-                                    )
-                                    fill_virtual_used = int(fill_diag.get("virtual_bridge_used", 0) or 0)
-                                    fill_virtual_tons = float(fill_diag.get("virtual_bridge_tons", 0.0) or 0.0)
-                                    fill_success = bool(
-                                        fill_valid
-                                        and 0 < fill_virtual_used <= int(virtual_pilot_max_per_block)
-                                        and fill_virtual_tons <= float(virtual_pilot_max_tons) + 1e-6
-                                    )
-                                    if fill_success:
-                                        diag["virtual_pilot_ton_fill_success_count"] += 1
-                                        pilot_valid, pilot_under, pilot_diag = fill_valid, fill_under, fill_diag
-                                        pilot_virtual_used = fill_virtual_used
-                                        pilot_virtual_used_tons = fill_virtual_tons
-                                        block = fill_block
-                                        block_size += 1
-                                print(
-                                    f"[APS][VIRTUAL_BRIDGE_TON_FILL_ATTEMPT] line={line}, block_id={block_id}, "
-                                    f"candidate_id={target.get('candidate_id')}, mode=EXPAND_ONE_NEIGHBOR, "
-                                    f"before_tons={float(block_tons):.1f}, after_tons={float(fill_after_tons):.1f}, "
-                                    f"success={bool(fill_success)}"
-                                )
-                            if pilot_valid and 0 < pilot_virtual_used <= int(virtual_pilot_max_per_block) and pilot_virtual_used_tons <= float(virtual_pilot_max_tons) + 1e-6:
-                                diag["virtual_pilot_success_count"] += 1
-                                pilot_diag["candidate_id"] = str(target.get("candidate_id", ""))
-                                pilot_diag["family"] = str(scheduler_family)
-                                best = (pilot_valid, pilot_under, pilot_diag, "VIRTUAL_PILOT", block)
-                                best_size = block_size
-                                print(
-                                    f"[APS][VIRTUAL_BRIDGE_PILOT_SUCCESS] line={line}, block_id={block_id}, "
-                                    f"salvaged_segments={len(pilot_valid)}, "
-                                    f"salvaged_orders={int(pilot_diag.get('salvaged_orders', 0) or 0)}"
-                                )
-                                _record_virtual_pilot_execution_stage(
-                                    diag,
-                                    line=str(line),
-                                    block_id=int(block_id),
-                                    candidate_id=str(target.get("candidate_id", "")),
-                                    family=scheduler_family,
-                                    stage="SUCCESS",
-                                    details={
-                                        "salvaged_segments": int(len(pilot_valid)),
-                                        "salvaged_orders": int(pilot_diag.get("salvaged_orders", 0) or 0),
-                                    },
-                                )
-                                break
-                            diag["virtual_pilot_reject_count"] += 1
-                            if pilot_virtual_used > int(virtual_pilot_max_per_block):
-                                fail_stage, fail_reason, fail_details = "VIRTUAL_TRANSITION_INVALID", "VIRTUAL_BRIDGE_LIMIT_EXCEEDED", {"virtual_used": int(pilot_virtual_used), "max_virtual_used": int(virtual_pilot_max_per_block)}
-                            elif pilot_virtual_used_tons > float(virtual_pilot_max_tons) + 1e-6:
-                                fail_stage, fail_reason, fail_details = "VIRTUAL_TON_BELOW_MIN", "VIRTUAL_TON_LIMIT_EXCEEDED", {"virtual_tons": float(pilot_virtual_used_tons), "max_virtual_tons": float(virtual_pilot_max_tons)}
-                            else:
-                                fail_stage, fail_reason, fail_details = _classify_virtual_pilot_recut_fail(pilot_diag, pilot_virtual_used, pilot_virtual_used_tons)
-                            _record_virtual_pilot_fail_stage(
-                                diag,
-                                line=str(line),
-                                block_id=int(block_id),
-                                candidate_id=str(target.get("candidate_id", "")),
-                                fail_stage=str(fail_stage),
-                                reason=str(fail_reason),
-                                details=dict(fail_details),
-                            )
-                            if int(spec_diag.get("both_valid_count", 0) or 0) > 0:
-                                if fail_stage == "VIRTUAL_LOCAL_RECUT_FAIL":
-                                    post_stage = "VIRTUAL_LOCAL_RECUT_FAIL"
-                                elif fail_stage in {"VIRTUAL_BOTH_TRANSITIONS_INVALID", "VIRTUAL_TRANSITION_INVALID"}:
-                                    post_stage = "VIRTUAL_SEGMENT_INVALID_AFTER_RECUT"
-                                elif fail_stage == "VIRTUAL_TON_BELOW_MIN":
-                                    post_stage = "VIRTUAL_TON_FILL_FAIL"
-                                else:
-                                    post_stage = "VIRTUAL_POST_SPEC_UNKNOWN_FAIL"
-                                _record_virtual_post_spec_fail(
-                                    diag,
-                                    line=str(line),
-                                    block_id=int(block_id),
-                                    candidate_id=str(target.get("candidate_id", "")),
-                                    family=scheduler_family,
-                                    fail_stage=post_stage,
-                                    details=dict(fail_details),
-                                )
-                            print(
-                                f"[APS][VIRTUAL_BRIDGE_PILOT_FAIL] line={line}, block_id={block_id}, "
-                                f"reason={fail_reason}"
-                            )
-                            _record_virtual_pilot_execution_stage(
-                                diag,
-                                line=str(line),
-                                block_id=int(block_id),
-                                candidate_id=str(target.get("candidate_id", "")),
-                                family=scheduler_family,
-                                stage="FAIL",
-                                details={"reason": str(fail_reason), "fail_stage": str(fail_stage)},
-                            )
-            if best is None:
-                diag["underfilled_reconstruction_blocks_skipped"] += 1
-                valid_before = 0
-                valid_after = 0
-                underfilled_before = len(block) if "block" in locals() else 1
-                underfilled_after = underfilled_before
-                scheduled_orders_before = 0
-                scheduled_orders_after = 0
-                gain = False
-                print(
-                    f"[APS][UNDERFILLED_RECON_GAIN_AUDIT] line={line}, block_id={block_id}, "
-                    f"valid_before={valid_before}, valid_after={valid_after}, "
-                    f"underfilled_before={underfilled_before}, underfilled_after={underfilled_after}, "
-                    f"scheduled_orders_before={scheduled_orders_before}, "
-                    f"scheduled_orders_after={scheduled_orders_after}, gain={bool(gain)}"
-                )
-                if not gain:
-                    print(
-                        f"[APS][UNDERFILLED_RECON_NO_GAIN] line={line}, block_id={block_id}, "
-                        f"valid_before={valid_before}, valid_after={valid_after}, "
-                        f"underfilled_before={underfilled_before}, underfilled_after={underfilled_after}"
-                    )
-                final_decision = "PREFILTER_ALL_FAIL" if endpoint_class == "RULE_PREFILTER_ALL_FAIL" else "NO_DIRECT_OR_BRIDGE_CANDIDATE"
-                _update_bridgeability_census_final_decision(
-                    bridgeability_census,
-                    line=str(line),
-                    block_id=int(block_id),
-                    final_decision=final_decision,
-                )
-                print(
-                    f"[APS][UNDERFILLED_RECON_FINAL_DECISION] line={line}, block_id={block_id}, "
-                    f"gain={bool(gain)}, final_decision={final_decision}, reason={final_decision}"
-                )
-                print(f"[APS][UNDERFILLED_RECON_SKIP] line={line}, block_id={block_id}, reason={final_decision}")
-                remaining_under.append(line_under[i])
-                i += 1
-                continue
-
-            valid_out, under_out, block_diag, mode, block = best
-            before_counter = Counter()
-            after_counter = Counter()
-            for seg in block:
-                before_counter.update([str(v) for v in seg.order_ids])
-            for seg in valid_out + under_out:
-                after_counter.update([str(v) for v in seg.order_ids])
-            if before_counter != after_counter:
-                diag["underfilled_reconstruction_blocks_skipped"] += 1
-                diag["repair_only_real_bridge_filtered_multiplicity_invalid"] += 1
-                diag["repair_only_real_bridge_filtered_block_order_mismatch"] += 1
-                print(f"[APS][UNDERFILLED_RECON_SKIP] line={line}, block_id={block_id}, reason=BLOCK_ORDER_MISMATCH")
-                remaining_under.extend(block)
-                i += best_size
-                continue
-
-            valid_before = len(valid_segments)
-            consumed_prev_ids = {int(seg.campaign_local_id) for seg in block if int(seg.campaign_local_id) < int(line_under[i].campaign_local_id)}
-            remaining_after_apply = [seg for seg in remaining_under if int(seg.campaign_local_id) not in consumed_prev_ids] if consumed_prev_ids else list(remaining_under)
-            valid_after = len(new_valid) + len(valid_out)
-            underfilled_before = len(underfilled_segments)
-            underfilled_after = len(remaining_after_apply) + len(under_out)
-            scheduled_orders_before = sum(len(seg.order_ids) for seg in valid_segments)
-            scheduled_orders_after = sum(len(seg.order_ids) for seg in new_valid + valid_out)
-            recon_gain = (
-                int(valid_after) > int(valid_before)
-                or int(underfilled_after) < int(underfilled_before)
-                or int(scheduled_orders_after) > int(scheduled_orders_before)
-            )
-            apply_real_edges = real_edges if mode in {"REAL", "VIRTUAL_PILOT"} else set()
-            apply_virtual_edges = virtual_edges if mode == "VIRTUAL_PILOT" else set()
-            pair_integrity_ok, pair_integrity_reason = _segments_pair_integrity_ok(
-                list(valid_out),
-                direct_edges=direct_edges,
-                real_edges=apply_real_edges,
-                max_real_bridge_per_segment=max_real,
-                virtual_edges=apply_virtual_edges,
-                max_virtual_bridge_per_segment=int(virtual_pilot_max_per_block) if mode == "VIRTUAL_PILOT" else 0,
-            )
-            virtual_pilot_limit_ok = True
-            if mode == "VIRTUAL_PILOT":
-                virtual_pilot_limit_ok = (
-                    int(block_diag.get("virtual_bridge_used", 0) or 0) <= int(virtual_pilot_max_per_block)
-                    and float(block_diag.get("virtual_bridge_tons", 0.0) or 0.0) <= float(virtual_pilot_max_tons) + 1e-6
-                )
-            apply_ok, apply_reject_reason = _should_apply_improvement(
-                valid_before=valid_before,
-                valid_after=valid_after,
-                underfilled_before=underfilled_before,
-                underfilled_after=underfilled_after,
-                scheduled_orders_before=scheduled_orders_before,
-                scheduled_orders_after=scheduled_orders_after,
-                integrity_ok=True,
-                pair_integrity_ok=pair_integrity_ok,
-            )
-            if not pair_integrity_ok and apply_reject_reason in {"", "PAIR_INTEGRITY_FAIL"}:
-                apply_reject_reason = pair_integrity_reason or "PAIR_INTEGRITY_FAIL"
-            if apply_ok and not virtual_pilot_limit_ok:
-                apply_ok = False
-                apply_reject_reason = "VIRTUAL_PILOT_LIMIT_FAIL"
-            if mode == "VIRTUAL_PILOT":
-                virtual_apply_ok, virtual_apply_reject = _should_apply_virtual_pilot(
-                    gain=bool(recon_gain),
-                    multiplicity_ok=True,
-                    pair_integrity_ok=bool(pair_integrity_ok),
-                    virtual_used=int(block_diag.get("virtual_bridge_used", 0) or 0),
-                    max_virtual_used=int(virtual_pilot_max_per_block),
-                    virtual_tons=float(block_diag.get("virtual_bridge_tons", 0.0) or 0.0),
-                    max_virtual_tons=float(virtual_pilot_max_tons),
-                )
-                if not virtual_apply_ok:
-                    apply_ok = False
-                    apply_reject_reason = virtual_apply_reject
-            print(
-                f"[APS][UNDERFILLED_RECON_GAIN_AUDIT] line={line}, block_id={block_id}, "
-                f"valid_before={valid_before}, valid_after={valid_after}, "
-                f"underfilled_before={underfilled_before}, underfilled_after={underfilled_after}, "
-                f"scheduled_orders_before={scheduled_orders_before}, "
-                f"scheduled_orders_after={scheduled_orders_after}, gain={bool(recon_gain)}"
-            )
-            print(
-                f"[APS][UNDERFILLED_RECON_APPLY_CHECK] line={line}, block_id={block_id}, "
-                f"valid_before={valid_before}, valid_after={valid_after}, "
-                f"underfilled_before={underfilled_before}, underfilled_after={underfilled_after}, "
-                f"scheduled_orders_before={scheduled_orders_before}, scheduled_orders_after={scheduled_orders_after}, "
-                f"integrity_ok={bool(pair_integrity_ok)}, apply={bool(apply_ok)}, reject_reason={apply_reject_reason}"
-            )
-            if mode == "VIRTUAL_PILOT":
-                _record_virtual_pilot_execution_stage(
-                    diag,
-                    line=str(line),
-                    block_id=int(block_id),
-                    candidate_id=str(block_diag.get("candidate_id", "")),
-                    family=str(block_diag.get("family", "")),
-                    stage="APPLY_CHECK_ENTERED",
-                    details={
-                        "gain": bool(recon_gain),
-                        "pair_integrity_ok": bool(pair_integrity_ok),
-                        "virtual_pilot_limit_ok": bool(virtual_pilot_limit_ok),
-                    },
-                )
-                print(
-                    f"[APS][VIRTUAL_BRIDGE_APPLY_CHECK_ENTER] line={line}, block_id={block_id}, "
-                    f"candidate_id={block_diag.get('candidate_id', '')}"
-                )
-                print(
-                    f"[APS][VIRTUAL_BRIDGE_PILOT_APPLY_CHECK] line={line}, block_id={block_id}, "
-                    f"gain={bool(recon_gain)}, integrity_ok={bool(pair_integrity_ok and virtual_pilot_limit_ok)}, "
-                    f"apply={bool(apply_ok)}, reject_reason={apply_reject_reason}"
-                )
-            conservative_apply = False
-            conservative_reject_reason = ""
-            if not apply_ok and bool(recon_gain):
-                diag["conservative_apply_attempt_count"] += 1
-                template_ok = bool(pair_integrity_ok)
-                hard_violation_delta = 0 if template_ok else 1
-                conservative_apply = (
-                    int(valid_after) >= int(valid_before)
-                    and (
-                        int(underfilled_after) < int(underfilled_before)
-                        or int(scheduled_orders_after) > int(scheduled_orders_before)
-                    )
-                    and bool(pair_integrity_ok)
-                    and template_ok
-                    and int(hard_violation_delta) <= 0
-                )
-                if not conservative_apply:
-                    diag["conservative_apply_reject_count"] += 1
-                    conservative_reject_reason = "PAIR_INTEGRITY_FAIL" if not pair_integrity_ok else "NO_CONSERVATIVE_GAIN"
-                else:
-                    diag["conservative_apply_success_count"] += 1
-                    apply_ok = True
-                    apply_reject_reason = ""
-                print(
-                    f"[APS][UNDERFILLED_RECON_CONSERVATIVE_APPLY_CHECK] line={line}, block_id={block_id}, "
-                    f"gain={bool(recon_gain)}, integrity_ok={bool(pair_integrity_ok)}, "
-                    f"template_ok={bool(template_ok)}, hard_violation_delta={int(hard_violation_delta)}, "
-                    f"apply={bool(conservative_apply)}, reject_reason={conservative_reject_reason}"
-                )
-                if conservative_apply:
-                    print(
-                        f"[APS][UNDERFILLED_RECON_CONSERVATIVE_APPLY] line={line}, block_id={block_id}, "
-                        f"applied=True, salvaged_segments={len(valid_out)}, "
-                        f"salvaged_orders={int(block_diag.get('salvaged_orders', 0))}"
-                    )
-            if not apply_ok:
-                diag["underfilled_reconstruction_apply_reject_count"] += 1
-                if mode == "VIRTUAL_PILOT":
-                    diag["virtual_pilot_reject_count"] += 1
-                    _record_virtual_pilot_fail_stage(
-                        diag,
-                        line=str(line),
-                        block_id=int(block_id),
-                        candidate_id=str(block_diag.get("candidate_id", "")),
-                        fail_stage="VIRTUAL_APPLY_GATE_REJECT",
-                        reason=str(apply_reject_reason or "VIRTUAL_APPLY_GATE_REJECT"),
-                        details={
-                            "gain": bool(recon_gain),
-                            "pair_integrity_ok": bool(pair_integrity_ok),
-                            "virtual_pilot_limit_ok": bool(virtual_pilot_limit_ok),
-                        },
-                    )
-                    _record_virtual_post_spec_fail(
-                        diag,
-                        line=str(line),
-                        block_id=int(block_id),
-                        candidate_id=str(block_diag.get("candidate_id", "")),
-                        family=str(block_diag.get("family", "")),
-                        fail_stage="VIRTUAL_APPLY_GATE_REJECT",
-                        details={
-                            "gain": bool(recon_gain),
-                            "pair_integrity_ok": bool(pair_integrity_ok),
-                            "virtual_pilot_limit_ok": bool(virtual_pilot_limit_ok),
-                            "apply_reject_reason": str(apply_reject_reason or ""),
-                        },
-                    )
-                    _record_virtual_pilot_execution_stage(
-                        diag,
-                        line=str(line),
-                        block_id=int(block_id),
-                        candidate_id=str(block_diag.get("candidate_id", "")),
-                        family=str(block_diag.get("family", "")),
-                        stage="FAIL",
-                        details={"reason": str(apply_reject_reason or "VIRTUAL_APPLY_GATE_REJECT")},
-                    )
-                if recon_gain:
-                    diag["underfilled_reconstruction_improvement_recorded_count"] += 1
-                final_decision = "IMPROVEMENT_RECORDED_BUT_NOT_APPLIED" if recon_gain else "NO_GAIN"
-                if mode != "VIRTUAL_PILOT":
-                    _update_bridgeability_census_final_decision(
-                        bridgeability_census,
-                        line=str(line),
-                        block_id=int(block_id),
-                        final_decision=final_decision,
-                    )
-                print(
-                    f"[APS][UNDERFILLED_RECON_FINAL_DECISION] line={line}, block_id={block_id}, "
-                    f"gain={bool(recon_gain)}, final_decision={final_decision}, "
-                    f"reason={apply_reject_reason}"
-                )
-                remaining_under.extend(block)
-                i += best_size
-                continue
-            diag["underfilled_reconstruction_improvement_applied_count"] += 1
-            if mode == "VIRTUAL_PILOT":
-                diag["virtual_pilot_apply_count"] += 1
-                diag["virtual_pilot_apply_success_count"] += 1
-                _record_virtual_pilot_execution_stage(
-                    diag,
-                    line=str(line),
-                    block_id=int(block_id),
-                    candidate_id=str(block_diag.get("candidate_id", "")),
-                    family=str(block_diag.get("family", "")),
-                    stage="SUCCESS",
-                    details={"reason": "IMPROVEMENT_APPLIED"},
-                )
-            if mode != "VIRTUAL_PILOT":
-                _update_bridgeability_census_final_decision(
-                    bridgeability_census,
-                    line=str(line),
-                    block_id=int(block_id),
-                    final_decision="IMPROVEMENT_APPLIED",
-                )
-            print(
-                f"[APS][UNDERFILLED_RECON_FINAL_DECISION] line={line}, block_id={block_id}, "
-                f"gain={bool(recon_gain)}, final_decision=IMPROVEMENT_APPLIED, reason=GAIN_ACCEPTED"
-            )
-            print(
-                f"[APS][UNDERFILLED_RECON_APPLY] line={line}, block_id={block_id}, "
-                f"applied=True, salvaged_segments={len(valid_out)}, "
-                f"salvaged_orders={int(block_diag.get('salvaged_orders', 0))}"
-            )
-            remaining_under = remaining_after_apply
-            max_local_id += len(valid_out) + len(under_out)
-            new_valid.extend(valid_out)
-            remaining_under.extend(under_out)
-            diag["underfilled_reconstruction_success"] += 1
-            diag["underfilled_reconstruction_segments_salvaged"] += len(valid_out)
-            diag["underfilled_reconstruction_orders_salvaged"] += int(block_diag.get("salvaged_orders", 0))
-            if mode == "REAL":
-                diag["repair_only_real_bridge_success"] += 1
-                diag["repair_only_real_bridge_used_segments"] += len(valid_out)
-                diag["repair_only_real_bridge_used_orders"] += int(block_diag.get("salvaged_orders", 0))
-                print(
-                    f"[APS][REPAIR_BRIDGE_HIT] type=REAL, line={line}, block_id={block_id}, "
-                    f"used_segments={len(valid_out)}, salvaged_orders={int(block_diag.get('salvaged_orders', 0))}, "
-                    f"direct_only_feasible=False"
-                )
-                print(
-                    f"[APS][REPAIR_BRIDGE] type=REAL, line={line}, block={i}-{i + best_size - 1}, "
-                    f"used={int(block_diag.get('real_bridge_used', 0))}, direct_only_feasible=False"
-                )
-            print(
-                f"[APS][UNDERFILLED_RECON_GAIN] line={line}, block_id={block_id}, "
-                f"valid_before={len(valid_segments)}, valid_after={len(new_valid)}, "
-                f"underfilled_before={len(underfilled_segments)}, underfilled_after={len(remaining_under)}, "
-                f"salvaged_orders={int(block_diag.get('salvaged_orders', 0))}"
-            )
-            print(
-                f"[APS][UNDERFILLED_RECON] line={line}, block_size={best_size}, "
-                f"old_underfilled={len(block)}, new_valid={len(valid_out)}, "
-                f"residual_underfilled={len(under_out)}"
-            )
-            diag["reconstruction_no_gain"] = False
-            # Reset no-gain streak on improvement
-            no_gain_streak = 0
-            i += best_size
-            # Track improved block
-            diag["cutter_blocks_improved"] = diag.get("cutter_blocks_improved", 0) + 1
-        else:
-            # No improvement: increment streak
-            no_gain_streak += 1
-            if no_gain_streak > diag.get("cutter_no_gain_streak_max", 0):
-                diag["cutter_no_gain_streak_max"] = no_gain_streak
-            # Early stop if no-gain streak limit reached
-            if no_gain_streak >= early_stop_no_gain_limit:
-                reconstruction_early_stopped = True
-                print(
-                    f"[APS][RECON_EARLY_STOP] line={line}, block_id={block_id}, "
-                    f"reason=NO_GAIN_STREAK({no_gain_streak}>={early_stop_no_gain_limit}), "
-                    f"remaining_under={len(line_under) - i}"
-                )
-                # Count remaining blocks as skipped by precheck
-                diag["cutter_blocks_skipped_by_precheck"] = (
-                    diag.get("cutter_blocks_skipped_by_precheck", 0)
-                    + len(line_under) - i
-                )
-                break
-
-    diag["underfilled_reconstruction_valid_delta"] = int(len(new_valid) - len(valid_segments))
-    diag["underfilled_reconstruction_underfilled_delta"] = int(len(underfilled_segments) - len(remaining_under))
-    diag["underfilled_reconstruction_valid_after"] = int(len(new_valid))
-    diag["underfilled_reconstruction_underfilled_after"] = int(len(remaining_under))
-    diag["underfilled_reconstruction_seconds"] = round(perf_counter() - t0, 6)
-    diag["reconstruction_seconds"] = diag["underfilled_reconstruction_seconds"]
-    census_dict = bridgeability_census.to_dict()
-    suggestion = _suggest_next_phase_from_census(census_dict)
-    diag["bridgeability_census"] = census_dict
-    diag["bridgeability_census_items"] = list(census_dict.get("items", []))
-    diag["bridgeability_route_suggestion"] = str(suggestion.get("suggestion", "CONTINUE_REAL_BRIDGE_ONLY"))
-    diag["virtual_pilot_selected_by_bucket_count"] = dict(virtual_pilot_selected_by_bucket)
-    diag["virtual_pilot_selected_by_family_count"] = dict(virtual_pilot_selected_by_family)
-    diag["virtual_pilot_scheduler_selected_blocks"] = list(virtual_pilot_scheduler_selected_blocks)
-    diag["virtual_pilot_scheduler_skipped_due_to_limit"] = list(virtual_pilot_scheduler_skipped_due_to_limit)
-    family_audit: dict[str, dict] = {}
-    stage_by_family = dict(diag.get("virtual_pilot_execution_stage_by_family", {}) or {})
-    for family in sorted(set(list(dict(virtual_pilot_selected_by_family).keys()) + list(stage_by_family.keys()) + ["WIDTH_GROUP", "THICKNESS", "OTHER"])):
-        fam_counts = dict(stage_by_family.get(family, {}) or {})
-        selected_count = int(dict(virtual_pilot_selected_by_family).get(family, 0) or 0)
-        dedup_kept_count = int(fam_counts.get("DEDUP_KEPT", 0) or 0)
-        attempt_started_count = int(fam_counts.get("ATTEMPT_STARTED", 0) or 0)
-        if selected_count > 0 and dedup_kept_count <= 0:
-            missing_reason = "ALL_DEDUP_SKIPPED"
-        elif dedup_kept_count > 0 and attempt_started_count <= 0:
-            missing_reason = "INTERNAL_FLOW_BROKEN"
-        else:
-            missing_reason = ""
-        family_audit[family] = {
-            "selected_count": selected_count,
-            "dedup_kept_count": dedup_kept_count,
-            "attempt_started_count": attempt_started_count,
-            "missing_execution_reason": missing_reason,
-        }
-        print(
-            f"[APS][VIRTUAL_BRIDGE_FAMILY_EXECUTION_AUDIT] family={family}, "
-            f"selected_count={selected_count}, dedup_kept_count={dedup_kept_count}, "
-            f"attempt_started_count={attempt_started_count}, "
-            f"missing_execution_reason={missing_reason or 'OK'}"
-        )
-        if family == "WIDTH_GROUP":
-            print(
-                f"[APS][VIRTUAL_BRIDGE_FAMILY_GUARANTEE] family=WIDTH_GROUP, "
-                f"guaranteed_attempt={bool(diag.get('virtual_pilot_width_group_guarantee_attempted', False))}, "
-                f"reason={'WIDTH_GROUP_ATTEMPT_PATH_ENTERED' if attempt_started_count > 0 else (missing_reason or 'NO_WIDTH_GROUP_SELECTED')}"
-            )
-    diag["virtual_pilot_family_execution_audit"] = family_audit
-    if int(diag.get("repair_only_real_bridge_attempts", 0) or 0) <= 0:
-        diag["repair_only_real_bridge_not_entered_reason"] = "DIRECT_ONLY_OR_NO_BRIDGE_STAGE"
-    print(
-        f"[APS][VIRTUAL_BRIDGE_PILOT_SCHEDULER] total_budget={int(virtual_pilot_max_blocks)}, "
-        f"bucket_quota={dict(virtual_pilot_family_quota)}, "
-        f"selected_by_bucket={dict(virtual_pilot_selected_by_bucket)}, "
-        f"selected_blocks={list(virtual_pilot_scheduler_selected_blocks)}, "
-        f"skipped_due_to_limit={list(virtual_pilot_scheduler_skipped_due_to_limit)}"
-    )
-    print(
-        f"[APS][BRIDGEABILITY_CENSUS] total_blocks={int(census_dict.get('total_blocks', 0) or 0)}, "
-        f"has_endpoint_edge_count={int(census_dict.get('has_endpoint_edge_count', 0) or 0)}, "
-        f"template_graph_no_edge_count={int(census_dict.get('template_graph_no_edge_count', 0) or 0)}, "
-        f"rule_prefilter_all_fail_count={int(census_dict.get('rule_prefilter_all_fail_count', 0) or 0)}, "
-        f"band_too_narrow_count={int(census_dict.get('band_too_narrow_count', 0) or 0)}, "
-        f"prefilter_rejected_block_count={int(census_dict.get('prefilter_rejected_block_count', 0) or 0)}, "
-        f"candidate_pool_empty_count={int(census_dict.get('candidate_pool_empty_count', 0) or 0)}, "
-        f"candidate_pool_nonempty_count={int(census_dict.get('candidate_pool_nonempty_count', 0) or 0)}, "
-        f"ton_rescue_entered_count={int(census_dict.get('ton_rescue_entered_count', 0) or 0)}, "
-        f"ton_rescue_success_count={int(census_dict.get('ton_rescue_success_count', 0) or 0)}, "
-        f"improvement_recorded_count={int(census_dict.get('improvement_recorded_count', 0) or 0)}, "
-        f"improvement_applied_count={int(census_dict.get('improvement_applied_count', 0) or 0)}, "
-        f"thickness_fail_dominant_count={int(census_dict.get('thickness_fail_dominant_count', 0) or 0)}, "
-        f"width_fail_dominant_count={int(census_dict.get('width_fail_dominant_count', 0) or 0)}, "
-        f"temp_fail_dominant_count={int(census_dict.get('temp_fail_dominant_count', 0) or 0)}, "
-        f"group_fail_dominant_count={int(census_dict.get('group_fail_dominant_count', 0) or 0)}, "
-        f"multi_fail_dominant_count={int(census_dict.get('multi_fail_dominant_count', 0) or 0)}"
-    )
-    print(
-        f"[APS][BRIDGEABILITY_ROUTE_SUGGESTION] suggestion={diag['bridgeability_route_suggestion']}, "
-        f"reasons={list(suggestion.get('reasons', []))}"
-    )
-    print(
-        f"[APS][RECON_GAIN] valid_before={len(valid_segments)}, valid_after={len(new_valid)}, "
-        f"underfilled_before={len(underfilled_segments)}, underfilled_after={len(remaining_under)}"
-    )
-    print(
-        f"[APS][RECON_TIMING] reconstruction={float(diag['reconstruction_seconds']):.3f}, "
-        f"repair_bridge_real={float(diag['repair_bridge_real_seconds']):.3f}"
-    )
-    print(
-        f"[APS][VIRTUAL_BRIDGE_PILOT_SUMMARY] "
-        f"scheduler_budget={int(diag.get('virtual_pilot_scheduler_budget', 0) or 0)}, "
-        f"selected_by_bucket_count={dict(diag.get('virtual_pilot_selected_by_bucket_count', {}) or {})}, "
-        f"dedup_group_count={int(diag.get('virtual_pilot_dedup_group_count', 0) or 0)}, "
-        f"duplicate_candidate_skipped_count={int(diag.get('virtual_pilot_duplicate_candidate_skipped_count', 0) or 0)}, "
-        f"selected_unique_pilot_key_count={int(diag.get('virtual_pilot_selected_unique_pilot_key_count', 0) or 0)}, "
-        f"selected_by_family_count={dict(diag.get('virtual_pilot_selected_by_family_count', {}) or {})}, "
-        f"family_prefilter_fail_count={int(diag.get('virtual_pilot_family_prefilter_fail_count', 0) or 0)}, "
-        f"width_group_family_attempt_count={int(diag.get('virtual_pilot_width_group_family_attempt_count', 0) or 0)}, "
-        f"thickness_family_attempt_count={int(diag.get('virtual_pilot_thickness_family_attempt_count', 0) or 0)}, "
-        f"structural_eligible_block_count={int(diag.get('virtual_pilot_structural_eligible_block_count', 0) or 0)}, "
-        f"runtime_enabled_block_count={int(diag.get('virtual_pilot_runtime_enabled_block_count', 0) or 0)}, "
-        f"final_eligible_block_count={int(diag.get('virtual_pilot_final_eligible_block_count', 0) or 0)}, "
-        f"eligible_block_count={int(diag.get('virtual_pilot_eligible_block_count', 0) or 0)}, "
-        f"selected_block_count={int(diag.get('virtual_pilot_selected_block_count', 0) or 0)}, "
-        f"attempt_count={int(diag.get('virtual_pilot_attempt_count', 0) or 0)}, "
-        f"success_count={int(diag.get('virtual_pilot_success_count', 0) or 0)}, "
-        f"apply_count={int(diag.get('virtual_pilot_apply_count', 0) or 0)}, "
-        f"reject_count={int(diag.get('virtual_pilot_reject_count', 0) or 0)}, "
-        f"skipped_count={int(diag.get('virtual_pilot_skipped_block_count', 0) or 0)}, "
-        f"skipped_due_to_disabled_count={int(diag.get('virtual_pilot_skipped_due_to_disabled_count', 0) or 0)}, "
-        f"skipped_due_to_limit_count={int(diag.get('virtual_pilot_skipped_due_to_limit_count', 0) or 0)}, "
-        f"skipped_due_to_no_pilotable_candidate_count={int(diag.get('virtual_pilot_skipped_due_to_no_pilotable_candidate_count', 0) or 0)}, "
-        f"small_block_soft_penalty_count={int(diag.get('virtual_pilot_small_block_soft_penalty_count', 0) or 0)}, "
-        f"spec_enum_total={int(diag.get('virtual_pilot_spec_enum_total', 0) or 0)}, "
-        f"spec_enum_both_valid_count={int(diag.get('virtual_pilot_spec_enum_both_valid_count', 0) or 0)}, "
-        f"ton_fill_attempt_count={int(diag.get('virtual_pilot_ton_fill_attempt_count', 0) or 0)}, "
-        f"ton_fill_success_count={int(diag.get('virtual_pilot_ton_fill_success_count', 0) or 0)}, "
-        f"selected_candidate_count={int(diag.get('virtual_pilot_selected_candidate_count', 0) or 0)}, "
-        f"dedup_kept_count={int(diag.get('virtual_pilot_dedup_kept_count', 0) or 0)}, "
-        f"dedup_skipped_count={int(diag.get('virtual_pilot_dedup_skipped_count', 0) or 0)}, "
-        f"attempt_started_count={int(diag.get('virtual_pilot_attempt_started_count', 0) or 0)}, "
-        f"spec_enum_done_count={int(diag.get('virtual_pilot_spec_enum_done_count', 0) or 0)}, "
-        f"recut_entered_count={int(diag.get('virtual_pilot_recut_entered_count', 0) or 0)}, "
-        f"segment_valid_count={int(diag.get('virtual_pilot_segment_valid_count', 0) or 0)}, "
-        f"ton_fill_entered_count={int(diag.get('virtual_pilot_ton_fill_entered_count', 0) or 0)}, "
-        f"apply_check_entered_count={int(diag.get('virtual_pilot_apply_check_entered_count', 0) or 0)}, "
-        f"apply_success_count={int(diag.get('virtual_pilot_apply_success_count', 0) or 0)}, "
-        f"post_spec_fail_stage_count={dict(diag.get('virtual_pilot_post_spec_fail_stage_count', {}) or {})}, "
-        f"fail_stage_count={dict(diag.get('virtual_pilot_fail_stage_count', {}) or {})}, "
-        f"reject_by_reason={dict(diag.get('virtual_pilot_reject_by_reason_count', {}) or {})}"
-    )
-    print(
-        f"[APS][UNDERFILLED_RECON_SUMMARY] attempts={int(diag.get('underfilled_reconstruction_attempts', 0))}, "
-        f"success={int(diag.get('underfilled_reconstruction_success', 0))}, "
-        f"blocks_tested={int(diag.get('underfilled_reconstruction_blocks_tested', 0))}, "
-        f"valid_delta={int(diag.get('underfilled_reconstruction_valid_delta', 0))}, "
-        f"underfilled_delta={int(diag.get('underfilled_reconstruction_underfilled_delta', 0))}, "
-        f"salvaged_segments={int(diag.get('underfilled_reconstruction_segments_salvaged', 0))}, "
-        f"salvaged_orders={int(diag.get('underfilled_reconstruction_orders_salvaged', 0))}, "
-        # ---- Cutter optimization stats ----
-        f"cutter_blocks_touched={int(diag.get('cutter_blocks_touched', 0))}, "
-        f"cutter_blocks_improved={int(diag.get('cutter_blocks_improved', 0))}, "
-        f"cutter_blocks_skipped_by_precheck={int(diag.get('cutter_blocks_skipped_by_precheck', 0))}, "
-        f"cutter_blocks_skipped_by_no_gain_set={int(diag.get('cutter_blocks_skipped_by_no_gain_set', 0))}, "
-        f"cutter_no_gain_streak_max={int(diag.get('cutter_no_gain_streak_max', 0))}, "
-        f"reconstruction_early_stopped={bool(diag.get('reconstruction_stage_early_stopped', False))}, "
-        f"ton_rescue_extract_success={int(diag.get('repair_bridge_ton_rescue_extract_success', 0))}, "
-        f"ton_rescue_partial_success={int(diag.get('repair_bridge_ton_rescue_partial_success', 0))}, "
-        f"ton_rescue_pair_fail_width={int(diag.get('repair_bridge_ton_rescue_pair_fail_width', 0))}, "
-        f"ton_rescue_pair_fail_thickness={int(diag.get('repair_bridge_ton_rescue_pair_fail_thickness', 0))}, "
-        f"ton_rescue_pair_fail_temp={int(diag.get('repair_bridge_ton_rescue_pair_fail_temp', 0))}, "
-        f"ton_rescue_pair_fail_group={int(diag.get('repair_bridge_ton_rescue_pair_fail_group', 0))}, "
-        f"ton_rescue_pair_fail_context={int(diag.get('repair_bridge_ton_rescue_pair_fail_context', 0))}, "
-        f"ton_rescue_pair_fail_template={int(diag.get('repair_bridge_ton_rescue_pair_fail_template', 0))}, "
-        f"ton_rescue_pair_fail_multi={int(diag.get('repair_bridge_ton_rescue_pair_fail_multi', 0))}, "
-        f"ton_rescue_pair_fail_unknown={int(diag.get('repair_bridge_ton_rescue_pair_fail_unknown', 0))}, "
-        f"prefilter_reject_count={int(diag.get('repair_bridge_prefilter_reject_count', 0))}, "
-        f"endpoint_early_stop_count={int(diag.get('repair_bridge_endpoint_early_stop_count', 0))}, "
-        f"local_band_retry_count={int(diag.get('repair_bridge_local_band_retry_count', 0))}, "
-        f"improvement_recorded_count={int(diag.get('underfilled_reconstruction_improvement_recorded_count', 0))}, "
-        f"improvement_applied_count={int(diag.get('underfilled_reconstruction_improvement_applied_count', 0))}, "
-        f"apply_reject_count={int(diag.get('underfilled_reconstruction_apply_reject_count', 0))}, "
-        f"bridgeability_route_suggestion={str(diag.get('bridgeability_route_suggestion', ''))}, "
-        # ---- Legacy virtual pilot: 降级为单一布尔字段 ----
-        f"virtual_pilot_skipped_due_to_disabled={bool(diag.get('virtual_pilot_skipped_due_to_disabled', True))}, "
-        f"conservative_apply_attempt_count={int(diag.get('conservative_apply_attempt_count', 0) or 0)}, "
-        f"conservative_apply_success_count={int(diag.get('conservative_apply_success_count', 0) or 0)}, "
-        f"conservative_apply_reject_count={int(diag.get('conservative_apply_reject_count', 0) or 0)}"
-    )
-    diagnostics.update(diag)
-    return new_valid, remaining_under, diag
-
-
-def _validate_fill_multiplicity(
-    tail_seg: CampaignSegment,
-    new_tail_seg: CampaignSegment,
-    inserted_oid: str,
-) -> Tuple[bool, dict]:
-    """
-    Validate order multiplicity for TAIL_FILL_FROM_DROPPED.
-
-    For FILL, the new tail contains ALL orders from the original tail PLUS
-    exactly one inserted dropped order.  The check is:
-        after_counter == before_counter + Counter([inserted_oid])
-
-    Returns:
-        (is_valid, details_dict)
-    """
-    before_counter = Counter(tail_seg.order_ids)
-    after_counter = Counter(new_tail_seg.order_ids)
-
-    before_count = sum(before_counter.values())
-    # Expected: before + 1 (the inserted dropped order)
-    expected_after_count = before_count + 1
-    actual_after_count = sum(after_counter.values())
-
-    # The inserted order must appear EXACTLY once in after
-    inserted_count_in_after = after_counter.get(inserted_oid, 0)
-    inserted_count_in_before = before_counter.get(inserted_oid, 0)
-
-    is_valid = (
-        actual_after_count == expected_after_count
-        and inserted_count_in_after == 1
-        and inserted_count_in_before == 0  # was NOT in the tail before
-    )
-
-    # All original tail orders must still be present (preserved)
-    original_preserved = all(
-        after_counter.get(oid, 0) == 1
-        for oid in tail_seg.order_ids
-    )
-
-    details = {
-        "before_count": before_count,
-        "expected_after_count": expected_after_count,
-        "actual_after_count": actual_after_count,
-        "inserted_order_id": inserted_oid,
-        "inserted_count_in_after": inserted_count_in_after,
-        "inserted_count_in_before": inserted_count_in_before,
-        "original_tail_preserved": original_preserved,
-        "multiplicity_match": is_valid,
-    }
-
-    if not is_valid:
-        reason = (
-            f"FILL_MULTIPLICITY_ERROR: "
-            f"inserted={inserted_oid}, "
-            f"before={before_count}, "
-            f"expected_after={expected_after_count}, "
-            f"actual_after={actual_after_count}, "
-            f"inserted_in_after={inserted_count_in_after}"
-        )
-        return False, details
-
-    return True, details
-
-
-def _check_global_order_uniqueness(
-    segments: List[CampaignSegment],
-) -> Tuple[int, List[dict]]:
-    """
-    Check that every order_id appears in at most one segment across ALL lines.
-
-    Returns:
-        (duplicate_count, duplicate_examples)
-    """
-    seen: Dict[str, dict] = {}
-    duplicates: List[dict] = []
-
-    for seg in segments:
-        for oid in seg.order_ids:
-            if oid in seen:
-                duplicates.append({
-                    "order_id": oid,
-                    "segment_a_local_id": seen[oid]["local_id"],
-                    "segment_a_line": seen[oid]["line"],
-                    "segment_b_local_id": seg.campaign_local_id,
-                    "segment_b_line": seg.line,
-                })
-            else:
-                seen[oid] = {"line": seg.line, "local_id": seg.campaign_local_id}
-
-    return len(duplicates), duplicates
-
-
-# ---------------------------------------------------------------------------
-# Rebalance orchestrator (window-based, no duplicates)
-# ---------------------------------------------------------------------------
+    if isinstance(diagnostics, dict):
+        diagnostics.update(diag)
+    print("[APS][UNDERFILLED_RECON] removed_from_mainline=true, candidate_source=graph_unused_nodes")
+    return list(valid_segments), list(underfilled_segments), diag
 
 def _rebalance_underfilled_segments(
     segments: List[CampaignSegment],
@@ -6592,6 +4445,8 @@ def _rebalance_underfilled_segments(
     tpl_df: pd.DataFrame | None = None,
     orders_df: pd.DataFrame | None = None,
     placed_oids: set | None = None,
+    candidate_graph=None,
+    graph_orders_df: pd.DataFrame | None = None,
 ) -> Tuple[List[CampaignSegment], List[CampaignSegment], dict]:
     """
     Orchestrator: apply multi-strategy rebalance to all underfilled segments
@@ -6681,6 +4536,10 @@ def _rebalance_underfilled_segments(
         "merge_skipped_due_to_fill_progress_count": 0,
         "tail_fill_candidates_rejected_already_in_segments": 0,
         "tail_fill_candidates_rejected_already_in_underfilled": 0,
+        "candidate_source": "graph_unused_nodes",
+        "graph_unused_candidates_total": 0,
+        "graph_unused_real_candidates": 0,
+        "graph_unused_virtual_candidates": 0,
         # Tail repair budget diagnostics
         "tail_repair_windows_attempted_total": 0,
         "tail_repair_windows_attempted_by_line": {"big_roll": 0, "small_roll": 0},
@@ -7129,12 +4988,29 @@ def _rebalance_underfilled_segments(
                 orders_df if orders_df is not None else pd.DataFrame(),
                 placed_oids | fill_consumed_oids,
                 cfg, tpl_df,
+                candidate_graph=candidate_graph,
+                graph_orders_df=graph_orders_df if graph_orders_df is not None else orders_df,
             )
 
             diag["tail_repair_fill_attempts"] += 1
             diag["fill_candidates_tested_total"] += diag_d.get("fill_candidates_tested", 0)
             diag["tail_fill_candidates_considered"] = (
                 diag.get("tail_fill_candidates_considered", 0) + diag_d.get("candidates_considered", 0)
+            )
+            diag["graph_unused_candidates_total"] = (
+                diag.get("graph_unused_candidates_total", 0) + diag_d.get("graph_unused_candidates_total", 0)
+            )
+            diag["graph_unused_real_candidates"] = (
+                diag.get("graph_unused_real_candidates", 0) + diag_d.get("graph_unused_real_candidates", 0)
+            )
+            diag["graph_unused_virtual_candidates"] = (
+                diag.get("graph_unused_virtual_candidates", 0) + diag_d.get("graph_unused_virtual_candidates", 0)
+            )
+            diag["graph_unused_repair_attempts"] = (
+                diag.get("graph_unused_repair_attempts", 0) + diag_d.get("graph_unused_repair_attempts", 0)
+            )
+            diag["virtual_node_repair_attempts"] = (
+                diag.get("virtual_node_repair_attempts", 0) + diag_d.get("virtual_node_repair_attempts", 0)
             )
 
             if not (ok_d and new_tail_d is not None):
@@ -7182,6 +5058,9 @@ def _rebalance_underfilled_segments(
                 diag.get("tail_fill_total_inserted_orders", 0) + 1
             )
             fill_consumed_oids.add(inserted_oid)
+            diag["graph_unused_repair_success"] = diag.get("graph_unused_repair_success", 0) + 1
+            if str(inserted_oid).startswith("VIRTUAL_") or str(inserted_oid).startswith("PREBUILT_VIRTUAL_"):
+                diag["virtual_node_repair_success"] = diag.get("virtual_node_repair_success", 0) + 1
 
             # ---- Apply the fill result to the window ----
             new_tail_d.campaign_local_id = u_seg.campaign_local_id
@@ -7434,6 +5313,27 @@ def _rebalance_underfilled_segments(
         # NOTE: if not repaired, u_seg remains in ordered_line as-is (invalid).
         # Final still_under is collected by scanning ordered_line below (Step 4).
 
+    def _check_global_order_uniqueness_local(segments: List[CampaignSegment]) -> Tuple[int, List[dict]]:
+        """Local safety helper: ensure every order_id appears in at most one segment."""
+        seen: Dict[str, dict] = {}
+        duplicates: List[dict] = []
+        for seg in segments:
+            for oid in getattr(seg, "order_ids", []) or []:
+                if oid in seen:
+                    duplicates.append({
+                        "order_id": oid,
+                        "segment_a_local_id": seen[oid]["local_id"],
+                        "segment_a_line": seen[oid]["line"],
+                        "segment_b_local_id": getattr(seg, "campaign_local_id", None),
+                        "segment_b_line": getattr(seg, "line", ""),
+                    })
+                else:
+                    seen[oid] = {
+                        "line": getattr(seg, "line", ""),
+                        "local_id": getattr(seg, "campaign_local_id", None),
+                    }
+        return len(duplicates), duplicates
+
     # -------------------------------------------------------------------------
     # Step 4: Rebuild final segment list by scanning the FINAL ordered_line.
     # Key invariant: after in-place replacement above, ordered_line contains the
@@ -7458,7 +5358,7 @@ def _rebalance_underfilled_segments(
     # -------------------------------------------------------------------------
     # Step 5: Global uniqueness check — crash early if duplicates remain
     # -------------------------------------------------------------------------
-    dup_count, dup_examples = _check_global_order_uniqueness(
+    dup_count, dup_examples = _check_global_order_uniqueness_local(
         repaired_segments + still_under
     )
     diag["duplicate_orders_after_rebalance"] = dup_count
@@ -7605,6 +5505,8 @@ def cut_sequences_into_campaigns(
     orders_df: pd.DataFrame,
     cfg: PlannerConfig,
     tpl_df: pd.DataFrame | None = None,
+    candidate_graph=None,
+    graph_orders_df: pd.DataFrame | None = None,
 ) -> CampaignCutResult:
     """
     Cut constructive chains into campaign segments.
@@ -7819,6 +5721,8 @@ def cut_sequences_into_campaigns(
         segments, underfilled_segments, rebal_diag = _rebalance_underfilled_segments(
             segments, underfilled_segments, order_tons, cfg, tpl_df,
             orders_df, placed_oids,
+            candidate_graph=candidate_graph,
+            graph_orders_df=graph_orders_df if graph_orders_df is not None else orders_df,
         )
         repaired_count = rebal_diag.get("total_repaired", 0)
         repaired_by_shift = rebal_diag.get("tail_repair_shift_success", 0)
@@ -7851,6 +5755,10 @@ def cut_sequences_into_campaigns(
         "tail_repair_fill_attempts": rebal_diag.get("tail_repair_fill_attempts", 0),
         "tail_repair_fill_success": rebal_diag.get("tail_repair_fill_success", 0),
         "tail_fill_candidates_considered": rebal_diag.get("tail_fill_candidates_considered", 0),
+        "candidate_source": "graph_unused_nodes",
+        "graph_unused_candidates_total": rebal_diag.get("graph_unused_candidates_total", 0),
+        "graph_unused_real_candidates": rebal_diag.get("graph_unused_real_candidates", 0),
+        "graph_unused_virtual_candidates": rebal_diag.get("graph_unused_virtual_candidates", 0),
         "tail_fill_partial_progress_count": rebal_diag.get("tail_fill_partial_progress_count", 0),
         "tail_fill_multiplicity_ok_count": rebal_diag.get("tail_fill_multiplicity_ok_count", 0),
         "tail_fill_multiplicity_fail_count": rebal_diag.get("tail_fill_multiplicity_fail_count", 0),

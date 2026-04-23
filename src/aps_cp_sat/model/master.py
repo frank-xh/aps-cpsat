@@ -171,8 +171,6 @@ from aps_cp_sat.model.fallback_policy import (
 from aps_cp_sat.model.joint_master import _run_global_joint_model, _run_unified_master_skeleton
 from aps_cp_sat.model.constructive_lns_master import run_constructive_lns_master
 from aps_cp_sat.model.local_router import _solve_slot_route_with_templates
-from aps_cp_sat.transition import build_transition_templates
-from aps_cp_sat.model.candidate_graph import build_candidate_graph
 
 
 def _is_diagnostic_profile(profile_name: str) -> bool:
@@ -999,7 +997,7 @@ def solve_master_model(
         expected_strategy = "constructive_lns"
         if profile_name != expected_profile or solver_strategy != expected_strategy:
             raise RuntimeError(
-                "[APS][PROFILE_GUARD][ONLY_SINGLE_ROUTE_ALLOWED] "
+                f"[APS][PROFILE_GUARD][ONLY_SINGLE_ROUTE_ALLOWED] "
                 f"expected strategy={expected_strategy}, expected profile={expected_profile}, "
                 f"got strategy={solver_strategy!r}, profile={profile_name!r}"
             )
@@ -1032,20 +1030,11 @@ def solve_master_model(
                 f"[APS][constructive_lns] edge_policy={constructive_edge_policy}, bridge_expansion_mode={bridge_expansion_mode}")
         health = _assess_template_graph_health(current_transition_pack, current_cfg)
         precheck_autorelax_applied = False
-        if health.get("template_graph_health") in {"SPARSE", "DISCONNECTED"}:
-            current_cfg = _precheck_relaxed_config(current_cfg)
-            rebuild_t0 = perf_counter()
-            current_transition_pack = build_transition_templates(orders_df, current_cfg)
-            template_build_seconds += perf_counter() - rebuild_t0
-            health = _assess_template_graph_health(current_transition_pack, current_cfg)
-            precheck_autorelax_applied = True
-            print(
-                f"[APS][template_precheck] autorelax=true, health={health.get('template_graph_health')}, "
-                f"prune={current_cfg.model.global_prune_max_pairs_per_from}, top_k={current_cfg.model.template_top_k}, "
-                f"routes_per_slot={current_cfg.model.max_routes_per_slot}"
-            )
-        else:
-            print(f"[APS][template_precheck] autorelax=false, health={health.get('template_graph_health')}")
+        print(
+            f"[APS][template_precheck] autorelax=false, "
+            f"health={health.get('template_graph_health')}, "
+            f"candidate_graph_source=pipeline"
+        )
 
         feasibility_evidence = build_feasibility_evidence(orders_df, current_transition_pack, current_cfg)
         evidence_level = str(feasibility_evidence.get("evidence_level", "OK"))

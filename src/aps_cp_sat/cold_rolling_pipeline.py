@@ -119,6 +119,8 @@ class ColdRollingPipeline:
                         f"virtual_edges={int(total.get('candidate_graph_virtual_edge_count', 0) or 0)}, "
                         f"real_virtual={int(total.get('candidate_graph_real_virtual_edge_count', 0) or 0)}, "
                         f"virtual_real={int(total.get('candidate_graph_virtual_real_edge_count', 0) or 0)}, "
+                        f"virtual_real_effective={int(total.get('virtual_real_edge_count_effective', 0) or 0)}, "
+                        f"virtual_chain_paths={int(total.get('accepted_virtual_chain_paths', 0) or 0)}, "
                         f"virtual_virtual={int(total.get('candidate_graph_virtual_virtual_edge_count', 0) or 0)}, "
                         f"real_bridge_capable_orders={int(total.get('candidate_graph_real_bridge_capable_order_count', 0) or 0)}, "
                         f"direct={int(total.get('candidate_graph_direct_edge_count', 0) or 0)}, "
@@ -136,9 +138,20 @@ class ColdRollingPipeline:
         if not isinstance(transition_pack, dict):
             return transition_pack
         tpl_df = transition_pack.get("templates")
+        tpl_df = tpl_df if isinstance(tpl_df, pd.DataFrame) else pd.DataFrame()
+        virtual_rows = ColdRollingPipeline._build_virtual_inventory_template_edges(orders_df, tpl_df, cfg)
+        if virtual_rows:
+            tpl_df = pd.concat([tpl_df, pd.DataFrame(virtual_rows)], ignore_index=True, sort=False)
+            transition_pack["templates"] = tpl_df
+            build_debug = transition_pack.get("build_debug")
+            if isinstance(build_debug, list):
+                for item in build_debug:
+                    if isinstance(item, dict) and str(item.get("line")) == "__all__":
+                        item["virtual_inventory_template_edge_count"] = int(len(virtual_rows))
+                        break
         candidate_graph = build_candidate_graph(
             orders_df,
-            tpl_df if isinstance(tpl_df, pd.DataFrame) else pd.DataFrame(),
+            tpl_df,
             cfg,
         )
         transition_pack["candidate_graph"] = candidate_graph
@@ -150,6 +163,115 @@ class ColdRollingPipeline:
                     item.update(candidate_graph.diagnostics)
                     break
         return transition_pack
+
+    @staticmethod
+    def _build_virtual_inventory_template_edges(orders_df: pd.DataFrame, tpl_df: pd.DataFrame, cfg) -> list[dict[str, Any]]:
+        """Add explicit graph edges for prebuilt virtual inventory nodes.
+
+        These rows do not alter virtual specs. They make fixed virtual coils
+        ordinary graph nodes so the solver can consume limited paths such as
+        real -> virtual -> virtual -> real from the single augmented graph.
+        """
+        if orders_df is None or orders_df.empty or "order_id" not in orders_df.columns:
+            return []
+        work = orders_df.copy()
+        if "is_virtual" not in work.columns:
+            return []
+        is_virtual = work["is_virtual"].fillna(False).astype(bool)
+        if not bool(is_virtual.any()):
+            return []
+
+        existing: set[tuple[str, str, str]] = set()
+        if isinstance(tpl_df, pd.DataFrame) and not tpl_df.empty:
+            for row in tpl_df[["line", "from_order_id", "to_order_id"]].dropna(how="any").to_dict("records"):
+                existing.add((str(row.get("line", "")), str(row.get("from_order_id", "")), str(row.get("to_order_id", ""))))
+
+        records = work.to_dict("records")
+        by_line: dict[str, list[dict[str, Any]]] = {"big_roll": [], "small_roll": []}
+        for rec in records:
+            cap = str(rec.get("line_capability", "dual") or "dual")
+            lines = []
+            if cap in {"big_only", "large", "big", "dual", "either"}:
+                lines.append("big_roll")
+            if cap in {"small_only", "small", "dual", "either"}:
+                lines.append("small_roll")
+            for line in lines:
+                by_line[line].append(rec)
+
+        def is_v(rec: dict[str, Any]) -> bool:
+            raw = rec.get("is_virtual", False)
+            try:
+                if pd.isna(raw):
+                    raw = False
+            except Exception:
+                pass
+            return bool(raw) or str(rec.get("virtual_origin", "")) == "prebuilt_inventory"
+
+        def ok(a: dict[str, Any], b: dict[str, Any]) -> bool:
+            if not (is_v(a) or is_v(b)):
+                return False
+            try:
+                aw = float(a.get("width", 0.0) or 0.0)
+                bw = float(b.get("width", 0.0) or 0.0)
+                at = float(a.get("thickness", 0.0) or 0.0)
+                bt = float(b.get("thickness", 0.0) or 0.0)
+            except Exception:
+                return False
+            if aw <= 0 or bw <= 0 or at <= 0 or bt <= 0:
+                return False
+            if abs(bt - at) > max(0.25, at * 0.35):
+                return False
+            if bw < aw and (aw - bw) > float(getattr(cfg.rule, "max_width_drop", 250.0)):
+                return False
+            if bw > aw and (bw - aw) > float(getattr(cfg.rule, "virtual_reverse_attach_max_mm", 250.0)):
+                return False
+            ga = str(a.get("steel_group", "") or "").upper()
+            gb = str(b.get("steel_group", "") or "").upper()
+            if ga != gb and ga not in {"PC", "VIRTUAL_PC", "普碳"} and gb not in {"PC", "VIRTUAL_PC", "普碳"}:
+                return False
+            return True
+
+        rows: list[dict[str, Any]] = []
+        for line, line_records in by_line.items():
+            for a in line_records:
+                a_id = str(a.get("order_id", "") or "")
+                if not a_id:
+                    continue
+                for b in line_records:
+                    b_id = str(b.get("order_id", "") or "")
+                    if not b_id or a_id == b_id:
+                        continue
+                    key = (line, a_id, b_id)
+                    if key in existing or not ok(a, b):
+                        continue
+                    width_delta = float(a.get("width", 0.0) or 0.0) - float(b.get("width", 0.0) or 0.0)
+                    thickness_delta = abs(float(a.get("thickness", 0.0) or 0.0) - float(b.get("thickness", 0.0) or 0.0))
+                    rows.append(
+                        {
+                            "template_id": f"{line}:{a_id}->{b_id}#virtual_inventory",
+                            "line": line,
+                            "from_order_id": a_id,
+                            "to_order_id": b_id,
+                            "edge_type": "DIRECT_EDGE",
+                            "bridge_count": 0,
+                            "virtual_tons": 0.0,
+                            "cost": float(abs(width_delta) + thickness_delta * 100.0),
+                            "width_smooth_cost": abs(width_delta),
+                            "thickness_smooth_cost": thickness_delta,
+                            "temp_margin_cost": 0.0,
+                            "cross_group_cost": 0.0 if str(a.get("steel_group", "")) == str(b.get("steel_group", "")) else 1.0,
+                            "bridge_path": "",
+                            "real_bridge_order_id": "",
+                            "temp_overlap": 999.0,
+                            "width_delta": width_delta,
+                            "thickness_delta": thickness_delta,
+                            "group_switch": int(str(a.get("steel_group", "")) != str(b.get("steel_group", ""))),
+                            "logical_reverse_flag": int(float(b.get("width", 0.0) or 0.0) > float(a.get("width", 0.0) or 0.0)),
+                            "physical_reverse_count": 0,
+                            "virtual_inventory_edge": True,
+                        }
+                    )
+        return rows
 
     def _prepare_world(self, req: ColdRollingRequest) -> PreparedWorld:
         """Build shared upstream artifacts once, before route-specific solving."""
@@ -231,6 +353,11 @@ class ColdRollingPipeline:
             )
             return replace(req, config=enforced_cfg)
 
+        if requested_strategy == "block_first":
+            raise ValueError(
+                "[APS][PROFILE_GUARD][ONLY_SINGLE_ROUTE_ALLOWED] "
+                f"expected strategy={target_strategy}, profile={target_profile}"
+            )
         if requested_profile != target_profile or requested_strategy != target_strategy:
             raise ValueError(
                 '[APS][PROFILE_GUARD][ONLY_SINGLE_ROUTE_ALLOWED] '
@@ -268,7 +395,13 @@ class ColdRollingPipeline:
         "candidate_graph_virtual_virtual_edge_count",
         "candidate_graph_real_virtual_edge_count",
         "candidate_graph_virtual_real_edge_count",
+        "virtual_real_edge_count_effective",
+        "accepted_virtual_chain_paths",
         "candidate_graph_real_bridge_capable_order_count",
+        "candidate_source",
+        "graph_unused_candidates_total",
+        "graph_unused_real_candidates",
+        "graph_unused_virtual_candidates",
         # ---- Guarded virtual family (鍙楁帶铏氭嫙鏃忔ˉ鎺? ----
         "virtual_family_frontload_enabled",
         # Greedy/constructive phase family stats
@@ -315,6 +448,12 @@ class ColdRollingPipeline:
         "final_schedule_gate_passed",
         "final_schedule_gate_reason",
         "final_hard_violation_count_total",
+        "hard_violation_source",
+        "final_width_total_violation_count",
+        "final_thickness_violation_count",
+        "final_temperature_violation_count",
+        "final_group_transition_violation_count",
+        "final_campaign_ton_violation_count",
         "shadow_virtual_bridge_candidate_count",
         "shadow_virtual_fill_candidate_count",
         "shadow_virtual_possible_reduced_drops",
@@ -473,6 +612,17 @@ class ColdRollingPipeline:
             em["final_duplicate_order_violation_count"] = int(audit_summary.get("duplicate_order_violation_count", 0) or 0)
             gate = evaluate_final_schedule_gate(em, audit_summary)
             em.update(gate)
+            if not bool(gate.get("final_schedule_gate_passed", False)):
+                print(
+                    "[APS][FINAL_VALIDATE] "
+                    "hard_violation_source=final_schedule_audit_summary, "
+                    f"final_hard_violation_count_total={gate.get('final_hard_violation_count_total', 0)}, "
+                    f"final_width_total_violation_count={gate.get('final_width_total_violation_count', 0)}, "
+                    f"final_thickness_violation_count={gate.get('final_thickness_violation_count', 0)}, "
+                    f"final_temperature_violation_count={gate.get('final_temperature_violation_count', 0)}, "
+                    f"final_group_transition_violation_count={gate.get('final_group_transition_violation_count', 0)}, "
+                    f"final_campaign_ton_violation_count={gate.get('final_campaign_ton_violation_count', 0)}"
+                )
         else:
             em.update(evaluate_final_schedule_gate(em, {}))
         return em
@@ -683,6 +833,8 @@ class ColdRollingPipeline:
                 "candidate_graph_virtual_virtual_edge_count",
                 "candidate_graph_real_virtual_edge_count",
                 "candidate_graph_virtual_real_edge_count",
+                "virtual_real_edge_count_effective",
+                "accepted_virtual_chain_paths",
                 "candidate_graph_real_bridge_capable_order_count",
                 "candidate_graph_direct_edge_count",
                 "candidate_graph_real_bridge_edge_count",
@@ -1624,7 +1776,7 @@ class ColdRollingPipeline:
         print(f"[APS][PROFILE_GUARD] joint_master_disabled=true")
         if str(req.config.model.main_solver_strategy or "") != "constructive_lns":
             raise RuntimeError(
-                "[APS][ONLY_SINGLE_ROUTE_ALLOWED] expected strategy=constructive_lns, "
+                f"[APS][ONLY_SINGLE_ROUTE_ALLOWED] expected strategy=constructive_lns, "
                 f"got {req.config.model.main_solver_strategy!r}"
             )
         if str(req.config.model.profile_name or "") != "constructive_lns_virtual_guarded_frontload":
@@ -1973,15 +2125,15 @@ class ColdRollingPipeline:
         validated_feasible = bool(routing_feasible and final_schedule_gate_passed)
         updated_engine_meta["validated_feasible"] = validated_feasible
 
-        # Priority 1: validated_feasible_candidate_available must be defined BEFORE acceptance_gate_reason
-        # This determines if the result can be used for optimize phase
+        # Single-route mode has one constructive_lns solve; no second optimize
+        # pass may rebuild a different graph downstream.
         validated_feasible_candidate_available = (
                 routing_feasible
                 and final_schedule_gate_passed
                 and acceptance_status in {"OFFICIAL_FULL_SCHEDULE", "PARTIAL_SCHEDULE_WITH_DROPS"}
         )
-        can_enter_optimize = bool(validated_feasible_candidate_available)
-        optimize_block_reason = ""
+        can_enter_optimize = False
+        optimize_block_reason = "SINGLE_ROUTE_NO_SECOND_SOLVE"
         if not routing_feasible:
             optimize_block_reason = "ROUTING_NOT_FEASIBLE"
         elif not final_schedule_gate_passed:
@@ -2245,6 +2397,10 @@ class ColdRollingPipeline:
         updated_engine_meta["shift_seconds"] = float(tail_summary.get("shift_seconds", 0.0) or 0.0)
         updated_engine_meta["fill_seconds"] = float(tail_summary.get("fill_seconds", 0.0) or 0.0)
         updated_engine_meta["merge_seconds"] = float(tail_summary.get("merge_seconds", 0.0) or 0.0)
+        updated_engine_meta["candidate_source"] = str(tail_summary.get("candidate_source", "graph_unused_nodes"))
+        updated_engine_meta["graph_unused_candidates_total"] = int(tail_summary.get("graph_unused_candidates_total", 0) or 0)
+        updated_engine_meta["graph_unused_real_candidates"] = int(tail_summary.get("graph_unused_real_candidates", 0) or 0)
+        updated_engine_meta["graph_unused_virtual_candidates"] = int(tail_summary.get("graph_unused_virtual_candidates", 0) or 0)
         updated_engine_meta["export_consistency_ok"] = True
 
         # ---- Expose run_path_fingerprint fields from nested engine_meta ----

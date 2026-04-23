@@ -15,24 +15,6 @@ def _mode_enabled(cfg: Any) -> bool:
     )
 
 
-def _infer_capability_for_width(orders_df: pd.DataFrame, width: float) -> str:
-    """Infer capability from nearby real orders instead of duplicating line rules."""
-    if not isinstance(orders_df, pd.DataFrame) or orders_df.empty or "line_capability" not in orders_df.columns:
-        return "dual"
-    work = orders_df.copy()
-    if "is_virtual" in work.columns:
-        work = work[~work["is_virtual"].fillna(False).astype(bool)]
-    if work.empty or "width" not in work.columns:
-        return "dual"
-    width_num = pd.to_numeric(work["width"], errors="coerce")
-    nearby = work[(width_num - float(width)).abs() <= 100.0]
-    source = nearby if not nearby.empty else work
-    caps = [str(v or "dual") for v in source["line_capability"].tolist()]
-    if not caps:
-        return "dual"
-    return str(Counter(caps).most_common(1)[0][0] or "dual")
-
-
 def _target_capabilities(model: Any) -> list[str]:
     caps: list[str] = []
     if bool(getattr(model, "prebuilt_virtual_generate_for_big_roll", True)):
@@ -42,14 +24,56 @@ def _target_capabilities(model: Any) -> list[str]:
     return caps or ["dual"]
 
 
+def _sanitize_widths(model: Any) -> list[float]:
+    raw = list(getattr(model, "prebuilt_virtual_widths", [1000, 1250, 1500]) or [])
+    cleaned: list[float] = []
+    seen: set[float] = set()
+    for value in raw:
+        try:
+            width = float(value)
+        except Exception:
+            continue
+        if width <= 0:
+            continue
+        if width in seen:
+            continue
+        seen.add(width)
+        cleaned.append(width)
+    return cleaned or [1000.0, 1250.0, 1500.0]
+
+
+def _sanitize_thicknesses(model: Any) -> list[float]:
+    raw = list(getattr(model, "prebuilt_virtual_thicknesses", [0.6, 0.8, 1.0, 1.2, 1.5, 2.0]) or [])
+    cleaned: list[float] = []
+    seen: set[float] = set()
+    for value in raw:
+        try:
+            thk = float(value)
+        except Exception:
+            continue
+        if thk <= 0:
+            continue
+        if thk in seen:
+            continue
+        seen.add(thk)
+        cleaned.append(thk)
+    return cleaned or [0.6, 0.8, 1.0, 1.2, 1.5, 2.0]
+
+
 def build_prebuilt_virtual_inventory(cfg: Any, orders_df: pd.DataFrame) -> pd.DataFrame:
-    """Build pre-generated virtual bridge inventory for graph construction only."""
+    """Build pre-generated virtual bridge inventory for graph construction only.
+
+    IMPORTANT:
+    - Width / thickness specs are kept exactly as configured.
+    - No dynamic width re-anchoring is performed.
+    - Both production lines receive their own finite inventory pool.
+    """
     model = getattr(cfg, "model", cfg)
     if not _mode_enabled(cfg):
         return pd.DataFrame()
 
-    widths = list(getattr(model, "prebuilt_virtual_widths", [1000, 1250, 1500]) or [])
-    thicknesses = list(getattr(model, "prebuilt_virtual_thicknesses", [0.6, 0.8, 1.0, 1.2, 1.5, 2.0]) or [])
+    widths = _sanitize_widths(model)
+    thicknesses = _sanitize_thicknesses(model)
     count_per_spec = max(0, int(getattr(model, "prebuilt_virtual_count_per_spec", 5) or 0))
     temp_min = float(getattr(model, "prebuilt_virtual_temp_min", 600.0) or 600.0)
     temp_max = float(getattr(model, "prebuilt_virtual_temp_max", 900.0) or 900.0)
@@ -61,21 +85,19 @@ def build_prebuilt_virtual_inventory(cfg: Any, orders_df: pd.DataFrame) -> pd.Da
         or getattr(getattr(cfg, "rule", None), "virtual_tons", 20.0)
         or 20.0
     )
-    use_cap_rules = bool(getattr(model, "prebuilt_virtual_use_same_line_capability_rules", True))
     target_caps = _target_capabilities(model)
 
     rows: list[dict[str, Any]] = []
-    for width in widths:
-        for thickness in thicknesses:
-            for target_cap in target_caps:
-                # Keep the same capability labels as real orders; the target
-                # line switches decide which finite inventory pool receives the spec.
-                inferred_cap = _infer_capability_for_width(orders_df, float(width)) if use_cap_rules else target_cap
-                cap = target_cap if target_cap in {"big_only", "small_only"} else inferred_cap
-                line = {"big_only": "big_roll", "small_only": "small_roll", "dual": ""}.get(cap, "")
-                spec_key = f"{line or 'dual'}|W{int(float(width))}|T{float(thickness):.2f}"
+    for target_cap in target_caps:
+        line = {"big_only": "big_roll", "small_only": "small_roll", "dual": ""}.get(target_cap, "")
+        for width in widths:
+            for thickness in thicknesses:
+                spec_key = f"{line or 'dual'}|W{int(width)}|T{float(thickness):.2f}"
                 for idx in range(1, count_per_spec + 1):
-                    virtual_id = f"VIRTUAL_PREBUILT__{line or 'dual'}__W{int(float(width))}__T{float(thickness):.2f}__{idx:02d}"
+                    virtual_id = (
+                        f"VIRTUAL_PREBUILT__{line or 'dual'}__W{int(width)}"
+                        f"__T{float(thickness):.2f}__{idx:02d}"
+                    )
                     rows.append(
                         {
                             "order_id": virtual_id,
@@ -95,12 +117,12 @@ def build_prebuilt_virtual_inventory(cfg: Any, orders_df: pd.DataFrame) -> pd.Da
                             "backlog": float(tons),
                             "due_date": pd.NaT,
                             "roll_type": "virtual",
-                            "line_capability": cap,
+                            "line_capability": target_cap,
                             "priority": 0,
                             "due_bucket": "virtual",
                             "due_rank": 99,
                             "line": line,
-                            "line_source": cap,
+                            "line_source": target_cap,
                             "proc_hours_big": 0.0,
                             "proc_hours_small": 0.0,
                             "proc_hours": 0.0,
@@ -151,7 +173,5 @@ def prebuilt_virtual_inventory_diagnostics(inventory_df: pd.DataFrame, cfg: Any)
         "virtual_inventory_small_roll_count": int(small_count),
         "virtual_inventory_remaining_count": int(len(inventory_df)),
         "virtual_inventory_consumed_count": 0,
-        "prebuilt_virtual_line_capability_breakdown": inventory_df["line_capability"].value_counts(dropna=False).to_dict()
-        if "line_capability" in inventory_df.columns
-        else {},
+        "prebuilt_virtual_line_capability_breakdown": inventory_df["line_capability"].value_counts(dropna=False).to_dict() if "line_capability" in inventory_df.columns else {},
     }

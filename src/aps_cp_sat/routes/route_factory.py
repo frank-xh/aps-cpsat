@@ -24,7 +24,7 @@ def create_route_runner(main_solver_strategy: str | None, profile_name: str | No
 
     if strategy != "constructive_lns":
         raise ValueError(
-            "[APS][ROUTE_FACTORY][ONLY_SINGLE_ROUTE_ALLOWED] "
+            f"[APS][ROUTE_FACTORY][ONLY_SINGLE_ROUTE_ALLOWED] "
             "expected strategy=constructive_lns, "
             "expected profile=constructive_lns_virtual_guarded_frontload, "
             f"got strategy={strategy!r}, profile={profile!r}"

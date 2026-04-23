@@ -9,7 +9,7 @@
    - ScoreConfig：目标函数、掉单、桥接、虚拟使用、平滑性等评分权重。
 2. 本文件中的 profile 只负责覆盖这些基础参数，不重新定义参数语义。
 3. 如果新增 profile 覆盖项，应先在对应 dataclass 中补字段和中文注释，再在这里覆盖取值。
-4. constructive_lns 与 block_first 两条路线通过 main_solver_strategy / profile_name 显式切换。
+4. 当前正式主路径只允许 constructive_lns / constructive_lns_virtual_guarded_frontload。
 5. 不在 profile 层绕过硬约束；硬约束口径统一以 RuleConfig 和终态审计为准。
 """
 
@@ -32,7 +32,7 @@ def build_profile_config(
         profile = "constructive_lns_virtual_guarded_frontload"
     if profile != "constructive_lns_virtual_guarded_frontload":
         raise ValueError(
-            "[APS][PROFILE_GUARD][ONLY_SINGLE_ROUTE_ALLOWED] "
+            f"[APS][PROFILE_GUARD][ONLY_SINGLE_ROUTE_ALLOWED] "
             "expected strategy=constructive_lns, "
             "expected profile=constructive_lns_virtual_guarded_frontload, "
             f"got profile={profile_name!r}"
