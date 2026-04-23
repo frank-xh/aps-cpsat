@@ -397,6 +397,570 @@ def _segment_real_tons(rows: List[Dict[str, Any]]) -> float:
     return float(total)
 
 
+def _split_block_ids(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(v) for v in value if str(v)]
+    return [p.strip() for p in str(value or "").split(",") if p.strip()]
+
+
+def _campaign_ton_by_id(schedule_df: pd.DataFrame) -> Dict[str, float]:
+    if schedule_df is None or schedule_df.empty or "campaign_id" not in schedule_df.columns:
+        return {}
+    tons_col = "tons" if "tons" in schedule_df.columns else None
+    if tons_col is None:
+        return {}
+    real_df = schedule_df
+    if "is_virtual" in real_df.columns:
+        real_df = real_df[~real_df["is_virtual"].astype(bool)]
+    return {
+        str(k): float(v)
+        for k, v in real_df.groupby("campaign_id", dropna=False)[tons_col].sum().to_dict().items()
+    }
+
+
+def _campaign_min_violation_count(schedule_df: pd.DataFrame, cfg: PlannerConfig) -> int:
+    min_tons = float(getattr(cfg.rule, "campaign_ton_min", 700.0) or 700.0)
+    return int(sum(1 for tons in _campaign_ton_by_id(schedule_df).values() if float(tons) < min_tons))
+
+
+def _ordered_campaign_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    sort_cols = [c for c in ["line", "campaign_id", "campaign_seq", "sequence_in_slot", "global_sequence_on_line", "sequence_in_block"] if c in df.columns]
+    if sort_cols:
+        return df.sort_values(sort_cols, kind="mergesort")
+    return df.copy()
+
+
+def _formal_trial_empty_row(reason: str = "DISABLED_BY_CONFIG") -> Dict[str, Any]:
+    return {
+        "proposal_id": "",
+        "source_skeleton_id": "",
+        "target_skeleton_id": "",
+        "bridge_type_needed": "",
+        "attempted": False,
+        "applied": False,
+        "rolled_back": False,
+        "guard_passed": False,
+        "guard_reason": reason,
+        "rollback_reason": "",
+        "campaign_tons_before": 0.0,
+        "campaign_tons_after": 0.0,
+        "hard_violation_before": 0,
+        "hard_violation_after": 0,
+        "campaign_ton_min_violation_count_before": 0,
+        "campaign_ton_min_violation_count_after": 0,
+        "registry_size": 0,
+        "registry_hit": False,
+        "preflight_reason": reason,
+        "reason": reason,
+    }
+
+
+def _set_formal_single_bridge_trial_defaults(diag_counters: Dict[str, Any]) -> None:
+    row = _formal_trial_empty_row()
+    diag_counters.setdefault("formal_single_bridge_trial_enabled", False)
+    diag_counters.setdefault("formal_single_bridge_trial_attempted", False)
+    diag_counters.setdefault("formal_single_bridge_trial_applied", False)
+    diag_counters.setdefault("formal_single_bridge_trial_rolled_back", False)
+    diag_counters.setdefault("formal_single_bridge_trial_guard_passed", False)
+    diag_counters.setdefault("formal_single_bridge_trial_guard_reason", row["guard_reason"])
+    diag_counters.setdefault("formal_single_bridge_trial_reason", row["guard_reason"])
+    diag_counters.setdefault("formal_single_bridge_trial_rollback_reason", "")
+    diag_counters.setdefault("formal_single_bridge_trial_proposal_id", "")
+    diag_counters.setdefault("formal_single_bridge_trial_source", "")
+    diag_counters.setdefault("formal_single_bridge_trial_target", "")
+    diag_counters.setdefault("formal_single_bridge_trial_bridge_type_needed", "")
+    diag_counters.setdefault("formal_single_bridge_trial_campaign_tons_before", 0.0)
+    diag_counters.setdefault("formal_single_bridge_trial_campaign_tons_after", 0.0)
+    diag_counters.setdefault("formal_single_bridge_trial_hard_violation_before", 0)
+    diag_counters.setdefault("formal_single_bridge_trial_hard_violation_after", 0)
+    diag_counters.setdefault("formal_single_bridge_trial_campaign_ton_min_violation_count_before", 0)
+    diag_counters.setdefault("formal_single_bridge_trial_campaign_ton_min_violation_count_after", 0)
+    diag_counters.setdefault("formal_single_bridge_trial_registry_size", 0)
+    diag_counters.setdefault("formal_single_bridge_trial_registry_hit", False)
+    diag_counters.setdefault("formal_single_bridge_trial_preflight_reason", row["preflight_reason"])
+    diag_counters.setdefault("formal_bridge_trial_rows", [row])
+
+
+def _record_formal_single_bridge_trial(
+    diag_counters: Dict[str, Any],
+    *,
+    proposal_id: str,
+    source_skeleton_id: str,
+    target_skeleton_id: str,
+    bridge_type_needed: str,
+    attempted: bool,
+    applied: bool,
+    rolled_back: bool,
+    guard_passed: bool,
+    guard_reason: str,
+    rollback_reason: str = "",
+    campaign_tons_before: float = 0.0,
+    campaign_tons_after: float = 0.0,
+    hard_violation_before: int = 0,
+    hard_violation_after: int = 0,
+    campaign_ton_min_violation_count_before: int | None = None,
+    campaign_ton_min_violation_count_after: int | None = None,
+    registry_size: int = 0,
+    registry_hit: bool = False,
+    preflight_reason: str | None = None,
+) -> None:
+    min_before = int(hard_violation_before if campaign_ton_min_violation_count_before is None else campaign_ton_min_violation_count_before)
+    min_after = int(hard_violation_after if campaign_ton_min_violation_count_after is None else campaign_ton_min_violation_count_after)
+    preflight = str(preflight_reason or guard_reason)
+    row = {
+        "proposal_id": proposal_id,
+        "source_skeleton_id": source_skeleton_id,
+        "target_skeleton_id": target_skeleton_id,
+        "bridge_type_needed": bridge_type_needed,
+        "attempted": bool(attempted),
+        "applied": bool(applied),
+        "rolled_back": bool(rolled_back),
+        "guard_passed": bool(guard_passed),
+        "guard_reason": guard_reason,
+        "rollback_reason": rollback_reason,
+        "campaign_tons_before": float(round(campaign_tons_before, 3)),
+        "campaign_tons_after": float(round(campaign_tons_after, 3)),
+        "hard_violation_before": int(hard_violation_before),
+        "hard_violation_after": int(hard_violation_after),
+        "campaign_ton_min_violation_count_before": min_before,
+        "campaign_ton_min_violation_count_after": min_after,
+        "registry_size": int(registry_size),
+        "registry_hit": bool(registry_hit),
+        "preflight_reason": preflight,
+        "reason": guard_reason,
+    }
+    diag_counters["formal_single_bridge_trial_attempted"] = bool(attempted)
+    diag_counters["formal_single_bridge_trial_applied"] = bool(applied)
+    diag_counters["formal_single_bridge_trial_rolled_back"] = bool(rolled_back)
+    diag_counters["formal_single_bridge_trial_guard_passed"] = bool(guard_passed)
+    diag_counters["formal_single_bridge_trial_guard_reason"] = guard_reason
+    diag_counters["formal_single_bridge_trial_reason"] = guard_reason
+    diag_counters["formal_single_bridge_trial_rollback_reason"] = rollback_reason
+    diag_counters["formal_single_bridge_trial_proposal_id"] = proposal_id
+    diag_counters["formal_single_bridge_trial_source"] = source_skeleton_id
+    diag_counters["formal_single_bridge_trial_target"] = target_skeleton_id
+    diag_counters["formal_single_bridge_trial_bridge_type_needed"] = bridge_type_needed
+    diag_counters["formal_single_bridge_trial_campaign_tons_before"] = float(round(campaign_tons_before, 3))
+    diag_counters["formal_single_bridge_trial_campaign_tons_after"] = float(round(campaign_tons_after, 3))
+    diag_counters["formal_single_bridge_trial_hard_violation_before"] = int(hard_violation_before)
+    diag_counters["formal_single_bridge_trial_hard_violation_after"] = int(hard_violation_after)
+    diag_counters["formal_single_bridge_trial_campaign_ton_min_violation_count_before"] = min_before
+    diag_counters["formal_single_bridge_trial_campaign_ton_min_violation_count_after"] = min_after
+    diag_counters["formal_single_bridge_trial_registry_size"] = int(registry_size)
+    diag_counters["formal_single_bridge_trial_registry_hit"] = bool(registry_hit)
+    diag_counters["formal_single_bridge_trial_preflight_reason"] = preflight
+    diag_counters["formal_bridge_trial_rows"] = [row]
+
+
+def _apply_single_bridge_trial_in_sandbox(
+    schedule_df: pd.DataFrame,
+    cfg: PlannerConfig,
+    assembly_plan: Any | None,
+    orders_by_id: Dict[str, Dict[str, Any]],
+    edge_lookup: Dict[tuple[str, str], Dict[str, Any]],
+    diag_counters: Dict[str, Any],
+) -> pd.DataFrame:
+    _set_formal_single_bridge_trial_defaults(diag_counters)
+    enabled = bool(getattr(cfg.model, "formal_single_bridge_trial_enabled", False))
+    diag_counters["formal_single_bridge_trial_enabled"] = enabled
+    if not enabled:
+        _record_formal_single_bridge_trial(
+            diag_counters,
+            proposal_id="",
+            source_skeleton_id="",
+            target_skeleton_id="",
+            bridge_type_needed="",
+            attempted=False,
+            applied=False,
+            rolled_back=False,
+            guard_passed=False,
+            guard_reason="DISABLED_BY_CONFIG",
+            rollback_reason="",
+        )
+        return schedule_df
+
+    requested_id = str(getattr(cfg.model, "formal_single_bridge_trial_proposal_id", "") or "")
+    dry_run = bool(getattr(cfg.model, "formal_single_bridge_trial_dry_run", False))
+    allow_virtual = bool(getattr(cfg.model, "formal_single_bridge_trial_allow_virtual_bridge", True))
+    allow_mixed = bool(getattr(cfg.model, "formal_single_bridge_trial_allow_mixed_bridge", False))
+    summary = dict(getattr(assembly_plan, "summary", {}) or {}) if assembly_plan is not None else {}
+    best_id = str(summary.get("best_bridge_merge_proposal_id", "") or "")
+    if requested_id in {"CURRENT_BEST", "AUTO_BEST", "__BEST__"}:
+        requested_id = best_id
+    proposal_rows = list(getattr(assembly_plan, "diagnostics", {}).get("bridge_merge_proposal_rows", [])) if assembly_plan is not None else []
+    simulation_rows = list(getattr(assembly_plan, "diagnostics", {}).get("bridge_merge_simulation_rows", [])) if assembly_plan is not None else []
+    planner_diag = dict(getattr(assembly_plan, "diagnostics", {}) or {}) if assembly_plan is not None else {}
+    registry = dict(planner_diag.get("bridge_proposal_registry", {}) or {})
+    registry_size = int(len(registry))
+    formal_obj = dict(planner_diag.get("formal_single_bridge_trial_proposal", {}) or {})
+
+    if not requested_id:
+        _record_formal_single_bridge_trial(
+            diag_counters,
+            proposal_id=requested_id,
+            source_skeleton_id="",
+            target_skeleton_id="",
+            bridge_type_needed="",
+            attempted=False,
+            applied=False,
+            rolled_back=False,
+            guard_passed=False,
+            guard_reason="DISABLED_BY_EMPTY_PROPOSAL_ID",
+            rollback_reason="DISABLED_BY_EMPTY_PROPOSAL_ID",
+            registry_size=registry_size,
+            registry_hit=False,
+            preflight_reason="PREFLIGHT_EMPTY_PROPOSAL_ID",
+        )
+        return schedule_df
+    if assembly_plan is None:
+        _record_formal_single_bridge_trial(
+            diag_counters,
+            proposal_id=requested_id,
+            source_skeleton_id="",
+            target_skeleton_id="",
+            bridge_type_needed="",
+            attempted=False,
+            applied=False,
+            rolled_back=False,
+            guard_passed=False,
+            guard_reason="DISABLED_BY_FALLBACK_POLICY",
+            rollback_reason="DISABLED_BY_FALLBACK_POLICY",
+            registry_size=registry_size,
+            registry_hit=False,
+            preflight_reason="PREFLIGHT_EMPTY_PROPOSAL",
+        )
+        return schedule_df
+    if requested_id != best_id:
+        _record_formal_single_bridge_trial(
+            diag_counters,
+            proposal_id=requested_id,
+            source_skeleton_id=str(summary.get("best_bridge_merge_proposal_source", "")),
+            target_skeleton_id=str(summary.get("best_bridge_merge_proposal_target", "")),
+            bridge_type_needed="",
+            attempted=False,
+            applied=False,
+            rolled_back=False,
+            guard_passed=False,
+            guard_reason="DISABLED_BY_NOT_BEST_PROPOSAL",
+            rollback_reason="DISABLED_BY_NOT_BEST_PROPOSAL",
+            registry_size=registry_size,
+            registry_hit=False,
+            preflight_reason="PREFLIGHT_REGISTRY_MISS",
+        )
+        return schedule_df
+
+    registry_hit = requested_id in registry
+    if formal_obj and str(formal_obj.get("proposal_id", "")) == requested_id:
+        proposal = formal_obj
+    elif registry_hit:
+        proposal = dict(registry.get(requested_id, {}) or {})
+    else:
+        proposal = next((dict(r) for r in proposal_rows if str(r.get("proposal_id", "")) == requested_id), None)
+    simulation = next((dict(r) for r in simulation_rows if str(r.get("proposal_id", "")) == requested_id), None)
+    registry_hit = bool(proposal)
+    if proposal is None:
+        _record_formal_single_bridge_trial(
+            diag_counters,
+            proposal_id=requested_id,
+            source_skeleton_id=str(summary.get("best_bridge_merge_proposal_source", "")),
+            target_skeleton_id=str(summary.get("best_bridge_merge_proposal_target", "")),
+            bridge_type_needed="",
+            attempted=False,
+            applied=False,
+            rolled_back=False,
+            guard_passed=False,
+            guard_reason="DISABLED_BY_PROPOSAL_NOT_FOUND",
+            rollback_reason="DISABLED_BY_PROPOSAL_NOT_FOUND",
+            registry_size=registry_size,
+            registry_hit=False,
+            preflight_reason="PREFLIGHT_REGISTRY_MISS",
+        )
+        return schedule_df
+
+    source_id = str(proposal.get("source_skeleton_id", ""))
+    target_id = str(proposal.get("target_skeleton_id", ""))
+    bridge_type = str(proposal.get("bridge_type_needed", ""))
+    if not source_id or not target_id:
+        _record_formal_single_bridge_trial(
+            diag_counters,
+            proposal_id=requested_id,
+            source_skeleton_id=source_id,
+            target_skeleton_id=target_id,
+            bridge_type_needed=bridge_type,
+            attempted=False,
+            applied=False,
+            rolled_back=False,
+            guard_passed=False,
+            guard_reason="DISABLED_BY_INTERNAL_GUARD",
+            rollback_reason="DISABLED_BY_INTERNAL_GUARD",
+            registry_size=registry_size,
+            registry_hit=registry_hit,
+            preflight_reason="PREFLIGHT_SOURCE_TARGET_MISSING",
+        )
+        return schedule_df
+    if bridge_type == "MIXED_COMPLEX_BRIDGE" and not allow_mixed:
+        _record_formal_single_bridge_trial(
+            diag_counters,
+            proposal_id=requested_id,
+            source_skeleton_id=source_id,
+            target_skeleton_id=target_id,
+            bridge_type_needed=bridge_type,
+            attempted=True,
+            applied=False,
+            rolled_back=True,
+            guard_passed=False,
+            guard_reason="DISABLED_BY_BRIDGE_TYPE_NOT_ALLOWED",
+            rollback_reason="DISABLED_BY_BRIDGE_TYPE_NOT_ALLOWED",
+            registry_size=registry_size,
+            registry_hit=registry_hit,
+            preflight_reason="PREFLIGHT_UNSUPPORTED_BRIDGE_TYPE",
+        )
+        return schedule_df
+    if bridge_type not in {"SIMPLE_REAL_BRIDGE", "SIMPLE_VIRTUAL_BRIDGE"}:
+        _record_formal_single_bridge_trial(
+            diag_counters,
+            proposal_id=requested_id,
+            source_skeleton_id=source_id,
+            target_skeleton_id=target_id,
+            bridge_type_needed=bridge_type,
+            attempted=True,
+            applied=False,
+            rolled_back=True,
+            guard_passed=False,
+            guard_reason="DISABLED_BY_BRIDGE_TYPE_NOT_ALLOWED",
+            rollback_reason="DISABLED_BY_BRIDGE_TYPE_NOT_ALLOWED",
+            registry_size=registry_size,
+            registry_hit=registry_hit,
+            preflight_reason="PREFLIGHT_UNSUPPORTED_BRIDGE_TYPE",
+        )
+        return schedule_df
+    if bridge_type == "SIMPLE_VIRTUAL_BRIDGE" and not allow_virtual:
+        _record_formal_single_bridge_trial(
+            diag_counters,
+            proposal_id=requested_id,
+            source_skeleton_id=source_id,
+            target_skeleton_id=target_id,
+            bridge_type_needed=bridge_type,
+            attempted=True,
+            applied=False,
+            rolled_back=True,
+            guard_passed=False,
+            guard_reason="DISABLED_BY_BRIDGE_TYPE_NOT_ALLOWED",
+            rollback_reason="DISABLED_BY_BRIDGE_TYPE_NOT_ALLOWED",
+            registry_size=registry_size,
+            registry_hit=registry_hit,
+            preflight_reason="PREFLIGHT_UNSUPPORTED_BRIDGE_TYPE",
+        )
+        return schedule_df
+    if not bool(simulation and simulation.get("simulated_merge_guard_passed", False)):
+        _record_formal_single_bridge_trial(
+            diag_counters,
+            proposal_id=requested_id,
+            source_skeleton_id=source_id,
+            target_skeleton_id=target_id,
+            bridge_type_needed=bridge_type,
+            attempted=True,
+            applied=False,
+            rolled_back=True,
+            guard_passed=False,
+            guard_reason=str((simulation or {}).get("simulated_merge_guard_reason", "PROPOSAL_NOT_FOUND")),
+            rollback_reason=str((simulation or {}).get("simulated_merge_guard_reason", "PROPOSAL_NOT_FOUND")),
+            registry_size=registry_size,
+            registry_hit=registry_hit,
+            preflight_reason="PREFLIGHT_OK",
+        )
+        return schedule_df
+
+    skeleton_rows = list(getattr(assembly_plan, "skeleton_rows", lambda: [])()) if assembly_plan is not None else []
+    skeleton_by_id = {str(r.get("skeleton_id", "")): dict(r) for r in skeleton_rows if isinstance(r, dict)}
+    source_blocks = _split_block_ids(proposal.get("source_block_ids", [])) or _split_block_ids(skeleton_by_id.get(source_id, {}).get("block_ids", ""))
+    target_blocks = _split_block_ids(proposal.get("target_block_ids", [])) or _split_block_ids(skeleton_by_id.get(target_id, {}).get("block_ids", ""))
+    if not source_blocks or not target_blocks or schedule_df.empty or "block_id" not in schedule_df.columns:
+        _record_formal_single_bridge_trial(
+            diag_counters,
+            proposal_id=requested_id,
+            source_skeleton_id=source_id,
+            target_skeleton_id=target_id,
+            bridge_type_needed=bridge_type,
+            attempted=True,
+            applied=False,
+            rolled_back=True,
+            guard_passed=False,
+            guard_reason="BRIDGE_EXPAND_INVALID",
+            rollback_reason="BRIDGE_EXPAND_INVALID",
+            registry_size=registry_size,
+            registry_hit=registry_hit,
+            preflight_reason="PREFLIGHT_OK",
+        )
+        return schedule_df
+
+    original_df = schedule_df.copy(deep=True)
+    ordered = _ordered_campaign_rows(schedule_df)
+    source_rows = ordered[ordered["block_id"].astype(str).isin(source_blocks)]
+    target_rows = ordered[ordered["block_id"].astype(str).isin(target_blocks)]
+    if source_rows.empty or target_rows.empty:
+        _record_formal_single_bridge_trial(
+            diag_counters,
+            proposal_id=requested_id,
+            source_skeleton_id=source_id,
+            target_skeleton_id=target_id,
+            bridge_type_needed=bridge_type,
+            attempted=True,
+            applied=False,
+            rolled_back=True,
+            guard_passed=False,
+            guard_reason="BRIDGE_EXPAND_INVALID",
+            rollback_reason="BRIDGE_EXPAND_INVALID",
+            registry_size=registry_size,
+            registry_hit=registry_hit,
+            preflight_reason="PREFLIGHT_OK",
+        )
+        return schedule_df
+
+    source_tail = source_rows.iloc[-1]
+    target_head = target_rows.iloc[0]
+    tail_oid = str(source_tail.get("order_id", ""))
+    head_oid = str(target_head.get("order_id", ""))
+    source_campaign = str(source_tail.get("campaign_id", ""))
+    target_campaign = str(target_head.get("campaign_id", ""))
+    tons_by_campaign = _campaign_ton_by_id(schedule_df)
+    campaign_tons_before = float(tons_by_campaign.get(source_campaign, 0.0) + tons_by_campaign.get(target_campaign, 0.0))
+    hard_before = _campaign_min_violation_count(schedule_df, cfg)
+
+    edge_rec = edge_lookup.get((tail_oid, head_oid))
+    edge_type = str(edge_rec.get("edge_type", "")) if edge_rec is not None else ""
+    if bridge_type == "SIMPLE_REAL_BRIDGE" and edge_type != "REAL_BRIDGE_EDGE":
+        reason = "BRIDGE_EXPAND_INVALID"
+        _record_formal_single_bridge_trial(
+            diag_counters, proposal_id=requested_id, source_skeleton_id=source_id, target_skeleton_id=target_id,
+            bridge_type_needed=bridge_type, attempted=True, applied=False, rolled_back=True, guard_passed=False,
+            guard_reason=reason, rollback_reason=reason, campaign_tons_before=campaign_tons_before,
+            campaign_tons_after=campaign_tons_before, hard_violation_before=hard_before, hard_violation_after=hard_before,
+            registry_size=registry_size, registry_hit=registry_hit, preflight_reason="PREFLIGHT_OK",
+        )
+        return original_df
+    if bridge_type == "SIMPLE_VIRTUAL_BRIDGE" and edge_type not in {"VIRTUAL_BRIDGE_EDGE", "VIRTUAL_BRIDGE_FAMILY_EDGE"}:
+        reason = "BRIDGE_EXPAND_INVALID"
+        _record_formal_single_bridge_trial(
+            diag_counters, proposal_id=requested_id, source_skeleton_id=source_id, target_skeleton_id=target_id,
+            bridge_type_needed=bridge_type, attempted=True, applied=False, rolled_back=True, guard_passed=False,
+            guard_reason=reason, rollback_reason=reason, campaign_tons_before=campaign_tons_before,
+            campaign_tons_after=campaign_tons_before, hard_violation_before=hard_before, hard_violation_after=hard_before,
+            registry_size=registry_size, registry_hit=registry_hit, preflight_reason="PREFLIGHT_OK",
+        )
+        return original_df
+
+    pair_ok, pair_reasons = _pair_hard_feasible(orders_by_id.get(tail_oid, {}), orders_by_id.get(head_oid, {}), cfg, edge_type)
+    if not pair_ok:
+        reason = "PAIR_INVALID_AFTER_MERGE"
+        _append_limited_example(
+            diag_counters,
+            "formal_single_bridge_trial_pair_invalid_examples",
+            {
+                "proposal_id": requested_id,
+                "from_order_id": tail_oid,
+                "to_order_id": head_oid,
+                "edge_type": edge_type,
+                "reasons": pair_reasons,
+            },
+            limit=5,
+        )
+        _record_formal_single_bridge_trial(
+            diag_counters, proposal_id=requested_id, source_skeleton_id=source_id, target_skeleton_id=target_id,
+            bridge_type_needed=bridge_type, attempted=True, applied=False, rolled_back=True, guard_passed=False,
+            guard_reason=reason, rollback_reason=reason, campaign_tons_before=campaign_tons_before,
+            campaign_tons_after=campaign_tons_before, hard_violation_before=hard_before, hard_violation_after=hard_before,
+            registry_size=registry_size, registry_hit=registry_hit, preflight_reason="PREFLIGHT_OK",
+        )
+        return original_df
+
+    source_order_set = set(source_rows["order_id"].astype(str).tolist())
+    target_order_set = set(target_rows["order_id"].astype(str).tolist())
+    if source_order_set.intersection(target_order_set):
+        reason = "DUPLICATE_AFTER_MERGE"
+        _record_formal_single_bridge_trial(
+            diag_counters, proposal_id=requested_id, source_skeleton_id=source_id, target_skeleton_id=target_id,
+            bridge_type_needed=bridge_type, attempted=True, applied=False, rolled_back=True, guard_passed=False,
+            guard_reason=reason, rollback_reason=reason, campaign_tons_before=campaign_tons_before,
+            campaign_tons_after=campaign_tons_before, hard_violation_before=hard_before, hard_violation_after=hard_before,
+            registry_size=registry_size, registry_hit=registry_hit, preflight_reason="PREFLIGHT_OK",
+        )
+        return original_df
+
+    trial_df = original_df.copy(deep=True)
+    affected_mask = trial_df["block_id"].astype(str).isin(source_blocks + target_blocks)
+    if source_campaign and target_campaign and source_campaign != target_campaign:
+        trial_campaign_id = f"{source_campaign}__formal_bridge_trial"
+        trial_df.loc[affected_mask, "campaign_id"] = trial_campaign_id
+        if "campaign_id_hint" in trial_df.columns:
+            trial_df.loc[affected_mask, "campaign_id_hint"] = trial_campaign_id
+    else:
+        trial_campaign_id = source_campaign or target_campaign or f"{source_id}__formal_bridge_trial"
+        trial_df.loc[affected_mask, "campaign_id"] = trial_campaign_id
+
+    affected_idx = _ordered_campaign_rows(trial_df[affected_mask]).index.tolist()
+    for seq, idx in enumerate(affected_idx, start=1):
+        if "campaign_seq" in trial_df.columns:
+            trial_df.loc[idx, "campaign_seq"] = seq
+        if "sequence_in_slot" in trial_df.columns:
+            trial_df.loc[idx, "sequence_in_slot"] = seq
+        if "campaign_real_seq" in trial_df.columns:
+            trial_df.loc[idx, "campaign_real_seq"] = seq
+    target_head_idx = target_head.name
+    if target_head_idx in trial_df.index:
+        trial_df.loc[target_head_idx, "selected_edge_type"] = edge_type
+        trial_df.loc[target_head_idx, "boundary_edge_type"] = edge_type
+        trial_df.loc[target_head_idx, "inter_block_boundary_before"] = True
+        trial_df.loc[target_head_idx, "boundary_from_block_id"] = source_blocks[-1]
+        trial_df.loc[target_head_idx, "boundary_to_block_id"] = target_blocks[0]
+
+    tons_after_map = _campaign_ton_by_id(trial_df)
+    campaign_tons_after = float(tons_after_map.get(trial_campaign_id, 0.0))
+    hard_after = _campaign_min_violation_count(trial_df, cfg)
+    before_best_tons = max(float(tons_by_campaign.get(source_campaign, 0.0)), float(tons_by_campaign.get(target_campaign, 0.0)))
+    if campaign_tons_after <= before_best_tons:
+        reason = "NO_TON_IMPROVEMENT"
+        _record_formal_single_bridge_trial(
+            diag_counters, proposal_id=requested_id, source_skeleton_id=source_id, target_skeleton_id=target_id,
+            bridge_type_needed=bridge_type, attempted=True, applied=False, rolled_back=True, guard_passed=False,
+            guard_reason=reason, rollback_reason=reason, campaign_tons_before=campaign_tons_before,
+            campaign_tons_after=campaign_tons_after, hard_violation_before=hard_before, hard_violation_after=hard_after,
+            registry_size=registry_size, registry_hit=registry_hit, preflight_reason="PREFLIGHT_OK",
+        )
+        return original_df
+    if hard_after >= hard_before:
+        reason = "NO_GLOBAL_IMPROVEMENT"
+        _record_formal_single_bridge_trial(
+            diag_counters, proposal_id=requested_id, source_skeleton_id=source_id, target_skeleton_id=target_id,
+            bridge_type_needed=bridge_type, attempted=True, applied=False, rolled_back=True, guard_passed=False,
+            guard_reason=reason, rollback_reason=reason, campaign_tons_before=campaign_tons_before,
+            campaign_tons_after=campaign_tons_after, hard_violation_before=hard_before, hard_violation_after=hard_after,
+            registry_size=registry_size, registry_hit=registry_hit, preflight_reason="PREFLIGHT_OK",
+        )
+        return original_df
+
+    if dry_run:
+        _record_formal_single_bridge_trial(
+            diag_counters, proposal_id=requested_id, source_skeleton_id=source_id, target_skeleton_id=target_id,
+            bridge_type_needed=bridge_type, attempted=True, applied=False, rolled_back=True, guard_passed=False,
+            guard_reason="DISABLED_BY_DRY_RUN", rollback_reason="DISABLED_BY_DRY_RUN", campaign_tons_before=campaign_tons_before,
+            campaign_tons_after=campaign_tons_after, hard_violation_before=hard_before, hard_violation_after=hard_after,
+            registry_size=registry_size, registry_hit=registry_hit, preflight_reason="PREFLIGHT_OK",
+        )
+        return original_df
+
+    _record_formal_single_bridge_trial(
+        diag_counters, proposal_id=requested_id, source_skeleton_id=source_id, target_skeleton_id=target_id,
+        bridge_type_needed=bridge_type, attempted=True, applied=True, rolled_back=False, guard_passed=True,
+        guard_reason="TRIAL_SUCCESS", rollback_reason="", campaign_tons_before=campaign_tons_before,
+        campaign_tons_after=campaign_tons_after, hard_violation_before=hard_before, hard_violation_after=hard_after,
+        registry_size=registry_size, registry_hit=registry_hit, preflight_reason="PREFLIGHT_OK",
+    )
+    return trial_df
+
+
 def _segment_viability_band(total_tons: float, cfg: PlannerConfig) -> str:
     min_ton = float(cfg.rule.campaign_ton_min)
     gap = max(0.0, min_ton - float(total_tons))
@@ -2011,6 +2575,7 @@ def realize_selected_blocks(
         "second_receiver_shadow_bridge_reason_code": "",
         "shadow_bridge_analysis_rows": [],
     }
+    _set_formal_single_bridge_trial_defaults(diag_counters)
 
     if assembly_plan is not None:
         planner_summary = dict(getattr(assembly_plan, "summary", {}) or {})
@@ -2024,8 +2589,52 @@ def realize_selected_blocks(
             diag_counters["bridge_requirement_rows"] = list(planner_diag.get("bridge_requirement_rows", []))
         if planner_diag.get("donor_candidate_rows"):
             diag_counters["donor_candidate_rows"] = list(planner_diag.get("donor_candidate_rows", []))
+        if planner_diag.get("assembly_plan_diagnostics_rows"):
+            diag_counters["assembly_plan_diagnostics_rows"] = list(planner_diag.get("assembly_plan_diagnostics_rows", []))
+        if planner_diag.get("bridge_merge_proposal_rows"):
+            diag_counters["bridge_merge_proposal_rows"] = list(planner_diag.get("bridge_merge_proposal_rows", []))
+        if planner_diag.get("bridge_merge_simulation_rows"):
+            diag_counters["bridge_merge_simulation_rows"] = list(planner_diag.get("bridge_merge_simulation_rows", []))
 
-    slots_to_process = master_result.campaign_slots
+    slots_to_process = []
+    planner_ready_for_finalization = bool(
+        getattr(assembly_plan, "summary", {}).get("assembly_plan_ready_for_finalization", False)
+    ) if assembly_plan is not None else False
+    if assembly_plan is not None and not planner_ready_for_finalization:
+        diag_counters["assembly_plan_fallback_used"] = True
+        diag_counters["used_assembly_plan_skeleton_slots"] = False
+        diag_counters["assembly_plan_fallback_reason_code"] = str(
+            getattr(assembly_plan, "summary", {}).get("assembly_plan_readiness_reason_code", "PLANNER_NOT_READY")
+        )
+    if assembly_plan is not None and planner_ready_for_finalization:
+        for lp in getattr(assembly_plan, "line_plans", []) or []:
+            for idx, sk in enumerate(getattr(lp, "campaign_skeletons", []) or [], start=1):
+                block_ids = [str(bid) for bid in getattr(sk, "block_ids", []) if str(bid)]
+                if not block_ids:
+                    continue
+                total_tons = float(getattr(sk, "current_real_tons", 0.0) or 0.0)
+                min_tons = float(getattr(sk, "target_ton_min", getattr(cfg.rule, "campaign_ton_min", 700.0)) or 700.0)
+                max_tons = float(getattr(sk, "target_ton_max", getattr(cfg.rule, "campaign_ton_max", 2000.0)) or 2000.0)
+                slots_to_process.append(
+                    BlockCampaignSlot(
+                        line=str(getattr(sk, "line", getattr(lp, "line", ""))),
+                        slot_no=idx,
+                        campaign_id=str(getattr(sk, "skeleton_id", f"{getattr(lp, 'line', 'line')}__sk{idx}")),
+                        block_ids=block_ids,
+                        total_tons=total_tons,
+                        gap_to_min_tons=max(0.0, min_tons - total_tons),
+                        remaining_to_max_tons=max(0.0, max_tons - total_tons),
+                        is_underfilled=total_tons < min_tons,
+                        head_block_id=block_ids[0],
+                        tail_block_id=block_ids[-1],
+                    )
+                )
+        if slots_to_process:
+            diag_counters["assembly_plan_fallback_used"] = False
+            diag_counters["used_assembly_plan_skeleton_slots"] = True
+            diag_counters["assembly_plan_skeleton_slots_used"] = int(len(slots_to_process))
+    if not slots_to_process:
+        slots_to_process = master_result.campaign_slots
     if not slots_to_process:
         diag_counters["used_campaign_slots_fallback"] = True
         slots_to_process = []
@@ -2391,6 +3000,14 @@ def realize_selected_blocks(
         )
         _shadow_bridge_analysis_for_underfilled_campaigns(schedule_df, cfg, diag_counters)
         schedule_df = _run_formal_virtual_fill_trial(schedule_df, cfg, diag_counters)
+        schedule_df = _apply_single_bridge_trial_in_sandbox(
+            schedule_df=schedule_df,
+            cfg=cfg,
+            assembly_plan=assembly_plan,
+            orders_by_id=orders_by_id,
+            edge_lookup=edge_lookup,
+            diag_counters=diag_counters,
+        )
         _append_campaign_viability_diagnostics(schedule_df, cfg, diag_counters)
 
     if not schedule_df.empty and assembly_plan is not None:

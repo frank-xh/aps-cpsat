@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 """
 Export layer contract.
@@ -2205,9 +2205,26 @@ def export_schedule_results(
     campaign_assembly_plan_df = pd.DataFrame(
         campaign_assembly_plan_rows,
         columns=[
-            "line", "skeleton_id", "block_ids", "anchor_block_id", "current_real_tons",
-            "viability_band", "assembly_status", "bridge_need_level", "bridge_type_needed",
-            "donor_need_level", "notes",
+            "line", "skeleton_id", "block_ids", "block_count", "anchor_block_id", "current_real_tons",
+            "viability_band", "assembly_status", "internal_bridge_needed", "internal_bridge_type",
+            "bridge_need_level", "bridge_type_needed", "donor_need_level", "notes",
+            "planner_ready_for_finalization", "readiness_reason_code", "fallback_used",
+        ],
+    )
+
+    assembly_plan_diagnostics_rows = []
+    if isinstance(validation_summary, dict) and isinstance(validation_summary.get("assembly_plan_diagnostics_rows"), list):
+        assembly_plan_diagnostics_rows = [dict(r) for r in validation_summary.get("assembly_plan_diagnostics_rows", []) if isinstance(r, dict)]
+    elif isinstance(em.get("assembly_plan_diagnostics_rows"), list):
+        assembly_plan_diagnostics_rows = [dict(r) for r in em.get("assembly_plan_diagnostics_rows", []) if isinstance(r, dict)]
+    if not assembly_plan_diagnostics_rows:
+        assembly_plan_diagnostics_rows = campaign_assembly_plan_rows
+    assembly_plan_diagnostics_df = pd.DataFrame(
+        assembly_plan_diagnostics_rows,
+        columns=[
+            "line", "skeleton_id", "block_count", "current_real_tons", "viability_band",
+            "planner_ready_for_finalization", "readiness_reason_code", "fallback_used",
+            "direct_group_merges", "real_bridge_group_merges", "mixed_bridge_requirements",
         ],
     )
 
@@ -2220,7 +2237,8 @@ def export_schedule_results(
         bridge_requirement_rows,
         columns=[
             "line", "source_block_id", "target_block_id", "source_campaign_skeleton_id",
-            "target_campaign_skeleton_id", "reason_code", "bridge_type_needed",
+            "target_campaign_skeleton_id", "source_skeleton_id", "target_skeleton_id",
+            "reason_code", "bridge_type_needed",
             "estimated_gap_closure_tons", "candidate_virtual_count", "mixed_bridge_required",
             "template_support_status",
         ],
@@ -2236,6 +2254,146 @@ def export_schedule_results(
         columns=[
             "donor_block_id", "donor_campaign_skeleton_id", "receiver_campaign_skeleton_id",
             "line", "transferable_tons", "pair_feasible", "duplicate_safe", "rejection_reason",
+        ],
+    )
+
+    bridge_merge_proposal_rows = []
+    if isinstance(validation_summary, dict) and isinstance(validation_summary.get("bridge_merge_proposal_rows"), list):
+        bridge_merge_proposal_rows = [dict(r) for r in validation_summary.get("bridge_merge_proposal_rows", []) if isinstance(r, dict)]
+    elif isinstance(em.get("bridge_merge_proposal_rows"), list):
+        bridge_merge_proposal_rows = [dict(r) for r in em.get("bridge_merge_proposal_rows", []) if isinstance(r, dict)]
+    bridge_merge_proposals_df = pd.DataFrame(
+        bridge_merge_proposal_rows,
+        columns=[
+            "line", "proposal_id", "source_skeleton_id", "target_skeleton_id", "proposal_type",
+            "bridge_type_needed", "projected_gap_before", "projected_gap_after",
+            "projected_viability_before", "projected_viability_after", "confidence_band",
+            "proposal_reason_code", "selected_for_formal_trial",
+        ],
+    )
+
+    bridge_merge_simulation_rows = []
+    if isinstance(validation_summary, dict) and isinstance(validation_summary.get("bridge_merge_simulation_rows"), list):
+        bridge_merge_simulation_rows = [dict(r) for r in validation_summary.get("bridge_merge_simulation_rows", []) if isinstance(r, dict)]
+    elif isinstance(em.get("bridge_merge_simulation_rows"), list):
+        bridge_merge_simulation_rows = [dict(r) for r in em.get("bridge_merge_simulation_rows", []) if isinstance(r, dict)]
+    bridge_merge_simulation_df = pd.DataFrame(
+        bridge_merge_simulation_rows,
+        columns=[
+            "proposal_id", "source_skeleton_id", "target_skeleton_id", "confidence_band",
+            "projected_gap_before", "projected_gap_after", "projected_viability_after",
+            "simulated_merge_guard_passed", "simulated_merge_guard_reason",
+            "proposal_simulation_consistent", "proposal_simulation_inconsistency_reason",
+            "simulated_skeleton_count", "simulated_avg_blocks_per_skeleton",
+            "simulated_hopeless_count", "simulated_near_merge_count",
+        ],
+    )
+
+    bridge_proposal_consistency_df = pd.DataFrame(
+        [[
+            em.get("best_bridge_merge_proposal_id", ""),
+            em.get("best_bridge_merge_source", em.get("best_bridge_merge_proposal_source", "")),
+            em.get("best_bridge_merge_target", em.get("best_bridge_merge_proposal_target", "")),
+            em.get("simulation_proposal_id", ""),
+            em.get("simulation_source", ""),
+            em.get("simulation_target", ""),
+            em.get("proposal_simulation_consistent", False),
+            em.get("proposal_simulation_inconsistency_reason", ""),
+        ]],
+        columns=[
+            "best_bridge_merge_proposal_id",
+            "best_bridge_merge_source",
+            "best_bridge_merge_target",
+            "simulation_proposal_id",
+            "simulation_source",
+            "simulation_target",
+            "proposal_simulation_consistent",
+            "proposal_simulation_inconsistency_reason",
+        ],
+    )
+
+    formal_bridge_trial_rows = []
+    if isinstance(validation_summary, dict) and isinstance(validation_summary.get("formal_bridge_trial_rows"), list):
+        formal_bridge_trial_rows = [dict(r) for r in validation_summary.get("formal_bridge_trial_rows", []) if isinstance(r, dict)]
+    elif isinstance(em.get("formal_bridge_trial_rows"), list):
+        formal_bridge_trial_rows = [dict(r) for r in em.get("formal_bridge_trial_rows", []) if isinstance(r, dict)]
+    if not formal_bridge_trial_rows:
+        formal_bridge_trial_rows = [
+            {
+                "proposal_id": em.get("formal_single_bridge_trial_proposal_id", ""),
+                "source_skeleton_id": em.get("formal_single_bridge_trial_source", ""),
+                "target_skeleton_id": em.get("formal_single_bridge_trial_target", ""),
+                "bridge_type_needed": em.get("formal_single_bridge_trial_bridge_type_needed", ""),
+                "attempted": em.get("formal_single_bridge_trial_attempted", False),
+                "applied": em.get("formal_single_bridge_trial_applied", False),
+                "rolled_back": em.get("formal_single_bridge_trial_rolled_back", False),
+                "guard_passed": em.get("formal_single_bridge_trial_guard_passed", False),
+                "guard_reason": em.get("formal_single_bridge_trial_guard_reason", ""),
+                "reason": em.get("formal_single_bridge_trial_reason", em.get("formal_single_bridge_trial_guard_reason", "")),
+                "rollback_reason": em.get("formal_single_bridge_trial_rollback_reason", ""),
+                "registry_size": em.get("formal_single_bridge_trial_registry_size", 0),
+                "registry_hit": em.get("formal_single_bridge_trial_registry_hit", False),
+                "preflight_reason": em.get("formal_single_bridge_trial_preflight_reason", ""),
+                "campaign_tons_before": em.get("formal_single_bridge_trial_campaign_tons_before", 0.0),
+                "campaign_tons_after": em.get("formal_single_bridge_trial_campaign_tons_after", 0.0),
+                "hard_violation_before": em.get("formal_single_bridge_trial_hard_violation_before", 0),
+                "hard_violation_after": em.get("formal_single_bridge_trial_hard_violation_after", 0),
+                "campaign_ton_min_violation_count_before": em.get("formal_single_bridge_trial_campaign_ton_min_violation_count_before", 0),
+                "campaign_ton_min_violation_count_after": em.get("formal_single_bridge_trial_campaign_ton_min_violation_count_after", 0),
+            }
+        ]
+    formal_bridge_trial_df = pd.DataFrame(
+        formal_bridge_trial_rows,
+        columns=[
+            "proposal_id",
+            "source_skeleton_id",
+            "target_skeleton_id",
+            "bridge_type_needed",
+            "attempted",
+            "applied",
+            "rolled_back",
+            "guard_passed",
+            "guard_reason",
+            "reason",
+            "rollback_reason",
+            "registry_size",
+            "registry_hit",
+            "preflight_reason",
+            "campaign_tons_before",
+            "campaign_tons_after",
+            "hard_violation_before",
+            "hard_violation_after",
+            "campaign_ton_min_violation_count_before",
+            "campaign_ton_min_violation_count_after",
+        ],
+    )
+
+    prebuilt_virtual_inventory_rows = []
+    if isinstance(em.get("prebuilt_virtual_inventory_rows"), list):
+        prebuilt_virtual_inventory_rows = [
+            dict(r) for r in em.get("prebuilt_virtual_inventory_rows", []) if isinstance(r, dict)
+        ]
+    elif isinstance(em.get("prebuilt_virtual_inventory"), pd.DataFrame):
+        prebuilt_virtual_inventory_rows = em.get("prebuilt_virtual_inventory").to_dict("records")
+    prebuilt_virtual_inventory_df = pd.DataFrame(
+        prebuilt_virtual_inventory_rows,
+        columns=[
+            "virtual_id",
+            "virtual_spec_key",
+            "order_id",
+            "width",
+            "thickness",
+            "tons",
+            "temp_min",
+            "temp_max",
+            "steel_group",
+            "line_capability",
+            "virtual_origin",
+            "prebuilt_spec_key",
+            "inventory_index",
+            "inventory_count_index",
+            "virtual_inventory_count_index",
+            "bridge_resource_only",
         ],
     )
 
@@ -2468,7 +2626,13 @@ def export_schedule_results(
         second_near_viable_df.to_excel(writer, sheet_name="second_near_viable_analysis", index=False)
         shadow_bridge_df.to_excel(writer, sheet_name="shadow_bridge_analysis", index=False)
         campaign_assembly_plan_df.to_excel(writer, sheet_name="campaign_assembly_plan", index=False)
+        assembly_plan_diagnostics_df.to_excel(writer, sheet_name="assembly_plan_diagnostics", index=False)
         bridge_requirements_df.to_excel(writer, sheet_name="bridge_requirements", index=False)
+        bridge_merge_proposals_df.to_excel(writer, sheet_name="bridge_merge_proposals", index=False)
+        bridge_merge_simulation_df.to_excel(writer, sheet_name="bridge_merge_simulation", index=False)
+        bridge_proposal_consistency_df.to_excel(writer, sheet_name="bridge_proposal_consistency", index=False)
+        formal_bridge_trial_df.to_excel(writer, sheet_name="formal_bridge_trial", index=False)
+        prebuilt_virtual_inventory_df.to_excel(writer, sheet_name="prebuilt_virtual_inventory", index=False)
         donor_candidates_df.to_excel(writer, sheet_name="donor_candidates", index=False)
         slot_summary_df.assign(产线=slot_summary_df.get("line", "").map(_zh_line)).rename(
             columns={

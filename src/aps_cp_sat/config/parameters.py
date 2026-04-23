@@ -1,3 +1,18 @@
+"""参数档位构建器。
+
+本文件负责把基础 RuleConfig / ModelConfig / ScoreConfig 组合成具体 profile。
+
+阅读和调参规则：
+1. 所有算法参数的字段级中文注释在对应 dataclass 中维护：
+   - RuleConfig：工艺硬规则和虚拟卷规格口径。
+   - ModelConfig：求解路线、模板图、LNS、block-first、桥接、虚拟影子模式等流程参数。
+   - ScoreConfig：目标函数、掉单、桥接、虚拟使用、平滑性等评分权重。
+2. 本文件中的 profile 只负责覆盖这些基础参数，不重新定义参数语义。
+3. 如果新增 profile 覆盖项，应先在对应 dataclass 中补字段和中文注释，再在这里覆盖取值。
+4. constructive_lns 与 block_first 两条路线通过 main_solver_strategy / profile_name 显式切换。
+5. 不在 profile 层绕过硬约束；硬约束口径统一以 RuleConfig 和终态审计为准。
+"""
+
 from __future__ import annotations
 
 from aps_cp_sat.config.model_config import ModelConfig
@@ -13,16 +28,25 @@ def build_profile_config(
     production_compatibility_mode: bool = False,
 ) -> PlannerConfig:
     profile = str(profile_name or "default").lower()
+    if profile in {"", "default"}:
+        profile = "constructive_lns_virtual_guarded_frontload"
+    if profile != "constructive_lns_virtual_guarded_frontload":
+        raise ValueError(
+            "[APS][PROFILE_GUARD][ONLY_SINGLE_ROUTE_ALLOWED] "
+            "expected strategy=constructive_lns, "
+            "expected profile=constructive_lns_virtual_guarded_frontload, "
+            f"got profile={profile_name!r}"
+        )
     base_rule = RuleConfig()
     base_score = ScoreConfig()
     base_model = ModelConfig(
         profile_name=profile,
         max_orders=10_000_000,
-        rounds=5,
-        time_limit_seconds=150.0,
+        rounds=6,  # 通用默认轮数：比旧值略高，兼顾稳定性与调参空间
+        time_limit_seconds=180.0,  # 通用默认时限：给模板/局部修复留足工程时间
         max_virtual_chain=5,
-        global_prune_max_pairs_per_from=4,
-        max_routes_per_slot=5,
+        global_prune_max_pairs_per_from=4,  # 默认仍保持保守剪枝，避免基础 profile 直接炸图
+        max_routes_per_slot=6,  # 适度放宽槽位路由候选，减少过早无路可走
         validation_mode=bool(validation_mode),
         production_compatibility_mode=bool(production_compatibility_mode),
         allow_fallback=False,
@@ -390,14 +414,14 @@ def build_profile_config(
                 # Switch to new ALNS master path
                 "main_solver_strategy": "constructive_lns",
                 # LNS parameters
-                "rounds": 10,
-                "constructive_lns_rounds": 10,
-                "lns_early_stop_no_improve_rounds": 3,
-                "lns_max_total_rounds": 10,
-                "lns_min_rounds_before_early_stop": 4,
-                "constructive_destroy_ratio_min": 0.20,
-                "constructive_destroy_ratio_max": 0.35,
-                "constructive_subproblem_max_orders": 40,
+                "rounds": 12,  # 主线默认 12 轮局部搜索，给 repair 更多机会
+                "constructive_lns_rounds": 12,  # ALNS 总轮数：从 10 提到 12，仍属可控范围
+                "lns_early_stop_no_improve_rounds": 4,  # 连续 4 轮无改进再停，减少过早停机
+                "lns_max_total_rounds": 12,  # 与 constructive_lns_rounds 对齐
+                "lns_min_rounds_before_early_stop": 5,  # 至少跑 5 轮再允许早停
+                "constructive_destroy_ratio_min": 0.18,  # 下界略降，减小对好链的过度破坏
+                "constructive_destroy_ratio_max": 0.30,  # 上界略降，控制修补子问题规模
+                "constructive_subproblem_max_orders": 48,  # 本地 CP-SAT 子问题略放宽，增强局部修复能力
                 "constructive_enable_cp_sat_repair": True,
                 # ---- Mainline (Route RB): allow REAL_BRIDGE_EDGE in constructive ----
                 # allow_real_bridge_edge_in_constructive = True for mainline
@@ -443,7 +467,7 @@ def build_profile_config(
                 "enableLegacyFallback": False,
                 # Production flags
                 "validation_mode": bool(validation_mode),
-                "time_limit_seconds": 60.0,
+                "time_limit_seconds": 90.0,  # 主线默认 90 秒，更接近工程验证时长
                 "min_real_schedule_ratio": 0.90,
                 "master_profile_count": 1,
                 "master_seed_count": 1,
@@ -545,6 +569,9 @@ def build_profile_config(
                 # allow_real = True (same as mainline Route RB)
                 "allow_virtual_bridge_edge_in_constructive": True,
                 "allow_real_bridge_edge_in_constructive": True,
+                "virtual_bridge_mode": "prebuilt_virtual_inventory",
+                "prebuilt_virtual_inventory_enabled": True,
+                "prebuilt_virtual_count_per_spec": 5,
                 "bridge_expansion_mode": "disabled",  # Still disabled: no virtual exact expansion
                 "repair_only_real_bridge_enabled": True,
                 "repair_only_virtual_bridge_enabled": False,
@@ -677,6 +704,7 @@ def build_profile_config(
                 "constructive_destroy_ratio_max": 0.35,
                 "constructive_subproblem_max_orders": 40,
                 "constructive_enable_cp_sat_repair": True,
+                "constructive_lns_alns_enable_real_bridge_moves": True,
                 # Same direct_only mode as constructive_lns_search
                 "allow_virtual_bridge_edge_in_constructive": False,
                 "allow_real_bridge_edge_in_constructive": False,
@@ -807,8 +835,8 @@ def build_profile_config(
                 # ---- Block-first master strategy ----
                 "main_solver_strategy": "block_first",
                 # LNS parameters (for block ALNS, not order ALNS)
-                "rounds": 10,
-                "constructive_lns_rounds": 10,
+                "rounds": 8,  # block-first 默认 8 轮块级 ALNS，先稳后强
+                "constructive_lns_rounds": 8,  # 兼容字段，保持与块级 ALNS 一致
                 "lns_early_stop_no_improve_rounds": 3,
                 "lns_max_total_rounds": 10,
                 "lns_min_rounds_before_early_stop": 4,
@@ -841,20 +869,21 @@ def build_profile_config(
                 "virtual_family_budget_per_line": 4,
                 "virtual_family_budget_per_segment": 2,
                 # ---- Block generator configuration (Sub-block validation version) ----
+                # 这里把 block 明确定义为“子块”，不是完整轧期；完整轧期由后续 slot 装配得到。
                 "block_generator_target_blocks": 2000,
-                "block_generator_time_limit_seconds": 15.0,
-                "block_generator_max_blocks_per_line": 60,
+                "block_generator_time_limit_seconds": 18.0,  # 建块阶段多给少量时间，避免候选块供给过薄
+                "block_generator_max_blocks_per_line": 50,  # 控制单线块池规模，避免噪声块太多
                 "block_generator_max_blocks_total": 160,
-                "block_generator_max_seed_per_bucket": 12,
+                "block_generator_max_seed_per_bucket": 10,  # 每桶种子略收敛，减少重复风格块
                 # ---- Block generator: candidate block (pool) threshold ----
-                "block_generator_candidate_tons_min": 200.0,
-                "block_generator_candidate_tons_target": 700.0,
-                "block_generator_candidate_tons_max": 2000.0,
+                "block_generator_candidate_tons_min": 120.0,  # 子块候选最小吨位：允许小块先入池，后续再装槽
+                "block_generator_candidate_tons_target": 220.0,  # 子块理想吨位：更贴近当前订单吨位规模
+                "block_generator_candidate_tons_max": 480.0,  # 子块候选上限：避免把一个块长成半个轧期
                 # ---- Block generator: ideal target block threshold ----
-                "block_generator_target_tons_min": 200.0,
-                "block_generator_target_tons_target": 700.0,
-                "block_generator_target_tons_max": 1200.0,
-                "block_generator_max_orders_per_block": 20,
+                "block_generator_target_tons_min": 180.0,  # 理想子块最低吨位
+                "block_generator_target_tons_target": 320.0,  # 理想子块目标吨位：从 700 下调到更合理的子块语义
+                "block_generator_target_tons_max": 520.0,  # 理想子块上限：为后续 slot 组装留空间
+                "block_generator_max_orders_per_block": 12,  # 子块最多订单数：避免块内部复杂度过高
                 "block_generator_allow_guarded_family": True,
                 "block_generator_allow_real_bridge": True,
                 "block_generator_allow_mixed_bridge_potential": True,
@@ -891,7 +920,7 @@ def build_profile_config(
                 "mixed_bridge_in_block_enabled": True,
                 "mixed_bridge_allowed_forms": ["REAL_TO_GUARDED", "GUARDED_TO_REAL"],
                 "mixed_bridge_allowed_hotspots": ["underfill", "group_switch", "bridge_dependency", "width_tension"],
-                "mixed_bridge_max_attempts_per_block": 10,
+                "mixed_bridge_max_attempts_per_block": 8,  # 混合桥接尝试次数略收敛，避免 realizer 过度耗时
                 # ---- Repair bridge (same as guarded frontload) ----
                 "virtual_bridge_pilot_max_blocks_per_run": 15,
                 "virtual_bridge_pilot_max_per_block": 1,
@@ -962,6 +991,11 @@ def build_profile_config(
                 "virtual_formal_fill_max_gap_tons": 80.0,
                 "virtual_formal_fill_max_count_per_campaign": 3,
                 "virtual_formal_fill_tail_only": True,
+                "formal_single_bridge_trial_enabled": False,
+                "formal_single_bridge_trial_proposal_id": "",
+                "formal_single_bridge_trial_dry_run": False,
+                "formal_single_bridge_trial_allow_virtual_bridge": True,
+                "formal_single_bridge_trial_allow_mixed_bridge": False,
                 "small_roll_dual_reserve_enabled": True,
                 "small_roll_dual_reserve_penalty": 15,
                 "small_roll_dual_reserve_bucket_enabled": True,
@@ -998,15 +1032,14 @@ def normalize_enforced_profile_name(profile_name: str | None) -> str:
     Normalize profile name to the current enforced default.
 
     Rules:
-        - None / "" / "default" -> "constructive_lns_search"
-        - "constructive_lns_search" -> "constructive_lns_search"
+        - None / "" / "default" -> "constructive_lns_virtual_guarded_frontload"
         - Other values are returned as-is (to allow explicit runtime errors)
     """
     if profile_name is None:
-        return "constructive_lns_search"
+        return "constructive_lns_virtual_guarded_frontload"
     name = str(profile_name).strip().lower()
     if name in ("", "default"):
-        return "constructive_lns_search"
+        return "constructive_lns_virtual_guarded_frontload"
     return str(profile_name)
 
 
@@ -1019,7 +1052,7 @@ def build_default_solve_config(
     其他 profile 值会在运行时被 master.py / cold_rolling_pipeline.py 的守卫拒绝。
     """
     return build_profile_config(
-        "constructive_lns_search",
+        "constructive_lns_virtual_guarded_frontload",
         validation_mode=validation_mode,
         production_compatibility_mode=production_compatibility_mode,
     )

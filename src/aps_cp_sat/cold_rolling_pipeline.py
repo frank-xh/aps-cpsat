@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 from dataclasses import replace
@@ -14,7 +14,12 @@ from aps_cp_sat.model.candidate_graph import build_candidate_graph
 from aps_cp_sat.model import solve_master_model
 from aps_cp_sat.preprocess import prepare_orders_for_model
 from aps_cp_sat.rules import RULE_REGISTRY
+from aps_cp_sat.routes import PreparedWorld, create_route_runner
 from aps_cp_sat.transition import build_transition_templates
+from aps_cp_sat.transition.virtual_inventory import (
+    build_prebuilt_virtual_inventory,
+    prebuilt_virtual_inventory_diagnostics,
+)
 from aps_cp_sat.config.parameters import build_profile_config, normalize_enforced_profile_name
 from aps_cp_sat.config.rule_config import RuleConfig
 from aps_cp_sat.validate import (
@@ -29,27 +34,17 @@ try:
 except Exception:
     persist_run_analysis_from_excel = None
 
-# Block-first import check (lazy, used only for error reporting)
-_block_first_import_error: str | None = None
-try:
-    from aps_cp_sat.model.block_generator import generate_candidate_blocks  # noqa: F401
-    from aps_cp_sat.model.block_master import solve_block_master  # noqa: F401
-    from aps_cp_sat.model.block_realizer import realize_selected_blocks  # noqa: F401
-    from aps_cp_sat.model.block_alns import run_block_alns  # noqa: F401
-except ImportError as e:
-    _block_first_import_error = str(e)
-
 
 class ColdRollingPipeline:
     """
-    冷轧排程分层门面：
+    鍐疯涧鎺掔▼鍒嗗眰闂ㄩ潰锛?
     preprocess -> transition -> model -> decode -> validate
     """
 
     @staticmethod
     def _print_data_diagnostics(orders_df) -> None:
         if orders_df is None or orders_df.empty:
-            print("[APS][数据诊断] 订单为空")
+            print("[APS][鏁版嵁璇婃柇] 璁㈠崟涓虹┖")
             return
         key_cols = ["width", "thickness", "temp_min", "temp_max", "tons", "steel_group", "line_capability"]
         missing: Dict[str, int] = {}
@@ -63,7 +58,7 @@ class ColdRollingPipeline:
         if "line_capability" in orders_df.columns:
             cap_cnt = orders_df["line_capability"].value_counts(dropna=False).to_dict()
         print(
-            f"[APS][数据诊断] rows={len(orders_df)}, "
+            f"[APS][鏁版嵁璇婃柇] rows={len(orders_df)}, "
             f"missing={missing}, bad_temp_range={bad_temp}, line_capability={cap_cnt}"
         )
 
@@ -71,7 +66,7 @@ class ColdRollingPipeline:
     def _print_template_diagnostics(transition_pack: dict) -> None:
         tpl = transition_pack.get("templates") if isinstance(transition_pack, dict) else None
         if tpl is None or tpl.empty:
-            print("[APS][模板诊断] 无模板")
+            print("[APS][TEMPLATE_DIAG] no_templates")
             return
         for line in sorted(tpl["line"].dropna().unique().tolist()):
             t = tpl[tpl["line"] == line]
@@ -81,14 +76,14 @@ class ColdRollingPipeline:
             avg_out = float(out_deg.mean()) if len(out_deg) else 0.0
             avg_in = float(in_deg.mean()) if len(in_deg) else 0.0
             print(
-                f"[APS][模板诊断] line={line}, templates={len(t)}, nodes={len(nodes)}, "
+                f"[APS][妯℃澘璇婃柇] line={line}, templates={len(t)}, nodes={len(nodes)}, "
                 f"avg_out={avg_out:.2f}, avg_in={avg_in:.2f}, "
                 f"max_bridge={int(t['bridge_count'].max()) if not t.empty else 0}"
             )
         ps = transition_pack.get("prune_summaries", []) if isinstance(transition_pack, dict) else []
         for s in ps:
             print(
-                f"[APS][模板剪枝] line={s.line}, unbridgeable={s.pruned_unbridgeable}, "
+                f"[APS][妯℃澘鍓灊] line={s.line}, unbridgeable={s.pruned_unbridgeable}, "
                 f"topk={s.pruned_topk}, degree={s.pruned_degree}, kept={s.kept_templates}"
             )
         bd = transition_pack.get("build_debug", []) if isinstance(transition_pack, dict) else []
@@ -98,7 +93,7 @@ class ColdRollingPipeline:
                 line = str(item.get("line", ""))
                 if line in {"big_roll", "small_roll"}:
                     print(
-                        f"[APS][模板构建摘要] line={line}, candidatePairs={int(item.get('candidate_pairs', 0) or 0)}, "
+                        f"[APS][妯℃澘鏋勫缓鎽樿] line={line}, candidatePairs={int(item.get('candidate_pairs', 0) or 0)}, "
                         f"templatesBuilt={int(item.get('kept_templates', 0) or 0)}, "
                         f"avgVirtualCount={float(item.get('avg_virtual_count', 0.0) or 0.0):.2f}, "
                         f"maxVirtualCount={int(item.get('max_virtual_count', 0) or 0)}, "
@@ -109,7 +104,7 @@ class ColdRollingPipeline:
                     )
             if isinstance(total, dict):
                 print(
-                    f"[APS][模板耗时] preprocess_seconds={float(total.get('preprocess_seconds', 0.0)):.3f}, "
+                    f"[APS][妯℃澘鑰楁椂] preprocess_seconds={float(total.get('preprocess_seconds', 0.0)):.3f}, "
                     f"line_partition_seconds={float(total.get('line_partition_seconds', 0.0)):.3f}, "
                     f"template_pair_scan_seconds={float(total.get('template_pair_scan_seconds', 0.0)):.3f}, "
                     f"bridge_check_seconds={float(total.get('bridge_check_seconds', 0.0)):.3f}, "
@@ -119,8 +114,14 @@ class ColdRollingPipeline:
                     f"template_build_seconds={float(total.get('template_build_seconds', 0.0)):.3f}"
                 )
                 print(
-                    f"[APS][CandidateGraph] edges={int(total.get('candidate_graph_edge_count', 0) or 0)}, "
-                    f"direct={int(total.get('candidate_graph_direct_edge_count', 0) or 0)}, "
+                        f"[APS][CandidateGraph] edges={int(total.get('candidate_graph_edge_count', 0) or 0)}, "
+                        f"virtual_nodes={int(total.get('candidate_graph_virtual_node_count', 0) or 0)}, "
+                        f"virtual_edges={int(total.get('candidate_graph_virtual_edge_count', 0) or 0)}, "
+                        f"real_virtual={int(total.get('candidate_graph_real_virtual_edge_count', 0) or 0)}, "
+                        f"virtual_real={int(total.get('candidate_graph_virtual_real_edge_count', 0) or 0)}, "
+                        f"virtual_virtual={int(total.get('candidate_graph_virtual_virtual_edge_count', 0) or 0)}, "
+                        f"real_bridge_capable_orders={int(total.get('candidate_graph_real_bridge_capable_order_count', 0) or 0)}, "
+                        f"direct={int(total.get('candidate_graph_direct_edge_count', 0) or 0)}, "
                     f"real_bridge={int(total.get('candidate_graph_real_bridge_edge_count', 0) or 0)}, "
                     f"virtual_family={int(total.get('candidate_graph_virtual_bridge_family_edge_count', 0) or 0)}, "
                     f"filtered_width={int(total.get('candidate_graph_filtered_by_width_count', 0) or 0)}, "
@@ -150,100 +151,125 @@ class ColdRollingPipeline:
                     break
         return transition_pack
 
+    def _prepare_world(self, req: ColdRollingRequest) -> PreparedWorld:
+        """Build shared upstream artifacts once, before route-specific solving."""
+        orders_df = prepare_orders_for_model(req.orders_path, req.steel_info_path, req.config)
+        self._print_data_diagnostics(orders_df)
+
+        virtual_inventory_df = build_prebuilt_virtual_inventory(req.config, orders_df)
+        virtual_diag = prebuilt_virtual_inventory_diagnostics(virtual_inventory_df, req.config)
+        virtual_diag.setdefault("virtual_inventory_count_total", int(virtual_diag.get("prebuilt_virtual_inventory_count", 0) or 0))
+        virtual_diag.setdefault("virtual_inventory_big_roll_count", int(virtual_diag.get("prebuilt_virtual_big_roll_count", 0) or 0))
+        virtual_diag.setdefault("virtual_inventory_small_roll_count", int(virtual_diag.get("prebuilt_virtual_small_roll_count", 0) or 0))
+        graph_orders_df = orders_df
+        if not virtual_inventory_df.empty:
+            graph_orders_df = pd.concat([orders_df, virtual_inventory_df], ignore_index=True, sort=False)
+            print(
+                f"[APS][PREBUILT_VIRTUAL] mode={virtual_diag.get('virtual_bridge_mode')}, "
+                f"inventory={virtual_diag.get('prebuilt_virtual_inventory_count', 0)}, "
+                f"specs={virtual_diag.get('prebuilt_virtual_specs_count', 0)}, "
+                f"line_capability={virtual_diag.get('prebuilt_virtual_line_capability_breakdown', {})}"
+            )
+
+        build_t0 = perf_counter()
+        transition_pack = build_transition_templates(graph_orders_df, req.config, unassigned_real_orders=orders_df)
+        transition_pack = self._attach_candidate_graph(graph_orders_df, transition_pack, req.config)
+        template_build_seconds = perf_counter() - build_t0
+        self._print_template_diagnostics(transition_pack)
+
+        candidate_graph_diagnostics = {}
+        candidate_graph = None
+        if isinstance(transition_pack, dict):
+            transition_pack["graph_orders_df"] = graph_orders_df
+            transition_pack["prebuilt_virtual_inventory"] = virtual_inventory_df
+            transition_pack.update(virtual_diag)
+            candidate_graph = transition_pack.get("candidate_graph")
+            raw_diag = transition_pack.get("candidate_graph_diagnostics", {})
+            if isinstance(raw_diag, dict):
+                candidate_graph_diagnostics = dict(raw_diag)
+            candidate_graph_diagnostics.update(virtual_diag)
+
+        shared_diagnostics = dict(virtual_diag)
+        if not virtual_inventory_df.empty:
+            shared_diagnostics["prebuilt_virtual_inventory_rows"] = virtual_inventory_df.to_dict("records")
+        shared_diagnostics.update(candidate_graph_diagnostics)
+
+        return PreparedWorld(
+            orders_df=orders_df,
+            normalized_orders_df=orders_df,
+            graph_orders_df=graph_orders_df,
+            transition_pack=transition_pack if isinstance(transition_pack, dict) else {},
+            candidate_graph=candidate_graph,
+            prebuilt_virtual_inventory_df=virtual_inventory_df,
+            shared_diagnostics=shared_diagnostics,
+            candidate_graph_diagnostics=candidate_graph_diagnostics,
+            template_build_seconds=float(template_build_seconds),
+        )
+
     # ---------------------------------------------------------------------------
-    # Profile guard: enforce constructive_lns_search as the only allowed path
+    # Profile guard: enforce constructive_lns_virtual_guarded_frontload only
     # ---------------------------------------------------------------------------
 
+    # ---------------------------------------------------------------------------
+    # Profile guard: enforce a single constructive_lns route/profile
+    # ---------------------------------------------------------------------------
     def _enforce_constructive_lns_profile(self, req: ColdRollingRequest) -> ColdRollingRequest:
-        """
-        Guard that enforces constructive_lns_search (or debug_acceptance) as the only allowed
-        profile/strategy.
+        requested_profile = str(req.config.model.profile_name or '').strip()
+        requested_strategy = str(req.config.model.main_solver_strategy or '').strip()
+        target_profile = 'constructive_lns_virtual_guarded_frontload'
+        target_strategy = 'constructive_lns'
 
-        A. Reads requested profile and strategy.
-        B. Auto-corrects empty / "default" -> constructive_lns_search (silent enforcement).
-        C. Accepts constructive_lns_search and constructive_lns_debug_acceptance explicitly.
-        D. Rejects any other profile explicitly.
-        """
-        requested_profile = str(req.config.model.profile_name or "").strip()
-
-        # ---- Allowed ALNS profiles (current production paths only) ----
-        # Profile semantics:
-        #   - constructive_lns_search: Production mainline (Route RB / direct_plus_real_bridge)
-        #   - constructive_lns_real_bridge_frontload: Alias of mainline (Route RB)
-        #   - constructive_lns_direct_only_baseline: Diagnostic baseline (Route C)
-        #   - constructive_lns_virtual_guarded_frontload: Guarded virtual family experiment
-        #   - block_first_guarded_search: Block-first experiment line
-        # NOTE: constructive_lns_bridge_family_master / debug_acceptance 已移出默认主路径，
-        # 保留于 compat/experimental_disabled/ 或 debug-only，不进入默认生产守卫。
-        _ALLOWED_ALNS_PROFILES = {
-            "constructive_lns_search",  # Production mainline (Route RB)
-            "constructive_lns_real_bridge_frontload",  # Alias of mainline (Route RB)
-            "constructive_lns_direct_only_baseline",  # Diagnostic baseline (Route C)
-            "constructive_lns_virtual_guarded_frontload",  # Guarded virtual family experiment
-            "block_first_guarded_search",  # Block-first experiment line
-        }
-
-        # Case B: auto-correct empty/default
-        if requested_profile in ("", "default"):
+        if requested_profile in ('', 'default'):
             enforced_cfg = build_profile_config(
-                "constructive_lns_search",
+                target_profile,
                 validation_mode=bool(req.config.model.validation_mode),
                 production_compatibility_mode=bool(req.config.model.production_compatibility_mode),
             )
             print(
                 f"[APS][PROFILE_GUARD] requested_profile={requested_profile or '(empty)'} -> "
-                f"enforced_profile=constructive_lns_search"
+                f"enforced_profile={target_profile}"
             )
             return replace(req, config=enforced_cfg)
 
-        # Case C: allowed profiles — return as-is
-        if requested_profile in _ALLOWED_ALNS_PROFILES:
-            return req
-
-        # Case D: illegal profile -> reject
-        raise ValueError(
-            f"[APS][PROFILE_GUARD] illegal profile: {requested_profile}; "
-            f"Only {sorted(_ALLOWED_ALNS_PROFILES)} are allowed in current engineering mode"
-        )
-
-    def _assert_block_first_result(self, result: ColdRollingResult) -> None:
-        """
-        Hard verification that we ACTUALLY ran block_first
-        """
-        cfg = result.config
-        profile = getattr(cfg.model, "profile_name", "")
-        if profile != "block_first_guarded_search":
-            return
-
-        meta = result.engine_meta or {}
-
-        actual_profile = meta.get("profile_name", "")
-        solver_path = meta.get("solver_path", "")
-        main_path = meta.get("main_path", "")
-
-        if actual_profile != "block_first_guarded_search":
-            raise RuntimeError(
-                f"[APS][block_first_verify] profile_name mismatch. Expected block_first_guarded_search, got {actual_profile}")
-        if solver_path != "block_first":
-            raise RuntimeError(f"[APS][block_first_verify] solver_path != block_first. Got {solver_path}")
-        if main_path != "block_first":
-            raise RuntimeError(f"[APS][block_first_verify] main_path != block_first. Got {main_path}")
-
-    # =========================================================================
-    # UNIFIED_ENGINE_META_FIELDS: unified口径的元数据字段
-    # 只保留当前真实主线使用的能力字段；旧 virtual pilot / oracle / family master 等已移除
-    # =========================================================================
+        if requested_profile != target_profile or requested_strategy != target_strategy:
+            raise ValueError(
+                '[APS][PROFILE_GUARD][ONLY_SINGLE_ROUTE_ALLOWED] '
+                f'expected strategy={target_strategy}, expected profile={target_profile}, '
+                f'got strategy={requested_strategy!r}, profile={requested_profile!r}'
+            )
+        return req
     _UNIFIED_ENGINE_META_FIELDS = (
         # ---- Configuration ----
         "profile_name",
+        "route_name",
         "solver_path",
+        "main_path",
+        "strategy_name",
         "constructive_edge_policy",
         "bridge_expansion_mode",
         "allow_virtual_bridge_edge_in_constructive",
         "allow_real_bridge_edge_in_constructive",
-        # ---- Single Candidate Graph 追踪 ----
+        "virtual_bridge_mode",
+        "prebuilt_virtual_inventory_enabled",
+        "prebuilt_virtual_inventory_count",
+        "virtual_inventory_count_total",
+        "prebuilt_virtual_specs_count",
+        "prebuilt_virtual_big_roll_count",
+        "prebuilt_virtual_small_roll_count",
+        "virtual_inventory_big_roll_count",
+        "virtual_inventory_small_roll_count",
+        "virtual_inventory_remaining_count",
+        "virtual_inventory_consumed_count",
+        "prebuilt_virtual_line_capability_breakdown",
+        # ---- Single Candidate Graph 杩借釜 ----
         "candidate_graph_source",
-        # ---- Guarded virtual family (受控虚拟族桥接) ----
+        "candidate_graph_virtual_node_count",
+        "candidate_graph_virtual_edge_count",
+        "candidate_graph_virtual_virtual_edge_count",
+        "candidate_graph_real_virtual_edge_count",
+        "candidate_graph_virtual_real_edge_count",
+        "candidate_graph_real_bridge_capable_order_count",
+        # ---- Guarded virtual family (鍙楁帶铏氭嫙鏃忔ˉ鎺? ----
         "virtual_family_frontload_enabled",
         # Greedy/constructive phase family stats
         "greedy_virtual_family_edge_uses",
@@ -280,7 +306,7 @@ class ColdRollingPipeline:
         "local_cpsat_success_count",
         "local_cpsat_skipped_due_to_gate",
         "local_cpsat_total_seconds",
-        # ---- Legacy virtual pilot 降级统计 ----
+        # ---- Legacy virtual pilot 闄嶇骇缁熻 ----
         "virtual_pilot_skipped_due_to_disabled",
         # ---- Acceptance status ----
         "acceptance",
@@ -297,6 +323,88 @@ class ColdRollingPipeline:
         "shadow_virtual_possible_reduced_underfilled_campaigns",
         "shadow_virtual_possible_reduced_realization_rejections",
         "shadow_virtual_budget_needed_estimate",
+        "assembly_plan_enabled",
+        "assembly_plan_line_count",
+        "assembly_plan_campaign_skeleton_count",
+        "assembly_plan_avg_blocks_per_skeleton",
+        "assembly_plan_already_viable_count",
+        "assembly_plan_near_viable_count",
+        "assembly_plan_merge_candidate_count",
+        "assembly_plan_hopeless_count",
+        "assembly_plan_bridge_requirement_count",
+        "assembly_plan_mixed_bridge_required_count",
+        "assembly_plan_simple_real_bridge_count",
+        "assembly_plan_simple_virtual_bridge_count",
+        "direct_group_merges",
+        "real_bridge_group_merges",
+        "mixed_bridge_requirements",
+        "direct_group_template_unknown_count",
+        "real_bridge_group_template_unsupported_count",
+        "assembly_plan_maturity_ready",
+        "assembly_plan_ready_for_finalization",
+        "assembly_plan_readiness_reason_code",
+        "assembly_plan_hopeless_ratio",
+        "assembly_plan_near_merge_ratio",
+        "assembly_plan_fallback_used",
+        "bridge_merge_proposal_count",
+        "bridge_merge_proposal_high_confidence_count",
+        "bridge_merge_to_already_viable_count",
+        "bridge_merge_to_near_viable_count",
+        "bridge_merge_to_merge_candidate_count",
+        "bridge_merge_requires_mixed_complex_count",
+        "bridge_merge_not_proposable_count",
+        "best_bridge_merge_proposal_id",
+        "best_bridge_merge_proposal_line",
+        "best_bridge_merge_proposal_source",
+        "best_bridge_merge_proposal_target",
+        "best_bridge_merge_projected_gap_before",
+        "best_bridge_merge_projected_gap_after",
+        "best_bridge_merge_projected_viability_after",
+        "simulation_proposal_id",
+        "simulation_source",
+        "simulation_target",
+        "simulation_projected_gap_before",
+        "simulation_projected_gap_after",
+        "simulation_projected_viability_after",
+        "proposal_simulation_consistent",
+        "proposal_simulation_inconsistency_reason",
+        "bridge_merge_simulation_enabled",
+        "best_bridge_merge_proposal_selected",
+        "best_bridge_merge_source",
+        "best_bridge_merge_target",
+        "best_bridge_merge_confidence_band",
+        "simulated_merge_guard_passed",
+        "simulated_merge_guard_reason",
+        "simulated_skeleton_count",
+        "simulated_avg_blocks_per_skeleton",
+        "simulated_hopeless_count",
+        "simulated_near_merge_count",
+        "formal_single_bridge_trial_enabled",
+        "formal_single_bridge_trial_selected",
+        "formal_single_bridge_trial_selected_proposal_id",
+        "formal_single_bridge_trial_selected_source",
+        "formal_single_bridge_trial_selected_target",
+        "formal_single_bridge_trial_selected_bridge_type",
+        "formal_single_bridge_trial_attempted",
+        "formal_single_bridge_trial_applied",
+        "formal_single_bridge_trial_rolled_back",
+        "formal_single_bridge_trial_guard_passed",
+        "formal_single_bridge_trial_guard_reason",
+        "formal_single_bridge_trial_reason",
+        "formal_single_bridge_trial_rollback_reason",
+        "formal_single_bridge_trial_preflight_reason",
+        "formal_single_bridge_trial_registry_size",
+        "formal_single_bridge_trial_registry_hit",
+        "formal_single_bridge_trial_proposal_id",
+        "formal_single_bridge_trial_source",
+        "formal_single_bridge_trial_target",
+        "formal_single_bridge_trial_bridge_type_needed",
+        "formal_single_bridge_trial_campaign_tons_before",
+        "formal_single_bridge_trial_campaign_tons_after",
+        "formal_single_bridge_trial_hard_violation_before",
+        "formal_single_bridge_trial_hard_violation_after",
+        "formal_single_bridge_trial_campaign_ton_min_violation_count_before",
+        "formal_single_bridge_trial_campaign_ton_min_violation_count_after",
         # ---- Block-first experiment line fields ----
         "generated_blocks_total",
         "selected_blocks_count",
@@ -523,6 +631,9 @@ class ColdRollingPipeline:
             or getattr(model_cfg, "main_solver_strategy", "")
             or "unknown"
         )
+        main_path = str(em.get("main_path") or solver_path or "unknown")
+        route_name = str(em.get("route_name") or solver_path or main_path or "unknown")
+        strategy_name = str(em.get("strategy_name") or getattr(model_cfg, "main_solver_strategy", "") or solver_path)
         allow_virtual = bool(
             em.get(
                 "allow_virtual_bridge_edge_in_constructive",
@@ -567,6 +678,12 @@ class ColdRollingPipeline:
         # Only propagate candidate graph diagnostics that are actually used in production
         for key in (
                 "candidate_graph_edge_count",
+                "candidate_graph_virtual_node_count",
+                "candidate_graph_virtual_edge_count",
+                "candidate_graph_virtual_virtual_edge_count",
+                "candidate_graph_real_virtual_edge_count",
+                "candidate_graph_virtual_real_edge_count",
+                "candidate_graph_real_bridge_capable_order_count",
                 "candidate_graph_direct_edge_count",
                 "candidate_graph_real_bridge_edge_count",
                 "candidate_graph_filtered_by_width_count",
@@ -576,7 +693,7 @@ class ColdRollingPipeline:
         ):
             if key in candidate_graph_diag:
                 em[key] = candidate_graph_diag.get(key)
-        # ---- Guarded virtual family (受控虚拟族桥接) diagnostics ----
+        # ---- Guarded virtual family (鍙楁帶铏氭嫙鏃忔ˉ鎺? diagnostics ----
         build_diags = lns_diag.get("constructive_build_diags", {}) if isinstance(lns_diag, dict) else {}
 
         if schedule_df is None:
@@ -622,11 +739,37 @@ class ColdRollingPipeline:
         em.update(
             {
                 "profile_name": profile_name,
+                "route_name": route_name,
                 "solver_path": solver_path,
+                "main_path": main_path,
+                "strategy_name": strategy_name,
                 "constructive_edge_policy": constructive_edge_policy,
                 "bridge_expansion_mode": bridge_expansion_mode,
                 "allow_virtual_bridge_edge_in_constructive": allow_virtual,
                 "allow_real_bridge_edge_in_constructive": allow_real,
+                "virtual_bridge_mode": str(em.get("virtual_bridge_mode", getattr(model_cfg, "virtual_bridge_mode", "template_bridge"))),
+                "prebuilt_virtual_inventory_enabled": bool(
+                    em.get(
+                        "prebuilt_virtual_inventory_enabled",
+                        getattr(model_cfg, "prebuilt_virtual_inventory_enabled", False),
+                    )
+                ),
+                "prebuilt_virtual_inventory_count": int(em.get("prebuilt_virtual_inventory_count", 0) or 0),
+                "virtual_inventory_count_total": int(
+                    em.get("virtual_inventory_count_total", em.get("prebuilt_virtual_inventory_count", 0)) or 0
+                ),
+                "prebuilt_virtual_specs_count": int(em.get("prebuilt_virtual_specs_count", 0) or 0),
+                "prebuilt_virtual_big_roll_count": int(em.get("prebuilt_virtual_big_roll_count", 0) or 0),
+                "prebuilt_virtual_small_roll_count": int(em.get("prebuilt_virtual_small_roll_count", 0) or 0),
+                "virtual_inventory_big_roll_count": int(
+                    em.get("virtual_inventory_big_roll_count", em.get("prebuilt_virtual_big_roll_count", 0)) or 0
+                ),
+                "virtual_inventory_small_roll_count": int(
+                    em.get("virtual_inventory_small_roll_count", em.get("prebuilt_virtual_small_roll_count", 0)) or 0
+                ),
+                "virtual_inventory_remaining_count": int(em.get("virtual_inventory_remaining_count", 0) or 0),
+                "virtual_inventory_consumed_count": int(em.get("virtual_inventory_consumed_count", 0) or 0),
+                "prebuilt_virtual_line_capability_breakdown": em.get("prebuilt_virtual_line_capability_breakdown", {}),
                 # Backward-compatible aliases used by older writer/decoder code.
                 "virtual_bridge_edge_enabled_in_constructive": allow_virtual,
                 "real_bridge_edge_enabled_in_constructive": allow_real,
@@ -634,7 +777,7 @@ class ColdRollingPipeline:
                 "candidate_graph_source": str(
                     em.get("candidate_graph_source", build_diags.get("candidate_graph_source", "unknown")) or "unknown"
                 ),
-                # Guarded virtual family (受控虚拟族桥接) - profile-level switch
+                # Guarded virtual family (鍙楁帶铏氭嫙鏃忔ˉ鎺? - profile-level switch
                 "virtual_family_frontload_enabled": bool(
                     getattr(model_cfg, "virtual_family_frontload_enabled", False)
                 ),
@@ -676,12 +819,12 @@ class ColdRollingPipeline:
                     em.get("selected_virtual_bridge_edge_count",
                            cls._count_edge_type(schedule_df, "VIRTUAL_BRIDGE_EDGE")) or 0
                 ),
-                # Guarded virtual family edge counts (受控虚拟族桥接)
+                # Guarded virtual family edge counts (鍙楁帶铏氭嫙鏃忔ˉ鎺?
                 "selected_virtual_bridge_family_edge_count": int(
                     em.get("selected_virtual_bridge_family_edge_count",
                            cls._count_edge_type(schedule_df, "VIRTUAL_BRIDGE_FAMILY_EDGE")) or 0
                 ),
-                # Legacy virtual bridge edge count (旧式虚拟桥接, 始终为0因legacy被禁用)
+                # Legacy virtual bridge edge count (鏃у紡铏氭嫙妗ユ帴, 濮嬬粓涓?鍥爈egacy琚鐢?
                 "selected_legacy_virtual_bridge_edge_count": int(0),
                 "max_bridge_count_used": int(
                     em.get(
@@ -704,7 +847,7 @@ class ColdRollingPipeline:
                                        cut_diags.get("underfilled_reconstruction_underfilled_delta", 0)) or 0) == 0,
                     )
                 ),
-                # ALNS guarded virtual family stats (受控虚拟族桥接)
+                # ALNS guarded virtual family stats (鍙楁帶铏氭嫙鏃忔ˉ鎺?
                 "alns_virtual_family_attempt_count": _round_alns_attempt,
                 "alns_virtual_family_accept_count": _round_alns_accept,
                 "local_cpsat_virtual_family_selected_count": _round_local_family_selected,
@@ -739,8 +882,8 @@ class ColdRollingPipeline:
                 "local_cpsat_total_seconds": float(
                     em.get("local_cpsat_total_seconds", lns_diag.get("local_cpsat_total_seconds", 0.0)) or 0.0
                 ),
-                # ---- Legacy virtual pilot 降级统计 ----
-                # virtual_pilot 相关字段已从默认主线移除；此处只保留一个总字段
+                # ---- Legacy virtual pilot 闄嶇骇缁熻 ----
+                # virtual_pilot 鐩稿叧瀛楁宸蹭粠榛樿涓荤嚎绉婚櫎锛涙澶勫彧淇濈暀涓€涓€诲瓧娈?
                 "virtual_pilot_skipped_due_to_disabled": bool(
                     getattr(model_cfg, "repair_only_virtual_bridge_pilot_enabled", False) is False
                 ),
@@ -1351,8 +1494,8 @@ class ColdRollingPipeline:
             "bridgeability_route_suggestion": str(em.get("bridgeability_route_suggestion", "")),
             "bridgeability_census": em.get("bridgeability_census", {}),
             "bridgeability_census_items": em.get("bridgeability_census_items", []),
-            # ---- Legacy virtual pilot: 已降级为单一总字段 ----
-            # 旧有 ~45 个 virtual_pilot 细项字段已从此处移除
+            # ---- Legacy virtual pilot: 宸查檷绾т负鍗曚竴鎬诲瓧娈?----
+            # 鏃ф湁 ~45 涓?virtual_pilot 缁嗛」瀛楁宸蹭粠姝ゅ绉婚櫎
             "conservative_apply_attempt_count": int(em.get("conservative_apply_attempt_count", 0) or 0),
             "conservative_apply_success_count": int(em.get("conservative_apply_success_count", 0) or 0),
             "conservative_apply_reject_count": int(em.get("conservative_apply_reject_count", 0) or 0),
@@ -1367,190 +1510,132 @@ class ColdRollingPipeline:
         }
         return diagnostics
 
+    def _evaluate_partial_acceptance(
+        self,
+        result: ColdRollingResult,
+        orders_df: pd.DataFrame,
+        *,
+        validation_summary: dict | None = None,
+    ) -> dict[str, Any]:
+        """Evaluate whether a routing-feasible partial result is acceptable for official export.
+
+        This method was referenced by the pipeline but missing after the recent route refactor.
+        It keeps the acceptance logic conservative:
+        - hard violations must be zero
+        - dropped count / dropped tons must stay within configured thresholds
+        - scheduled real orders / tons must exceed configured floors
+        """
+        summary = validation_summary or {}
+        model_cfg = getattr(result.config, 'model', result.config)
+
+        schedule_df = result.schedule_df if isinstance(result.schedule_df, pd.DataFrame) else pd.DataFrame()
+        dropped_df = result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else pd.DataFrame()
+        source_orders = orders_df if isinstance(orders_df, pd.DataFrame) else pd.DataFrame()
+
+        def _bool_series(df: pd.DataFrame, col: str, default: bool = False) -> pd.Series:
+            if not isinstance(df, pd.DataFrame) or df.empty or col not in df.columns:
+                return pd.Series([default] * len(df), index=df.index if isinstance(df, pd.DataFrame) else None)
+            s = df[col]
+            return s.fillna(default).astype(bool)
+
+        total_real_orders = int((~_bool_series(source_orders, 'is_virtual', False)).sum()) if not source_orders.empty else 0
+        total_real_tons = float(pd.to_numeric(source_orders.get('tons'), errors='coerce').fillna(0.0).sum()) if not source_orders.empty and 'tons' in source_orders.columns else 0.0
+
+        real_schedule_df = schedule_df.copy()
+        if not real_schedule_df.empty:
+            if 'is_virtual' in real_schedule_df.columns:
+                real_schedule_df = real_schedule_df[~_bool_series(real_schedule_df, 'is_virtual', False)]
+            elif 'virtual_origin' in real_schedule_df.columns:
+                real_schedule_df = real_schedule_df[real_schedule_df['virtual_origin'].fillna('').astype(str) == '']
+
+        scheduled_real_orders = int(real_schedule_df['order_id'].astype(str).nunique()) if 'order_id' in real_schedule_df.columns and not real_schedule_df.empty else int(summary.get('final_realized_order_count', 0) or 0)
+        scheduled_real_tons = float(pd.to_numeric(real_schedule_df.get('tons'), errors='coerce').fillna(0.0).sum()) if 'tons' in real_schedule_df.columns and not real_schedule_df.empty else float(summary.get('final_realized_tons', 0.0) or 0.0)
+
+        dropped_real_df = dropped_df.copy()
+        if not dropped_real_df.empty:
+            if 'is_virtual' in dropped_real_df.columns:
+                dropped_real_df = dropped_real_df[~_bool_series(dropped_real_df, 'is_virtual', False)]
+            elif 'virtual_origin' in dropped_real_df.columns:
+                dropped_real_df = dropped_real_df[dropped_real_df['virtual_origin'].fillna('').astype(str) == '']
+
+        dropped_count = int(dropped_real_df['order_id'].astype(str).nunique()) if 'order_id' in dropped_real_df.columns and not dropped_real_df.empty else max(0, total_real_orders - scheduled_real_orders)
+        dropped_tons = float(pd.to_numeric(dropped_real_df.get('tons'), errors='coerce').fillna(0.0).sum()) if 'tons' in dropped_real_df.columns and not dropped_real_df.empty else max(0.0, total_real_tons - scheduled_real_tons)
+
+        partial_drop_ratio = (dropped_count / total_real_orders) if total_real_orders > 0 else 0.0
+        partial_drop_tons_ratio = (dropped_tons / total_real_tons) if total_real_tons > 0 else 0.0
+
+        hard_violation_count_total = int(
+            summary.get('final_hard_violation_count_total', summary.get('hard_violation_count_total', 0)) or 0
+        )
+        campaign_ton_hard_violation_count_total = int(
+            summary.get(
+                'campaign_ton_hard_violation_count_total',
+                (summary.get('campaign_ton_min_violation_count', 0) or 0)
+                + (summary.get('campaign_ton_max_violation_count', 0) or 0),
+            )
+            or 0
+        )
+        hard_violations_zero = hard_violation_count_total == 0
+
+        max_drop_ratio = float(getattr(model_cfg, 'max_drop_ratio_for_partial', 1.0) or 1.0)
+        max_drop_tons_ratio = float(getattr(model_cfg, 'max_drop_tons_ratio_for_partial', 1.0) or 1.0)
+        max_drop_count = int(getattr(model_cfg, 'max_drop_count_for_partial', total_real_orders or 0) or 0)
+        min_scheduled_orders = int(getattr(model_cfg, 'min_scheduled_orders_for_partial', 0) or 0)
+        min_scheduled_tons = float(getattr(model_cfg, 'min_scheduled_tons_for_partial', 0.0) or 0.0)
+
+        block_reason = ''
+        if not hard_violations_zero:
+            block_reason = f'HARD_VIOLATIONS:{hard_violation_count_total}'
+        elif scheduled_real_orders < min_scheduled_orders:
+            block_reason = 'SCHEDULED_ORDERS_BELOW_MIN'
+        elif scheduled_real_tons < min_scheduled_tons:
+            block_reason = 'SCHEDULED_TONS_BELOW_MIN'
+        elif dropped_count > max_drop_count:
+            block_reason = 'DROP_COUNT_EXCEEDS_THRESHOLD'
+        elif partial_drop_ratio > max_drop_ratio:
+            block_reason = 'DROP_RATIO_EXCEEDS_THRESHOLD'
+        elif partial_drop_tons_ratio > max_drop_tons_ratio:
+            block_reason = 'DROP_TONS_RATIO_EXCEEDS_THRESHOLD'
+
+        partial_acceptance_passed = (block_reason == '')
+
+        return {
+            'partial_result_available': bool(not schedule_df.empty),
+            'partial_acceptance_passed': bool(partial_acceptance_passed),
+            'partial_drop_ratio': float(partial_drop_ratio),
+            'partial_drop_tons_ratio': float(partial_drop_tons_ratio),
+            'scheduled_real_orders': int(scheduled_real_orders),
+            'scheduled_real_tons': float(scheduled_real_tons),
+            'dropped_real_orders': int(dropped_count),
+            'dropped_real_tons': float(dropped_tons),
+            'hard_violation_count_total': int(hard_violation_count_total),
+            'campaign_ton_hard_violation_count_total': int(campaign_ton_hard_violation_count_total),
+            'hard_violations_zero': bool(hard_violations_zero),
+            'partial_acceptance_block_reason': str(block_reason),
+        }
+
     def run(self, req: ColdRollingRequest) -> ColdRollingResult:
         run_t0 = perf_counter()
         print(f"[APS][RUN_PATH_FINGERPRINT] PIPELINE_V2_20260416A")
-        # ---- Profile guard: enforce constructive_lns_search ----
+        # ---- Profile guard: enforce single constructive_lns route/profile ----
         req = self._enforce_constructive_lns_profile(req)
         print(f"[APS][PROFILE_GUARD] effective_profile={req.config.model.profile_name}")
         print(f"[APS][PROFILE_GUARD] effective_main_solver_strategy={req.config.model.main_solver_strategy}")
         print(f"[APS][PROFILE_GUARD] joint_master_disabled=true")
-
-        # =========================================================================
-        # Branch: block_first vs. constructive_lns
-        # pipeline prepares data, dispatches to solve_master_model for execution
-        # =========================================================================
-        if req.config.model.main_solver_strategy == "block_first":
-            if _block_first_import_error is not None:
-                raise ImportError(
-                    f"[APS][block_first] Failed to import block_first modules: {_block_first_import_error}"
-                )
-            print(f"[APS][block_first] Starting block-first via solve_master_model")
-            print(f"[APS][block_first] profile_name={req.config.model.profile_name}")
-            print(
-                f"[APS][block_first] block_generator_max_blocks_total={int(getattr(req.config.model, 'block_generator_max_blocks_total', 80))}"
+        if str(req.config.model.main_solver_strategy or "") != "constructive_lns":
+            raise RuntimeError(
+                "[APS][ONLY_SINGLE_ROUTE_ALLOWED] expected strategy=constructive_lns, "
+                f"got {req.config.model.main_solver_strategy!r}"
             )
-            print(
-                f"[APS][block_first] block_alns_rounds={int(getattr(req.config.model, 'block_alns_rounds', 10))}"
-            )
-            print(f"[APS][block_first] prepared transition_pack and dispatching to solve_master_model")
-
-            # ---- Prepare orders and templates (same as constructive_lns) ----
-            orders_df = prepare_orders_for_model(req.orders_path, req.steel_info_path, req.config)
-            self._print_data_diagnostics(orders_df)
-
-            build_t0 = perf_counter()
-            transition_pack = build_transition_templates(orders_df, req.config)
-            transition_pack = self._attach_candidate_graph(orders_df, transition_pack, req.config)
-            template_build_seconds = perf_counter() - build_t0
-            self._print_template_diagnostics(transition_pack)
-            print(f"[APS][block_first] template_build_seconds={template_build_seconds:.3f}")
-
-            # ---- Dispatch to solve_master_model (single canonical block-first path) ----
-            schedule_df, rounds_df, dropped_df, engine_meta = solve_master_model(
-                req, transition_pack=transition_pack, orders_df=orders_df
+        if str(req.config.model.profile_name or "") != "constructive_lns_virtual_guarded_frontload":
+            raise RuntimeError(
+                "[APS][ONLY_SINGLE_ROUTE_ALLOWED] expected profile=constructive_lns_virtual_guarded_frontload, "
+                f"got {req.config.model.profile_name!r}"
             )
 
-            total_runtime = perf_counter() - run_t0
-
-            result = ColdRollingResult(
-                schedule_df=schedule_df,
-                rounds_df=rounds_df,
-                output_path=Path(req.output_path),
-                dropped_df=dropped_df,
-                engine_meta=engine_meta,
-                config=req.config,
-            )
-
-            # ---- Decode phase ----
-            result = decode_solution(result)
-
-            annotated_dropped = ColdRollingPipeline._annotate_dropped_orders(
-                orders_df,
-                result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else pd.DataFrame(),
-                result.engine_meta or {},
-            )
-            result = replace(result, dropped_df=annotated_dropped)
-
-            # ---- Validation ----
-            summary = validate_solution_summary(result, result.config.rule)
-            if result.schedule_df is None or result.schedule_df.empty:
-                eq = {
-                    "template_pair_ok": bool((result.engine_meta or {}).get("template_pair_ok", False)),
-                    "adjacency_rule_ok": bool((result.engine_meta or {}).get("adjacency_rule_ok", False)),
-                    "bridge_expand_ok": bool((result.engine_meta or {}).get("bridge_expand_ok", False)),
-                    "adjacency_violation_cnt": int((result.engine_meta or {}).get("adjacency_violation_cnt", 0)),
-                    "bridge_expand_violation_cnt": int((result.engine_meta or {}).get("bridge_expand_violation_cnt", 0)),
-                    "chain_break_cnt": int((result.engine_meta or {}).get("chain_break_cnt", 0)),
-                    "bridge_path_expand_miss_cnt": int((result.engine_meta or {}).get("bridge_path_expand_miss_cnt", 0)),
-                    "template_miss_cnt": int((result.engine_meta or {}).get("template_miss_cnt", 0)),
-                }
-                routing_feasible = False
-            else:
-                eq = validate_model_equivalence(
-                    result.schedule_df,
-                    transition_pack.get("templates") if isinstance(transition_pack, dict) else None,
-                )
-                routing_feasible = bool(
-                    eq.get("template_pair_ok", False)
-                    and eq.get("adjacency_rule_ok", False)
-                    and eq.get("bridge_expand_ok", False)
-                )
-
-            updated_engine_meta = dict(result.engine_meta or {})
-            updated_engine_meta["total_runtime_seconds"] = float(total_runtime)
-            updated_engine_meta["template_build_seconds"] = float(template_build_seconds)
-            updated_engine_meta["routing_feasible"] = bool(routing_feasible)
-            updated_engine_meta["routing_status"] = "OK" if routing_feasible else "ROUTING_INFEASIBLE"
-            updated_engine_meta["template_pair_ok"] = bool(eq.get("template_pair_ok", False))
-            updated_engine_meta["adjacency_rule_ok"] = bool(eq.get("adjacency_rule_ok", False))
-            updated_engine_meta["bridge_expand_ok"] = bool(eq.get("bridge_expand_ok", False))
-            updated_engine_meta["adjacency_violation_cnt"] = int(eq.get("adjacency_violation_cnt", 0))
-            updated_engine_meta["bridge_expand_violation_cnt"] = int(eq.get("bridge_expand_violation_cnt", 0))
-            updated_engine_meta["chain_break_cnt"] = int(eq.get("chain_break_cnt", 0))
-            updated_engine_meta["bridge_path_expand_miss_cnt"] = int(eq.get("bridge_path_expand_miss_cnt", 0))
-            updated_engine_meta["template_miss_cnt"] = int(eq.get("template_miss_cnt", 0))
-            updated_engine_meta = self._merge_final_audit_and_gate(updated_engine_meta, summary)
-            shadow_rows, shadow_metrics = self._build_shadow_virtual_analysis(summary, updated_engine_meta, result.config)
-            updated_engine_meta.update(shadow_metrics)
-            updated_engine_meta["shadow_virtual_analysis_rows"] = shadow_rows
-
-            # ---- Force export for block-first verification ----
-            export_path = Path(req.output_path)
-            export_path.parent.mkdir(parents=True, exist_ok=True)
-
-            updated_engine_meta["final_export_performed"] = True
-            updated_engine_meta["official_exported"] = bool(routing_feasible)
-            updated_engine_meta["analysis_exported"] = bool(not routing_feasible)
-            updated_engine_meta["result_usage"] = "OFFICIAL" if routing_feasible else "ANALYSIS_ONLY"
-            updated_engine_meta = self._apply_final_schedule_gate_to_export(updated_engine_meta)
-            # ---- Normalize block-first engine/path metadata ----
-            # For block_first_guarded_search, all exported / validated metadata must use one unified path name.
-            updated_engine_meta["engine_used"] = "block_first"
-            updated_engine_meta["main_path"] = "block_first"
-            updated_engine_meta["solver_path"] = "block_first"
-
-            updated_engine_meta = self._ensure_unified_engine_meta(
-                updated_engine_meta,
-                result.config,
-                schedule_df=result.schedule_df if isinstance(result.schedule_df, pd.DataFrame) else pd.DataFrame(),
-                dropped_df=result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else pd.DataFrame(),
-                rounds_df=result.rounds_df if isinstance(result.rounds_df, pd.DataFrame) else pd.DataFrame(),
-            )
-            updated_engine_meta["engine_used"] = "block_first"
-            updated_engine_meta["main_path"] = "block_first"
-            updated_engine_meta["solver_path"] = "block_first"
-
-            result = replace(result, engine_meta=updated_engine_meta, output_path=export_path)
-
-            # ---- FINAL BLOCK_FIRST ASSERTION ----
-            self._assert_block_first_result(result)
-
-            # ---- Diagnostics ----
-            diagnostics = self._build_run_diagnostics(orders_df, transition_pack, result)
-            diagnostics["validation_summary"] = dict(summary)
-
-            print(
-                f"[APS][block_first][export] routing_feasible={routing_feasible}, "
-                f"official_exported={updated_engine_meta.get('official_exported', False)}, "
-                f"analysis_exported={updated_engine_meta.get('analysis_exported', False)}, "
-                f"output={export_path}"
-            )
-
-            # ---- Export XLSX ----
-            t_export_start = perf_counter()
-            export_schedule_results(
-                final_df=result.schedule_df,
-                rounds_df=result.rounds_df,
-                dropped_df=result.dropped_df if isinstance(result.dropped_df, pd.DataFrame)
-                else result.schedule_df.iloc[0:0].copy(),
-                output_path=str(result.output_path),
-                input_order_count=int(updated_engine_meta.get("input_order_count", len(orders_df))),
-                rule=result.config.rule,
-                engine_used=str(updated_engine_meta.get("engine_used", "block_first")),
-                fallback_used=bool(updated_engine_meta.get("fallback_used", False)),
-                fallback_type=str(updated_engine_meta.get("fallback_type", "")),
-                fallback_reason=str(updated_engine_meta.get("fallback_reason", "")),
-                equivalence_summary=eq,
-                failure_diagnostics=diagnostics,
-                engine_meta=updated_engine_meta,
-            )
-            result_writer_seconds = perf_counter() - t_export_start
-            updated_engine_meta["result_writer_seconds"] = float(result_writer_seconds)
-            print(f"[APS][PHASE_TIMING] result_writer={result_writer_seconds:.3f}s")
-
-            result = replace(result, engine_meta=updated_engine_meta)
-            return result
-
-        # =========================================================================
-        # constructive_lns path (existing)
-        # =========================================================================
+        # Single route: constructive_lns only.
         print(f"[APS][constructive_lns] preparing transition templates for constructive graph search")
         print(f"[APS][Profile] name={req.config.model.profile_name}")
-        if req.config.model.profile_name == "constructive_lns_debug_acceptance":
-            print(
-                "[APS][debug_acceptance] using relaxed partial acceptance thresholds for validation only"
-            )
         # Route B: Log bridge expansion mode to prevent future misdiagnosis
         bridge_expansion_mode = str(getattr(req.config.model, "bridge_expansion_mode", "disabled"))
         allow_virtual_bridge = bool(getattr(req.config.model, "allow_virtual_bridge_edge_in_constructive", False))
@@ -1564,10 +1649,10 @@ class ColdRollingPipeline:
         self._print_config_snapshot(req.config)
         if constructive_edge_policy == "direct_only":
             print(
-                f"[APS][constructive_lns] 路线C(direct_only): 只允许 DIRECT_EDGE, 禁用所有桥接边, 快速验证桥接展开是否为 official_exported 唯一障碍")
+                f"[APS][constructive_lns] 璺嚎C(direct_only): 鍙厑璁?DIRECT_EDGE, 绂佺敤鎵€鏈夋ˉ鎺ヨ竟, 蹇€熼獙璇佹ˉ鎺ュ睍寮€鏄惁涓?official_exported 鍞竴闅滅")
         elif constructive_edge_policy == "direct_plus_real_bridge":
             print(
-                f"[APS][constructive_lns] 路线RB(direct_plus_real_bridge): 允许 DIRECT_EDGE + REAL_BRIDGE_EDGE, 禁用 VIRTUAL_BRIDGE_EDGE, bridge_expansion_mode={bridge_expansion_mode}")
+                f"[APS][constructive_lns] 璺嚎RB(direct_plus_real_bridge): 鍏佽 DIRECT_EDGE + REAL_BRIDGE_EDGE, 绂佺敤 VIRTUAL_BRIDGE_EDGE, bridge_expansion_mode={bridge_expansion_mode}")
         else:
             print(
                 f"[APS][constructive_lns] edge_policy={constructive_edge_policy}, bridge_expansion_mode={bridge_expansion_mode}")
@@ -1579,22 +1664,26 @@ class ColdRollingPipeline:
             f"slot_order_hard_cap=({req.config.model.big_roll_slot_hard_order_cap},{req.config.model.small_roll_slot_hard_order_cap}), "
             f"slot_order_penalty={req.config.score.slot_order_count_penalty}"
         )
-        orders_df = prepare_orders_for_model(req.orders_path, req.steel_info_path, req.config)
-        self._print_data_diagnostics(orders_df)
-
-        build_t0 = perf_counter()
-        transition_pack = build_transition_templates(orders_df, req.config)
-        transition_pack = self._attach_candidate_graph(orders_df, transition_pack, req.config)
-        template_build_seconds = perf_counter() - build_t0
-        self._print_template_diagnostics(transition_pack)
-
-        schedule_df, rounds_df, dropped_df, engine_meta = solve_master_model(req, transition_pack=transition_pack,
-                                                                             orders_df=orders_df)
+        world = self._prepare_world(req)
+        orders_df = world.orders_df
+        transition_pack = world.transition_pack
+        template_build_seconds = world.template_build_seconds
+        route = create_route_runner(req.config.model.main_solver_strategy, req.config.model.profile_name)
+        print(
+            f"[APS][ROUTE] route_name={route.route_name}, "
+            f"profile_name={req.config.model.profile_name}, "
+            f"strategy={req.config.model.main_solver_strategy}"
+        )
+        route_result = route.solve(req, world)
+        schedule_df = route_result.schedule_df
+        rounds_df = route_result.rounds_df
+        dropped_df = route_result.dropped_df
+        engine_meta = route_result.engine_meta
         effective_cfg = engine_meta.get("effective_config", req.config) if isinstance(engine_meta, dict) else req.config
         if isinstance(engine_meta, dict) and engine_meta.get(
                 "precheck_autorelax_applied") and effective_cfg is not req.config:
-            transition_pack = build_transition_templates(orders_df, effective_cfg)
-            transition_pack = self._attach_candidate_graph(orders_df, transition_pack, effective_cfg)
+            transition_pack = build_transition_templates(world.graph_orders_df, effective_cfg, unassigned_real_orders=orders_df)
+            transition_pack = self._attach_candidate_graph(world.graph_orders_df, transition_pack, effective_cfg)
         result = ColdRollingResult(
             schedule_df=schedule_df,
             rounds_df=rounds_df,
@@ -1780,17 +1869,17 @@ class ColdRollingPipeline:
                         # routing feasible but hard violations exist
                         updated_engine_meta["failure_mode"] = "FAILED_PARTIAL_ACCEPTANCE_HARD_VIOLATIONS"
                         print(
-                            f"[APS][结果门槛] routing 已可行，但 hard violations 未通过 "
+                            f"[APS][缁撴灉闂ㄦ] routing 宸插彲琛岋紝浣?hard violations 鏈€氳繃 "
                             f"({block_reason}), hard_violations={partial_eval['hard_violation_count_total']}, "
-                            f"结果降级为 BEST_SEARCH_CANDIDATE_ANALYSIS"
+                            f"缁撴灉闄嶇骇涓?BEST_SEARCH_CANDIDATE_ANALYSIS"
                         )
                     else:
                         # routing feasible, no hard violations, but soft threshold not met
                         updated_engine_meta["failure_mode"] = "FAILED_PARTIAL_ACCEPTANCE_SOFT_THRESHOLD_NOT_MET"
                         print(
-                            f"[APS][结果门槛] routing 已可行，但 partial acceptance 软阈值未通过 "
+                            f"[APS][缁撴灉闂ㄦ] routing 宸插彲琛岋紝浣?partial acceptance 杞槇鍊兼湭閫氳繃 "
                             f"({block_reason}), hard_violations={partial_eval['hard_violation_count_total']}, "
-                            f"结果降级为 BEST_SEARCH_CANDIDATE_ANALYSIS"
+                            f"缁撴灉闄嶇骇涓?BEST_SEARCH_CANDIDATE_ANALYSIS"
                         )
                     updated_engine_meta["result_acceptance_status"] = "BEST_SEARCH_CANDIDATE_ANALYSIS"
                     updated_engine_meta["result_usage"] = "ANALYSIS_ONLY"
@@ -2053,7 +2142,7 @@ class ColdRollingPipeline:
                     export_path = result.output_path.with_name(
                         f"{result.output_path.stem}{suffix}{result.output_path.suffix}"
                     )
-                    print(f"[APS][结果门槛] routing 不可行，结果仅按调试输出导出: {export_path}")
+                    print(f"[APS][缁撴灉闂ㄦ] routing 涓嶅彲琛岋紝缁撴灉浠呮寜璋冭瘯杈撳嚭瀵煎嚭: {export_path}")
                     analysis_exported = True
                     official_exported = False
                     result_usage = "ANALYSIS_ONLY"
@@ -2061,7 +2150,7 @@ class ColdRollingPipeline:
                     export_path = result.output_path.with_name(
                         f"{result.output_path.stem}{suffix}{result.output_path.suffix}"
                     )
-                    print(f"[APS][结果门槛] routing 不可行，结果按分析用途导出: {export_path}")
+                    print(f"[APS][缁撴灉闂ㄦ] routing 涓嶅彲琛岋紝缁撴灉鎸夊垎鏋愮敤閫斿鍑? {export_path}")
                     analysis_exported = True
                     official_exported = False
                     result_usage = "ANALYSIS_ONLY"
@@ -2069,7 +2158,7 @@ class ColdRollingPipeline:
                     final_export_performed = False
                     analysis_exported = False
                     result_usage = "NOT_EXPORTED"
-                    print("[APS][结果门槛] routing 不可行，已禁止失败结果导出")
+                    print("[APS][EXPORT_GATE] routing infeasible and export disabled")
             elif acceptance_status == "BEST_SEARCH_CANDIDATE_ANALYSIS":
                 # Class B: routing feasible but partial acceptance failed
                 suffix = "_PARTIAL_ACCEPTANCE_FAILED_ANALYSIS"
@@ -2077,8 +2166,10 @@ class ColdRollingPipeline:
                     export_path = result.output_path.with_name(
                         f"{result.output_path.stem}_BEST_SEARCH_CANDIDATE_ANALYSIS{result.output_path.suffix}"
                     )
-                    print(f"[APS][结果门槛] routing 已可行，但 partial acceptance 未通过，"
-                          f"结果降级为 BEST_SEARCH_CANDIDATE_ANALYSIS，该文件仅用于调优分析: {export_path}")
+                    print(
+                        f"[APS][EXPORT_GATE] routing feasible but partial acceptance failed, "
+                        f"export best candidate analysis: {export_path}"
+                    )
                     analysis_exported = True
                     official_exported = False
                     result_usage = "ANALYSIS_ONLY"
@@ -2086,8 +2177,10 @@ class ColdRollingPipeline:
                     export_path = result.output_path.with_name(
                         f"{result.output_path.stem}{suffix}{result.output_path.suffix}"
                     )
-                    print(f"[APS][结果门槛] routing 已可行，但 partial acceptance 未通过，"
-                          f"结果按分析用途导出: {export_path}")
+                    print(
+                        f"[APS][EXPORT_GATE] routing feasible but partial acceptance failed, "
+                        f"export analysis: {export_path}"
+                    )
                     analysis_exported = True
                     official_exported = False
                     result_usage = "ANALYSIS_ONLY"
@@ -2095,8 +2188,10 @@ class ColdRollingPipeline:
                     export_path = result.output_path.with_name(
                         f"{result.output_path.stem}{suffix}{result.output_path.suffix}"
                     )
-                    print(f"[APS][结果门槛] routing 已可行，但 partial acceptance 未通过，"
-                          f"结果按调试用途导出: {export_path}")
+                    print(
+                        f"[APS][EXPORT_GATE] routing feasible but partial acceptance failed, "
+                        f"export debug file: {export_path}"
+                    )
                     analysis_exported = True
                     official_exported = False
                     result_usage = "ANALYSIS_ONLY"
@@ -2104,14 +2199,14 @@ class ColdRollingPipeline:
                     final_export_performed = False
                     analysis_exported = False
                     result_usage = "NOT_EXPORTED"
-                    print("[APS][结果门槛] routing 已可行，但 partial acceptance 未通过，已禁止导出")
+                    print("[APS][EXPORT_GATE] partial acceptance failed and export disabled")
             else:
                 # routing_feasible=True, acceptance_status not official, and all export flags off
                 final_export_performed = False
                 official_exported = False
                 analysis_exported = False
                 result_usage = "NOT_EXPORTED"
-                print("[APS][结果门槛] routing 已可行，但 acceptance 状态异常，已禁止导出")
+                print("[APS][EXPORT_GATE] unexpected acceptance status with export disabled")
         else:
             official_exported = True
             analysis_exported = False
@@ -2282,8 +2377,8 @@ class ColdRollingPipeline:
             "bridgeability_route_suggestion",
             "bridgeability_census",
             "bridgeability_census_items",
-            # ---- Legacy virtual pilot: 已降级为单一总字段 ----
-            # 旧有 ~45 个 virtual_pilot 细项字段已从此处移除
+            # ---- Legacy virtual pilot: 宸查檷绾т负鍗曚竴鎬诲瓧娈?----
+            # 鏃ф湁 ~45 涓?virtual_pilot 缁嗛」瀛楁宸蹭粠姝ゅ绉婚櫎
             "conservative_apply_attempt_count",
             "conservative_apply_success_count",
             "conservative_apply_reject_count",
@@ -2344,12 +2439,12 @@ class ColdRollingPipeline:
         diagnostics["validation_summary"] = dict(summary)
         if bool(em.get("best_candidate_available", False)) and int(em.get("candidate_schedule_rows", 0) or 0) > 0:
             print(
-                f"[APS][候选导出] candidate_schedule_available=True, rows={int(em.get('candidate_schedule_rows', 0))}, "
+                f"[APS][鍊欓€夊鍑篯 candidate_schedule_available=True, rows={int(em.get('candidate_schedule_rows', 0))}, "
                 f"big_roll_rows={int(em.get('candidate_big_roll_rows', 0))}, "
                 f"small_roll_rows={int(em.get('candidate_small_roll_rows', 0))}"
             )
         print(
-            f"[APS][运行诊断] profile={req.config.model.profile_name}, "
+            f"[APS][杩愯璇婃柇] profile={req.config.model.profile_name}, "
             f"engine={em.get('engine_used', 'unknown')}, main_path={em.get('main_path', 'unknown')}, "
             f"local_router={em.get('local_routing_role', 'not_used')}, "
             f"routing_feasible={routing_feasible}, "
@@ -2375,9 +2470,9 @@ class ColdRollingPipeline:
             f"low_slots={diagnostics.get('slot', {}).get('low_slot_count', 0)}"
         )
         if str(em.get("result_acceptance_status", "")) == "PARTIAL_SCHEDULE_WITH_DROPS":
-            print("[APS][结果门槛] 本轮为部分可接受结果，已剔除部分高风险物料")
+            print("[APS][EXPORT_GATE] partial schedule with drops was accepted")
         print(
-            f"[APS][耗时] template_build_seconds={em.get('template_build_seconds', 0.0):.3f}, "
+            f"[APS][鑰楁椂] template_build_seconds={em.get('template_build_seconds', 0.0):.3f}, "
             f"joint_master_seconds={em.get('joint_master_seconds', 0.0):.3f}, "
             f"local_router_seconds={em.get('local_router_seconds', 0.0):.3f}, "
             f"fallback_total_seconds={em.get('fallback_total_seconds', 0.0):.3f}, "
@@ -2409,7 +2504,7 @@ class ColdRollingPipeline:
         if bool(em.get("final_export_performed", False)):
             if str(em.get("result_usage", "")) == "ANALYSIS_ONLY" and bool(em.get("best_candidate_available", False)):
                 print(
-                    "[APS][候选导出] candidate_schedule_exported=True, "
+                    "[APS][鍊欓€夊鍑篯 candidate_schedule_exported=True, "
                     "candidate_line_summary_exported=True, candidate_violation_summary_exported=True"
                 )
             t_export_start = perf_counter()

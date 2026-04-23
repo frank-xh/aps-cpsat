@@ -39,7 +39,7 @@ class SolveConfig:
     time_limit_seconds: float = 20.0
     
     # Validation/experiment fields
-    profile_name: str = "constructive_lns_search"
+    profile_name: str = "constructive_lns_virtual_guarded_frontload"
     main_solver_strategy: str | None = None
     
     # 主模型编排参数：控制外层编排复杂度，默认保持轻量。

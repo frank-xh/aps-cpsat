@@ -409,9 +409,49 @@ def build_candidate_graph(
             bridge_family_counts[fam] = bridge_family_counts.get(fam, 0) + 1
 
     final_type_counts = Counter(edge.edge_type for edge in final_edges)
+    def _is_virtual_record(rec: dict[str, Any]) -> bool:
+        raw = rec.get("is_virtual", False)
+        if pd.isna(raw):
+            raw = False
+        return bool(raw) or str(rec.get("virtual_origin", "")) == "prebuilt_inventory"
+
+    virtual_node_ids = {
+        str(rec.get("order_id", ""))
+        for rec in order_map.values()
+        if _is_virtual_record(rec)
+    }
+    virtual_edge_count = 0
+    virtual_virtual_edge_count = 0
+    real_virtual_edge_count = 0
+    virtual_real_edge_count = 0
+    for edge in final_edges:
+        from_virtual = str(edge.from_order_id) in virtual_node_ids
+        to_virtual = str(edge.to_order_id) in virtual_node_ids
+        if from_virtual or to_virtual:
+            virtual_edge_count += 1
+        if from_virtual and to_virtual:
+            virtual_virtual_edge_count += 1
+        elif (not from_virtual) and to_virtual:
+            real_virtual_edge_count += 1
+        elif from_virtual and (not to_virtual):
+            virtual_real_edge_count += 1
+    real_bridge_capable_orders = set()
+    for edge in final_edges:
+        if edge.edge_type != REAL_BRIDGE_EDGE:
+            continue
+        if str(edge.from_order_id) not in virtual_node_ids:
+            real_bridge_capable_orders.add(str(edge.from_order_id))
+        if str(edge.to_order_id) not in virtual_node_ids:
+            real_bridge_capable_orders.add(str(edge.to_order_id))
 
     diagnostics = {
         "candidate_graph_edge_count": int(len(final_edges)),
+        "candidate_graph_virtual_node_count": int(len(virtual_node_ids)),
+        "candidate_graph_virtual_edge_count": int(virtual_edge_count),
+        "candidate_graph_virtual_virtual_edge_count": int(virtual_virtual_edge_count),
+        "candidate_graph_real_virtual_edge_count": int(real_virtual_edge_count),
+        "candidate_graph_virtual_real_edge_count": int(virtual_real_edge_count),
+        "candidate_graph_real_bridge_capable_order_count": int(len(real_bridge_capable_orders)),
         "candidate_graph_direct_edge_count": int(final_type_counts.get(DIRECT_EDGE, 0)),
         "candidate_graph_real_bridge_edge_count": int(final_type_counts.get(REAL_BRIDGE_EDGE, 0)),
         "candidate_graph_virtual_bridge_family_edge_count": int(final_type_counts.get(VIRTUAL_BRIDGE_FAMILY_EDGE, 0)),
