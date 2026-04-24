@@ -76,7 +76,74 @@ def _line_allowed(order: dict[str, Any], line: str | None) -> bool:
     return True
 
 
-def edge_passes_final_hard_rules(
+def _has_value(value: Any) -> bool:
+    try:
+        return not pd.isna(value)
+    except Exception:
+        return value is not None
+
+
+def _rejection_counter_template() -> dict[str, int]:
+    return {
+        "rejected_line_capability": 0,
+        "rejected_width_increase": 0,
+        "rejected_width_drop": 0,
+        "rejected_thickness": 0,
+        "rejected_temp": 0,
+        "rejected_group": 0,
+        "rejected_virtual_chain": 0,
+        "rejected_reverse_budget": 0,
+        "rejected_bridge_budget": 0,
+        "rejected_contract": 0,
+        "other": 0,
+    }
+
+
+def accumulate_adj_hard_filter_rejection(counter: dict[str, int] | None, reason: str) -> dict[str, int]:
+    counts = dict(counter or _rejection_counter_template())
+    key = str(reason or "")
+    if key == "FINAL_LINE_CAPABILITY_RULE":
+        counts["rejected_line_capability"] += 1
+    elif key == "FINAL_WIDTH_RULE":
+        counts["rejected_width_increase"] += 1
+    elif key == "FINAL_WIDTH_DROP_RULE":
+        counts["rejected_width_drop"] += 1
+    elif key == "FINAL_THICKNESS_RULE":
+        counts["rejected_thickness"] += 1
+    elif key == "FINAL_TEMP_RULE":
+        counts["rejected_temp"] += 1
+    elif key == "FINAL_GROUP_RULE":
+        counts["rejected_group"] += 1
+    elif key in {"FINAL_VIRTUAL_CHAIN_RULE", "FINAL_VIRTUAL_RATIO_RULE"}:
+        counts["rejected_virtual_chain"] += 1
+    elif key == "FINAL_REVERSE_WIDTH_BUDGET_RULE":
+        counts["rejected_reverse_budget"] += 1
+    elif key == "FINAL_BRIDGE_BUDGET_RULE":
+        counts["rejected_bridge_budget"] += 1
+    elif key == "FINAL_DATA_CONTRACT_RULE":
+        counts["rejected_contract"] += 1
+    else:
+        counts["other"] += 1
+    return counts
+
+
+def log_adj_hard_filter(stage: str, counter: dict[str, int] | None) -> None:
+    counts = dict(counter or _rejection_counter_template())
+    print(
+        f"[APS][ADJ_HARD_FILTER] stage={stage}, "
+        f"rejected_width_increase={int(counts.get('rejected_width_increase', 0))}, "
+        f"rejected_temp={int(counts.get('rejected_temp', 0))}, "
+        f"rejected_thickness={int(counts.get('rejected_thickness', 0))}, "
+        f"rejected_group={int(counts.get('rejected_group', 0))}, "
+        f"rejected_line_capability={int(counts.get('rejected_line_capability', 0))}, "
+        f"rejected_virtual_chain={int(counts.get('rejected_virtual_chain', 0))}, "
+        f"rejected_reverse_budget={int(counts.get('rejected_reverse_budget', 0))}, "
+        f"rejected_bridge_budget={int(counts.get('rejected_bridge_budget', 0))}, "
+        f"rejected_contract={int(counts.get('rejected_contract', 0))}"
+    )
+
+
+def is_hard_adjacent_feasible(
     prev_order: dict[str, Any] | None,
     next_order: dict[str, Any] | None,
     cfg,
@@ -100,13 +167,17 @@ def edge_passes_final_hard_rules(
     if not _line_allowed(prev, line) or not _line_allowed(nxt, line):
         return False, "FINAL_LINE_CAPABILITY_RULE"
 
+    required_fields = ("width", "thickness", "temp_min", "temp_max", "steel_group")
+    if any(not _has_value(prev.get(field)) or not _has_value(nxt.get(field)) for field in required_fields):
+        return False, "FINAL_DATA_CONTRACT_RULE"
+
     prev_width = _as_float(prev.get("width"))
     next_width = _as_float(nxt.get("width"))
     if next_width > prev_width:
         return False, "FINAL_WIDTH_RULE"
     max_drop = _as_float(getattr(rule, "max_width_drop", 250.0), 250.0)
     if prev_width - next_width > max_drop:
-        return False, "FINAL_WIDTH_RULE"
+        return False, "FINAL_WIDTH_DROP_RULE"
 
     if not _thickness_ok(_as_float(prev.get("thickness")), _as_float(nxt.get("thickness"))):
         return False, "FINAL_THICKNESS_RULE"
@@ -134,7 +205,28 @@ def edge_passes_final_hard_rules(
         if not (has_bridge_evidence or explicit_ok or prev_group in pc_groups or next_group in pc_groups):
             return False, "FINAL_GROUP_RULE"
 
+    reverse_budget = ctx.get("max_reverse_width_count")
+    reverse_used = int(_as_float(ctx.get("reverse_width_count", 0), 0))
+    reverse_cost = int(_as_float(ctx.get("reverse_width_cost", 0), 0))
+    if reverse_budget is not None and reverse_used + reverse_cost > int(_as_float(reverse_budget, 0), 0):
+        return False, "FINAL_REVERSE_WIDTH_BUDGET_RULE"
+
+    bridge_budget = ctx.get("bridge_count_budget")
+    bridge_used = int(_as_float(ctx.get("bridge_count_used", 0), 0))
+    bridge_cost = int(_as_float(ctx.get("bridge_count", 0), 0))
+    if bridge_budget is not None and bridge_used + bridge_cost > int(_as_float(bridge_budget, 0), 0):
+        return False, "FINAL_BRIDGE_BUDGET_RULE"
+
     return maybe_chain_passes_virtual_limits(prev, nxt, cfg, ctx)
+
+
+def edge_passes_final_hard_rules(
+    prev_order: dict[str, Any] | None,
+    next_order: dict[str, Any] | None,
+    cfg,
+    context: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    return is_hard_adjacent_feasible(prev_order, next_order, cfg, context)
 
 
 def maybe_chain_passes_virtual_limits(
@@ -173,4 +265,4 @@ def sequence_pair_passes_final_hard_rules(
     cfg,
     context: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
-    return edge_passes_final_hard_rules(prev_order, next_order, cfg, context)
+    return is_hard_adjacent_feasible(prev_order, next_order, cfg, context)

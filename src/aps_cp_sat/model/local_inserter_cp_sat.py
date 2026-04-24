@@ -31,7 +31,11 @@ import pandas as pd
 from ortools.sat.python import cp_model
 
 from aps_cp_sat.config import PlannerConfig
-from aps_cp_sat.model.edge_hard_filter import edge_passes_final_hard_rules
+from aps_cp_sat.model.edge_hard_filter import (
+    accumulate_adj_hard_filter_rejection,
+    edge_passes_final_hard_rules,
+    log_adj_hard_filter,
+)
 from aps_cp_sat.model.local_router import _template_total_cost
 
 
@@ -237,6 +241,7 @@ class _StrictTemplateGraph:
         self.rebuild_repair_family_edge_keys_used_count: int = 0
         self.order_context_by_id: Dict[str, dict] = dict(getattr(req, "order_context_by_id", {}) or {})
         self.rejected_arcs_by_hard_filter: int = 0
+        self.adj_hard_filter_rejections: dict[str, int] = {}
 
         # Determine edge policy string
         # Policy determines which arc types are allowed in local inserter:
@@ -335,6 +340,9 @@ class _StrictTemplateGraph:
                 )
                 if not hard_ok:
                     self.rejected_arcs_by_hard_filter += 1
+                    self.adj_hard_filter_rejections = accumulate_adj_hard_filter_rejection(
+                        self.adj_hard_filter_rejections, _hard_reason
+                    )
                     continue
 
             # Guarded family: apply request-level + profile-level eligibility checks
@@ -421,6 +429,7 @@ class _StrictTemplateGraph:
             self.edges.append(edge_info)
             self.outgoing[from_idx].append(edge_info)
             self.incoming[to_idx].append(edge_info)
+        log_adj_hard_filter("local_cpsat_graph_build", self.adj_hard_filter_rejections)
 
     def has_outgoing(self, idx: int) -> bool:
         return len(self.outgoing.get(idx, [])) > 0

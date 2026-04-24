@@ -46,6 +46,20 @@ class ConstructiveLnsRouteRunner(BaseRouteRunner):
             "constructive_lns_alns_enable_virtual_inventory_moves",
             bool(getattr(req.config.model, "constructive_lns_alns_enable_virtual_inventory_moves", False)),
         )
+        # Keep original order metadata available for decode/final audit column recovery.
+        # The constructive_lns schedule rows are intentionally lightweight; final
+        # validation columns such as temp_min/temp_max must be recovered from the
+        # normalized graph orders rather than silently backfilled as missing.
+        meta.setdefault("source_orders_df", world.graph_orders_df.copy())
+        meta.setdefault("graph_orders_df", world.graph_orders_df.copy())
+        meta.setdefault(
+            "order_lookup",
+            {
+                str(row.get("order_id", "")): dict(row)
+                for row in world.graph_orders_df.to_dict("records")
+                if str(row.get("order_id", "") or "")
+            },
+        )
         for key, value in world.candidate_graph_diagnostics.items():
             meta.setdefault(key, value)
         for key, value in world.shared_diagnostics.items():

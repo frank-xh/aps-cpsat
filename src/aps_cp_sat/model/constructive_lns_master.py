@@ -36,6 +36,7 @@ from aps_cp_sat.model.campaign_cutter import (
     CampaignSegment,
     cut_sequences_into_campaigns,
     _validate_segment_template_pairs,
+    is_near_viable_segment,
 )
 from aps_cp_sat.model.constructive_sequence_builder import (
     ConstructiveBuildResult,
@@ -47,6 +48,9 @@ from aps_cp_sat.model.local_inserter_cp_sat import (
     LocalInsertRequest,
     solve_local_insertion_subproblem,
 )
+from aps_cp_sat.model.seed_scoring import compute_seed_business_score
+from aps_cp_sat.model.virtual_order_utils import is_effective_virtual_order
+from aps_cp_sat.model.edge_hard_filter import sequence_pair_passes_final_hard_rules
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +93,64 @@ class NeighborhoodType(Enum):
     WIDTH_TENSION_HOTSPOT = "WIDTH_TENSION_HOTSPOT"   # Width tension / drop-pressure (family edge candidate)
     GROUP_SWITCH_HOTSPOT = "GROUP_SWITCH_HOTSPOT"      # Group switch pressure (family edge candidate)
     BRIDGE_DEPENDENT_SEGMENT = "BRIDGE_DEPENDENT_SEGMENT"  # Segments with many bridge edges
+    UNDERFILLED_FRAGMENT_STITCH = "UNDERFILLED_FRAGMENT_STITCH"  # Stitch underfilled fragments into valid campaigns
+
+
+def _rank_alns_candidate_orders(
+    candidate_ids: Sequence[str],
+    *,
+    orders_df: pd.DataFrame,
+    line: str,
+    cfg: PlannerConfig,
+    target_gap_tons: float = 0.0,
+) -> list[str]:
+    """业务化排序 repair 候选，优先 near-viable rescue、宽到窄、可延展。"""
+    if not candidate_ids or orders_df.empty or "order_id" not in orders_df.columns:
+        return list(candidate_ids)
+    line_df = orders_df.copy()
+    line_cap = line_df.get("line_capability")
+    if line_cap is not None:
+        mask = (
+            line_cap.astype(str).isin(["dual", "both", "either", "", "big", "big_only", "large"])
+            if line == "big_roll"
+            else line_cap.astype(str).isin(["dual", "both", "either", "", "small", "small_only"])
+        )
+        line_df = line_df[mask].copy()
+    order_lookup = {
+        str(row.get("order_id", "")): dict(row)
+        for row in line_df.to_dict("records")
+    }
+    ranked: list[tuple[float, str]] = []
+    for oid in list(dict.fromkeys(candidate_ids)):
+        row = order_lookup.get(str(oid))
+        if not row:
+            ranked.append((0.0, str(oid)))
+            continue
+        seed_score = compute_seed_business_score(row, line_df, None, cfg)
+        tons = float(row.get("tons", 0.0) or 0.0)
+        ton_fit = 0.0
+        if target_gap_tons > 0:
+            ton_fit = max(0.0, min(1.0, min(target_gap_tons, tons) / max(1.0, target_gap_tons)))
+        extendability = float(seed_score.get("extendability_score", 0.0) or 0.0)
+        formability = float(seed_score.get("tonnage_formability_score", 0.0) or 0.0)
+        reverse_friendly = float(seed_score.get("reverse_budget_friendliness_score", 0.0) or 0.0)
+        virtual_penalty = 0.45 if is_effective_virtual_order(row) else 0.0
+        if bool(getattr(cfg.model, "constructive_lns_alns_enable_virtual_inventory_moves", False)) and target_gap_tons > 0:
+            # In ALNS rescue windows, virtual inventory may be useful for underfilled segments.
+            # Keep a penalty, but make it controllable rather than prohibitive.
+            if target_gap_tons <= float(getattr(cfg.model, "tail_repair_gap_limit_tons", 220.0) or 220.0):
+                virtual_penalty = 0.18 if is_effective_virtual_order(row) else 0.0
+        total = (
+            float(seed_score.get("seed_score_total", 0.0))
+            + (0.30 * ton_fit)
+            + (0.22 * extendability)
+            + (0.12 * formability)
+            + (0.08 * reverse_friendly)
+            - virtual_penalty
+        )
+        ranked.append((float(total), str(oid)))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [oid for _, oid in ranked]
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +194,7 @@ def should_enable_virtual_family_for_neighborhood(
         NeighborhoodType.LOW_FILL_SEGMENT,
         NeighborhoodType.HIGH_DROP_PRESSURE,
         NeighborhoodType.GROUP_SWITCH_HOTSPOT,
+        NeighborhoodType.UNDERFILLED_FRAGMENT_STITCH,
     }
     secondary_neighborhoods = {
         NeighborhoodType.WIDTH_TENSION_HOTSPOT,
@@ -201,6 +264,7 @@ def should_run_local_cpsat(
         NeighborhoodType.GROUP_SWITCH_HOTSPOT,
         NeighborhoodType.WIDTH_TENSION_HOTSPOT,
         NeighborhoodType.BRIDGE_DEPENDENT_SEGMENT,
+        NeighborhoodType.UNDERFILLED_FRAGMENT_STITCH,
     }
     if neighborhood not in cpsat_eligible_neighborhoods:
         return False, f"NEIGHBORHOOD_NOT_ELIGIBLE({neighborhood.value})"
@@ -1292,25 +1356,33 @@ def _select_neighborhood(
     ton_min = float(cfg.rule.campaign_ton_min)
     ton_max = float(cfg.rule.campaign_ton_max)
 
+    active_underfilled = [
+        s for s in segments
+        if bool(getattr(s, "order_ids", []) or []) and (not bool(getattr(s, "is_valid", True)) or float(getattr(s, "total_tons", 0.0) or 0.0) < ton_min)
+    ]
+
     # ---- LOW_FILL_SEGMENT / TAIL_REBALANCE: use underfilled_bias_segs if available ----
     if strategy == NeighborhoodType.TAIL_REBALANCE and underfilled_bias_segs:
-        # Prioritize underfilled segments, then fall back to valid segments near min
-        scored: List[Tuple[float, CampaignSegment]] = []
-        underfilled_ids = {s.campaign_local_id for s in underfilled_bias_segs if not s.is_valid}
+        # Prioritize active underfilled fragments before valid near-min segments.
+        # valid 733t campaigns are already usable; an underfilled 538t fragment
+        # must not lose the target selection merely because its gap is larger.
+        scored: List[Tuple[tuple, CampaignSegment]] = []
+        underfilled_ids = {
+            (str(s.line), int(s.campaign_local_id))
+            for s in underfilled_bias_segs
+            if bool(getattr(s, "order_ids", []) or [])
+        }
+        for seg in active_underfilled:
+            key = (str(seg.line), int(seg.campaign_local_id))
+            if key in underfilled_ids:
+                scored.append(((0, abs(ton_min - float(seg.total_tons)), -float(seg.total_tons), str(seg.line), int(seg.campaign_local_id)), seg))
         valid_segs = [s for s in segments if s.is_valid]
 
-        # Score underfilled segments: smallest gap to min = highest priority
         for seg in valid_segs:
-            if seg.campaign_local_id in underfilled_ids:
-                gap = ton_min - seg.total_tons
-                score = gap  # Smaller gap = lower score = higher priority
-                scored.append((score, seg))
-            else:
-                # Also consider near-min valid segments
-                if seg.total_tons >= ton_min:
-                    fr = seg.total_tons / ton_min if ton_min > 0 else 0.0
-                    score = abs(fr - 1.0) * 100  # Scale up so near-min still gets priority
-                    scored.append((score, seg))
+            if seg.total_tons >= ton_min:
+                fr = seg.total_tons / ton_min if ton_min > 0 else 0.0
+                score = abs(fr - 1.0) * 100
+                scored.append(((1, score, -float(seg.total_tons), str(seg.line), int(seg.campaign_local_id)), seg))
 
         if not scored:
             # Fall back to all valid segments sorted by fill ratio
@@ -1326,24 +1398,27 @@ def _select_neighborhood(
 
     # ---- Standard selection for other strategies ----
     valid_segs = [s for s in segments if s.is_valid]
-    if not valid_segs:
+    selectable_segs = list(valid_segs)
+    if strategy in {
+        NeighborhoodType.LOW_FILL_SEGMENT,
+        NeighborhoodType.TAIL_REBALANCE,
+        NeighborhoodType.BRIDGE_DEPENDENT_SEGMENT,
+        NeighborhoodType.UNDERFILLED_FRAGMENT_STITCH,
+    }:
+        selectable_segs = active_underfilled + [s for s in valid_segs if s not in active_underfilled]
+    if not selectable_segs:
         return []
 
     scored = []
-    for seg in valid_segs:
+    for seg in selectable_segs:
         if strategy == NeighborhoodType.LOW_FILL_SEGMENT:
-            # Enhanced multi-criteria scoring:
-            #   a) gap_to_min: how much below ton_min (0 if above min)
-            gap_to_min = max(0.0, ton_min - seg.total_tons)
-            #   b) fill ratio score: closer to 1.0 = lower score
-            if seg.total_tons >= ton_min:
-                fill_ratio = seg.total_tons / ton_min if ton_min > 0 else 0.0
-                fill_score = abs(fill_ratio - 1.0) * 50
+            is_active = (not bool(getattr(seg, "is_valid", True))) or float(seg.total_tons) < ton_min
+            if is_active:
+                # Underfilled first, then closest to 700t, then larger tonnage.
+                score = (0, abs(ton_min - float(seg.total_tons)), -float(seg.total_tons), str(seg.line), int(seg.campaign_local_id))
             else:
-                fill_score = 0.0  # underfilled: highest priority
-            # Combined: prioritize by gap (underfilled first), then by fill ratio
-            # Scale gap to put underfilled segments clearly ahead
-            score = gap_to_min + fill_score
+                fill_ratio = seg.total_tons / ton_min if ton_min > 0 else 0.0
+                score = (1, abs(fill_ratio - 1.0) * 100, -float(seg.total_tons), str(seg.line), int(seg.campaign_local_id))
             scored.append((score, seg))
 
         elif strategy == NeighborhoodType.HIGH_DROP_PRESSURE:
@@ -1377,29 +1452,43 @@ def _select_neighborhood(
                 scored.append((0.0, seg))
 
         elif strategy == NeighborhoodType.BRIDGE_DEPENDENT_SEGMENT:
-            # Score by how underfilled + bridge edge dependent the segment is
-            ton_min = float(cfg.rule.campaign_ton_min)
-            gap = max(0.0, ton_min - seg.total_tons)
-            # Also prefer segments with many orders (more candidates to disrupt)
-            order_count_factor = len(seg.order_ids) / 10.0
-            score = gap + order_count_factor
+            is_active = (not bool(getattr(seg, "is_valid", True))) or float(seg.total_tons) < ton_min
+            if is_active:
+                score = (0, abs(ton_min - float(seg.total_tons)), -len(seg.order_ids), str(seg.line), int(seg.campaign_local_id))
+            else:
+                gap = max(0.0, ton_min - seg.total_tons)
+                order_count_factor = len(seg.order_ids) / 10.0
+                score = (1, gap - order_count_factor, str(seg.line), int(seg.campaign_local_id))
+            scored.append((score, seg))
+
+        elif strategy == NeighborhoodType.UNDERFILLED_FRAGMENT_STITCH:
+            is_active = (not bool(getattr(seg, "is_valid", True))) or float(seg.total_tons) < ton_min
+            if not is_active:
+                score = (1, 999999.0, str(seg.line), int(seg.campaign_local_id))
+            else:
+                score = (0, abs(ton_min - float(seg.total_tons)), -float(seg.total_tons), str(seg.line), int(seg.campaign_local_id))
             scored.append((score, seg))
 
         elif strategy == NeighborhoodType.TAIL_REBALANCE:
-            # Pick segments that are closest to ton_min (tail candidates).
-            if seg.total_tons >= ton_min:
-                fill_ratio = seg.total_tons / ton_min if ton_min > 0 else 0.0
-                score = abs(fill_ratio - 1.0)
-                scored.append((score, seg))
+            is_active = (not bool(getattr(seg, "is_valid", True))) or float(seg.total_tons) < ton_min
+            if is_active:
+                score = (0, abs(ton_min - float(seg.total_tons)), -float(seg.total_tons), str(seg.line), int(seg.campaign_local_id))
             else:
-                scored.append((0.0, seg))
+                fill_ratio = seg.total_tons / ton_min if ton_min > 0 else 0.0
+                score = (1, abs(fill_ratio - 1.0), -float(seg.total_tons), str(seg.line), int(seg.campaign_local_id))
+            scored.append((score, seg))
         else:
             scored.append((0.0, seg))
 
     # Shuffle ties and pick 1-2
     n_pick = rand.randint(1, min(2, len(scored)))
-    if strategy in (NeighborhoodType.LOW_FILL_SEGMENT, NeighborhoodType.TAIL_REBALANCE):
-        scored.sort(key=lambda x: x[0])  # Lower score = higher priority
+    if strategy in (
+        NeighborhoodType.LOW_FILL_SEGMENT,
+        NeighborhoodType.TAIL_REBALANCE,
+        NeighborhoodType.BRIDGE_DEPENDENT_SEGMENT,
+        NeighborhoodType.UNDERFILLED_FRAGMENT_STITCH,
+    ):
+        scored.sort(key=lambda x: x[0])  # Lower tuple = higher priority; active underfilled first.
     else:
         scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -1408,6 +1497,217 @@ def _select_neighborhood(
     top_candidates = scored[:shuffle_range]
     rand.shuffle(top_candidates)
     return [seg for _, seg in top_candidates[:n_pick]]
+
+
+
+def _line_allows_order(line: str, rec: dict) -> bool:
+    cap = str((rec or {}).get("line_capability", "dual") or "dual").lower()
+    if cap in {"dual", "both", "either", ""}:
+        return True
+    if cap in {"big_only", "large", "big"}:
+        return str(line) == "big_roll"
+    if cap in {"small_only", "small"}:
+        return str(line) == "small_roll"
+    return True
+
+
+def _template_row_for_pair(tpl_df: pd.DataFrame, prev_oid: str, next_oid: str) -> dict:
+    if tpl_df is None or tpl_df.empty:
+        return {}
+    if "from_order_id" not in tpl_df.columns or "to_order_id" not in tpl_df.columns:
+        return {}
+    mask = (
+        (tpl_df["from_order_id"].astype(str) == str(prev_oid))
+        & (tpl_df["to_order_id"].astype(str) == str(next_oid))
+    )
+    if not bool(mask.any()):
+        return {}
+    return dict(tpl_df.loc[mask].iloc[0])
+
+
+def _pair_is_stitch_feasible(
+    prev_oid: str,
+    next_oid: str,
+    *,
+    line: str,
+    orders_lookup: dict[str, dict],
+    tpl_df: pd.DataFrame,
+    cfg: PlannerConfig,
+) -> tuple[bool, str]:
+    prev_rec = orders_lookup.get(str(prev_oid), {})
+    next_rec = orders_lookup.get(str(next_oid), {})
+    if not prev_rec or not next_rec:
+        return False, "ORDER_CONTEXT_MISSING"
+    tpl_row = _template_row_for_pair(tpl_df, str(prev_oid), str(next_oid))
+    if not tpl_row:
+        return False, "NO_TEMPLATE_EDGE"
+    ok, reason = sequence_pair_passes_final_hard_rules(
+        prev_rec,
+        next_rec,
+        cfg,
+        {
+            "line": line,
+            "edge_type": str(tpl_row.get("edge_type", "DIRECT_EDGE") or "DIRECT_EDGE"),
+            "template_row": tpl_row,
+            "bridge_count": int(tpl_row.get("bridge_count", 0) or 0),
+            "current_virtual_chain_length": 0,
+            "campaign_order_count": 0,
+            "campaign_virtual_count": 0,
+        },
+    )
+    return bool(ok), str(reason or "")
+
+
+def _try_underfilled_fragment_stitch(
+    current_segs: List[CampaignSegment],
+    orders_df: pd.DataFrame,
+    tpl_df: pd.DataFrame,
+    cfg: PlannerConfig,
+    rand: random.Random,
+) -> tuple[List[CampaignSegment], dict]:
+    """Try stitching two active underfilled fragments into a valid campaign.
+
+    This is intentionally conservative: it only stitches fragments from the same
+    line, preserves internal order, requires template/hard feasibility at the
+    new boundary, and optionally tries one prebuilt virtual coil between them.
+    """
+    diag = {
+        "underfilled_stitch_attempt_count": 0,
+        "underfilled_stitch_success_count": 0,
+        "underfilled_stitch_virtual_success_count": 0,
+        "underfilled_stitch_real_bridge_success_count": 0,
+        "underfilled_stitch_reject_hard_count": 0,
+        "underfilled_stitch_reject_ton_count": 0,
+        "underfilled_stitch_promoted_count": 0,
+    }
+    model = getattr(cfg, "model", None)
+    if not bool(getattr(model, "alns_underfilled_stitch_enabled", True) if model else True):
+        return current_segs, diag
+    if orders_df is None or orders_df.empty or "order_id" not in orders_df.columns:
+        return current_segs, diag
+
+    ton_min = float(cfg.rule.campaign_ton_min)
+    ton_max = float(getattr(model, "alns_underfilled_stitch_max_combined_tons", cfg.rule.campaign_ton_max) if model else cfg.rule.campaign_ton_max)
+    min_combined = float(getattr(model, "alns_underfilled_stitch_min_combined_tons", 650.0) if model else 650.0)
+    max_pairs = int(getattr(model, "alns_underfilled_stitch_max_pairs_per_round", 200) if model else 200)
+    max_virtual_trials = int(getattr(model, "alns_underfilled_stitch_max_bridge_trials", 3) if model else 3)
+    allow_virtual = bool(getattr(model, "alns_underfilled_stitch_allow_virtual", True) if model else True)
+
+    orders_lookup = {str(row.get("order_id")): dict(row) for row in orders_df.to_dict("records")}
+    active = [
+        s for s in current_segs
+        if bool(getattr(s, "order_ids", []) or [])
+        and ((not bool(getattr(s, "is_valid", True))) or float(getattr(s, "total_tons", 0.0) or 0.0) < ton_min)
+    ]
+    active = [s for s in active if float(getattr(s, "total_tons", 0.0) or 0.0) >= float(getattr(model, "alns_underfilled_fragment_min_tons", 80.0) if model else 80.0)]
+    if len(active) < 2:
+        return current_segs, diag
+    active.sort(key=lambda s: (str(s.line), abs(ton_min - float(s.total_tons)), -float(s.total_tons), int(s.campaign_local_id)))
+
+    used_all = {str(oid) for seg in current_segs for oid in getattr(seg, "order_ids", [])}
+    virtual_rows = []
+    if allow_virtual:
+        for rec in orders_df.to_dict("records"):
+            oid = str(rec.get("order_id", "") or "")
+            if not oid or oid in used_all:
+                continue
+            if not is_effective_virtual_order(oid):
+                continue
+            virtual_rows.append(rec)
+
+    attempts = 0
+    for source in active:
+        for target in active:
+            if attempts >= max_pairs:
+                break
+            if source is target:
+                continue
+            if str(source.line) != str(target.line):
+                continue
+            if set(map(str, source.order_ids)) & set(map(str, target.order_ids)):
+                continue
+            combined_tons = float(source.total_tons) + float(target.total_tons)
+            if combined_tons > ton_max + 1e-6:
+                diag["underfilled_stitch_reject_ton_count"] += 1
+                continue
+            if combined_tons < min_combined - 1e-6:
+                continue
+            attempts += 1
+            diag["underfilled_stitch_attempt_count"] += 1
+            line = str(source.line)
+            source_tail = str(source.order_ids[-1])
+            target_head = str(target.order_ids[0])
+            ok, reason = _pair_is_stitch_feasible(source_tail, target_head, line=line, orders_lookup=orders_lookup, tpl_df=tpl_df, cfg=cfg)
+            bridge_orders: list[str] = []
+            bridge_type = "DIRECT"
+            if not ok:
+                diag["underfilled_stitch_reject_hard_count"] += 1
+                if allow_virtual:
+                    tried = 0
+                    for vrec in virtual_rows:
+                        if tried >= max_virtual_trials:
+                            break
+                        if not _line_allows_order(line, vrec):
+                            continue
+                        vid = str(vrec.get("order_id", "") or "")
+                        vtons = float(vrec.get("tons", 0.0) or 0.0)
+                        if combined_tons + vtons > ton_max + 1e-6:
+                            continue
+                        ok1, r1 = _pair_is_stitch_feasible(source_tail, vid, line=line, orders_lookup=orders_lookup, tpl_df=tpl_df, cfg=cfg)
+                        ok2, r2 = _pair_is_stitch_feasible(vid, target_head, line=line, orders_lookup=orders_lookup, tpl_df=tpl_df, cfg=cfg)
+                        tried += 1
+                        print(
+                            f"[APS][BIG_ROLL_VIRTUAL_USE] stage=underfilled_stitch, line={line}, "
+                            f"virtual_order_id={vid}, prev_order={source_tail}, next_order={target_head}, "
+                            f"accepted={bool(ok1 and ok2)}, reject_reason={'' if ok1 and ok2 else (r1 if not ok1 else r2)}"
+                        )
+                        if ok1 and ok2:
+                            ok = True
+                            reason = ""
+                            bridge_orders = [vid]
+                            bridge_type = "VIRTUAL"
+                            combined_tons += vtons
+                            break
+            if ok and ton_min - 1e-6 <= combined_tons <= ton_max + 1e-6:
+                new_orders = list(map(str, source.order_ids)) + bridge_orders + list(map(str, target.order_ids))
+                next_id = max(int(getattr(seg, "campaign_local_id", 0) or 0) for seg in current_segs) + 1
+                new_seg = CampaignSegment(
+                    line=line,
+                    campaign_local_id=next_id,
+                    order_ids=new_orders,
+                    total_tons=combined_tons,
+                    cut_reason=source.cut_reason,
+                    start_order_id=new_orders[0],
+                    end_order_id=new_orders[-1],
+                    edge_count=max(0, len(new_orders) - 1),
+                    is_valid=True,
+                )
+                old_keys = {(str(source.line), int(source.campaign_local_id)), (str(target.line), int(target.campaign_local_id))}
+                updated = [
+                    seg for seg in current_segs
+                    if (str(seg.line), int(seg.campaign_local_id)) not in old_keys
+                ]
+                updated.append(new_seg)
+                diag["underfilled_stitch_success_count"] += 1
+                diag["underfilled_stitch_promoted_count"] += 1
+                if bridge_type == "VIRTUAL":
+                    diag["underfilled_stitch_virtual_success_count"] += 1
+                print(
+                    f"[APS][UNDERFILLED_STITCH] source={source.line}_{source.campaign_local_id}, "
+                    f"target={target.line}_{target.campaign_local_id}, source_tons={source.total_tons:.1f}, "
+                    f"target_tons={target.total_tons:.1f}, combined_tons={combined_tons:.1f}, "
+                    f"bridge_type={bridge_type}, success=True"
+                )
+                return updated, diag
+            else:
+                print(
+                    f"[APS][UNDERFILLED_STITCH] source={source.line}_{source.campaign_local_id}, "
+                    f"target={target.line}_{target.campaign_local_id}, combined_tons={combined_tons:.1f}, "
+                    f"bridge_type={bridge_type}, success=False, reject_reason={reason or 'TON_WINDOW'}"
+                )
+        if attempts >= max_pairs:
+            break
+    return current_segs, diag
 
 
 # ---------------------------------------------------------------------------
@@ -1482,22 +1782,27 @@ def _compute_destroy_count(
     segments: List[CampaignSegment],
     rand: random.Random,
     hotspot_strength: float = 0.0,
+    cfg: PlannerConfig | None = None,
 ) -> int:
     """
-    Compute how many orders to destroy (20%~35% of segment orders).
+    Compute how many orders to destroy, using profile-level ratio configuration.
 
-    Args:
-        segments: Selected segments for destruction.
-        rand: Random generator.
-        hotspot_strength: [0,1] factor that biases destroy count upward when hotspots are strong.
-            - hotspot_strength=0 → use lower end (20%)
-            - hotspot_strength=1 → use upper end (35%)
+    The previous implementation hard-coded 20%~35%.  That made profile
+    parameters look adjustable while the actual ALNS behavior stayed fixed.
+    Keep the same default range, but let constructive_destroy_ratio_min/max
+    drive the real destroy size.
     """
     total = sum(len(s.order_ids) for s in segments if s.is_valid)
     if total == 0:
         return 0
-    base_frac = 0.20 + hotspot_strength * 0.15  # 0.20~0.35
-    frac = rand.uniform(base_frac, min(0.35, base_frac + 0.05))
+    model = getattr(cfg, "model", None) if cfg is not None else None
+    min_frac = float(getattr(model, "constructive_destroy_ratio_min", 0.20) if model else 0.20)
+    max_frac = float(getattr(model, "constructive_destroy_ratio_max", 0.35) if model else 0.35)
+    min_frac = max(0.01, min(0.95, min_frac))
+    max_frac = max(min_frac, min(0.95, max_frac))
+    hotspot_strength = max(0.0, min(1.0, float(hotspot_strength or 0.0)))
+    base_frac = min_frac + hotspot_strength * (max_frac - min_frac)
+    frac = rand.uniform(base_frac, min(max_frac, base_frac + 0.05))
     return max(1, int(total * frac))
 
 
@@ -2522,6 +2827,29 @@ def _run_alns_iteration(
         "graph_unused_repair_success": 0,
         "virtual_node_repair_attempts": 0,
         "virtual_node_repair_success": 0,
+        "neighborhood_hotspot_counts": {},
+        "selected_hotspot_type_counts": {},
+        "near_viable_rescue_attempts": 0,
+        "near_viable_rescue_success": 0,
+        "hopeless_segment_skipped_count": 0,
+        "virtual_hotspot_move_attempts": 0,
+        "virtual_hotspot_move_success": 0,
+        "virtual_hotspot_move_reject_by_penalty": 0,
+        "virtual_hotspot_move_reject_by_hard_rule": 0,
+        "active_underfilled_selected_count": 0,
+        "active_underfilled_promoted_count": 0,
+        "underfilled_stitch_attempt_count": 0,
+        "underfilled_stitch_success_count": 0,
+        "underfilled_stitch_virtual_success_count": 0,
+        "underfilled_stitch_real_bridge_success_count": 0,
+        "underfilled_stitch_reject_hard_count": 0,
+        "underfilled_stitch_reject_ton_count": 0,
+        "underfilled_stitch_promoted_count": 0,
+    }
+    underfilled_before_ids = {
+        (str(seg.line), int(seg.campaign_local_id))
+        for seg in current_segs
+        if bool(getattr(seg, "order_ids", []) or []) and not bool(getattr(seg, "is_valid", True))
     }
 
     # ---- Step 1: Select neighborhood ----
@@ -2540,10 +2868,14 @@ def _run_alns_iteration(
     # LOW_FILL diagnostics: how many candidates were considered
     ton_min = float(cfg.rule.campaign_ton_min)
     if neighborhood == NeighborhoodType.LOW_FILL_SEGMENT and current_segs:
-        valid_segs = [s for s in current_segs if s.is_valid]
-        tail_repair_diag["low_fill_candidates"] = len(valid_segs)
-        if valid_segs:
-            gaps = [max(0.0, ton_min - s.total_tons) for s in valid_segs]
+        low_fill_candidates = [
+            s for s in current_segs
+            if bool(getattr(s, "order_ids", []) or [])
+            and ((not bool(getattr(s, "is_valid", True))) or float(s.total_tons) <= ton_min * 1.15)
+        ]
+        tail_repair_diag["low_fill_candidates"] = len(low_fill_candidates)
+        if low_fill_candidates:
+            gaps = [max(0.0, ton_min - s.total_tons) for s in low_fill_candidates]
             tail_repair_diag["low_fill_avg_gap_to_min"] = round(sum(gaps) / len(gaps), 2)
         if selected:
             tail_repair_diag["low_fill_selected_gap"] = round(
@@ -2560,13 +2892,46 @@ def _run_alns_iteration(
     # ---- Step 2: Compute destroy count with hotspot strength ----
     # Compute per-segment hotspot_strength for destroy count biasing
     primary_seg = selected[0]
+    _primary_is_active_underfilled = (not bool(getattr(primary_seg, "is_valid", True))) or float(getattr(primary_seg, "total_tons", 0.0) or 0.0) < float(cfg.rule.campaign_ton_min)
+    if _primary_is_active_underfilled:
+        tail_repair_diag["active_underfilled_selected_count"] = 1
+    print(
+        f"[APS][ALNS_TARGET] round={round_num}, neighborhood={neighborhood.value}, "
+        f"selected_line={primary_seg.line}, selected_campaign={primary_seg.campaign_local_id}, "
+        f"selected_is_active_underfilled={_primary_is_active_underfilled}, "
+        f"selected_tons={float(primary_seg.total_tons):.1f}, "
+        f"selected_gap_to_min={max(0.0, float(cfg.rule.campaign_ton_min) - float(primary_seg.total_tons)):.1f}, "
+        f"selected_order_count={len(primary_seg.order_ids)}"
+    )
+    if neighborhood == NeighborhoodType.UNDERFILLED_FRAGMENT_STITCH:
+        stitched_segs, stitch_diag = _try_underfilled_fragment_stitch(
+            current_segs=current_segs,
+            orders_df=orders_df,
+            tpl_df=tpl_df,
+            cfg=cfg,
+            rand=rand,
+        )
+        for k, v in stitch_diag.items():
+            tail_repair_diag[k] = int(tail_repair_diag.get(k, 0) or 0) + int(v or 0)
+        accepted_stitch = int(stitch_diag.get("underfilled_stitch_success_count", 0) or 0) > 0
+        if accepted_stitch:
+            tail_repair_diag["active_underfilled_promoted_count"] = int(stitch_diag.get("underfilled_stitch_promoted_count", 0) or 0)
+        return stitched_segs, current_dropped, accepted_stitch, 0, 0, 0, 0, 0, 0, {}, {
+            "filtered_by_capability_count": 0,
+            "filtered_by_connectivity_count": 0,
+            "skipped_already_tried_count": 0,
+        }, tail_repair_diag
+    if is_near_viable_segment(primary_seg, cfg):
+        tail_repair_diag["near_viable_rescue_attempts"] += 1
+    elif float(primary_seg.total_tons) < float(cfg.rule.campaign_ton_min) * 0.65:
+        tail_repair_diag["hopeless_segment_skipped_count"] += 1
     dp_info = None
     if neighborhood == NeighborhoodType.HIGH_DROP_PRESSURE:
         dp_info = _compute_segment_drop_pressure(primary_seg, current_dropped, orders_df, cfg)
     hotspot_strength = _compute_hotspot_strength(
         neighborhood, primary_seg, orders_df, cfg, drop_pressure_info=dp_info
     )
-    destroy_count = _compute_destroy_count(selected, rand, hotspot_strength=hotspot_strength)
+    destroy_count = _compute_destroy_count(selected, rand, hotspot_strength=hotspot_strength, cfg=cfg)
     if destroy_count == 0:
         return current_segs, current_dropped, False, 0, 0, 0, 0, 0, 0, {}, {
             "filtered_by_capability_count": 0,
@@ -2806,7 +3171,9 @@ def _run_alns_iteration(
     _dropped_count = sum(len(v) for v in current_dropped.values())
     _ton_min = float(cfg.rule.campaign_ton_min)
     _underfill_detected = any(
-        s.total_tons < _ton_min for s in new_segs if s.is_valid
+        (not bool(getattr(s, "is_valid", True))) or float(s.total_tons) < _ton_min
+        for s in new_segs
+        if bool(getattr(s, "order_ids", []) or [])
     )
     _drop_pressure_score = float(_dropped_count) / max(1, len(orders_df))
     _total_tons_in_segs = sum(s.total_tons for s in new_segs if s.is_valid)
@@ -2815,9 +3182,9 @@ def _run_alns_iteration(
     _bridge_dependent_segment = False
     # Detect hotspots from segments: wide-to-narrow transitions, group switches, low-fill bridge segments
     for seg in new_segs:
-        if not seg.is_valid or not seg.order_ids:
+        if not seg.order_ids:
             continue
-        if seg.total_tons < _ton_min:
+        if (not seg.is_valid) or seg.total_tons < _ton_min:
             # Underfilled segment may be bridge-dependent
             _bridge_dependent_segment = True
         # Check for group transitions / width tension within segment
@@ -2940,6 +3307,38 @@ def _run_alns_iteration(
         for oid in dropped_pool_candidates:
             round_line_hint_map[oid] = line
 
+        _target_gap_tons = max(0.0, float(cfg.rule.campaign_ton_min) - float(primary_seg.total_tons)) if primary_seg is not None else 0.0
+        hotspot_allows_virtual = neighborhood in {
+            NeighborhoodType.LOW_FILL_SEGMENT,
+            NeighborhoodType.TAIL_REBALANCE,
+            NeighborhoodType.HIGH_DROP_PRESSURE,
+            NeighborhoodType.WIDTH_TENSION_HOTSPOT,
+            NeighborhoodType.GROUP_SWITCH_HOTSPOT,
+            NeighborhoodType.BRIDGE_DEPENDENT_SEGMENT,
+        }
+        if dropped_pool_candidates:
+            _virtual_before = [oid for oid in dropped_pool_candidates if is_effective_virtual_order(str(oid))]
+            if _virtual_before:
+                tail_repair_diag["virtual_hotspot_move_attempts"] = (
+                    tail_repair_diag.get("virtual_hotspot_move_attempts", 0) + len(_virtual_before)
+                )
+            if not hotspot_allows_virtual:
+                dropped_pool_candidates = [
+                    oid for oid in dropped_pool_candidates
+                    if not is_effective_virtual_order(str(oid))
+                ]
+                tail_repair_diag["virtual_hotspot_move_reject_by_penalty"] = (
+                    tail_repair_diag.get("virtual_hotspot_move_reject_by_penalty", 0)
+                    + max(0, len(_virtual_before) - sum(1 for oid in dropped_pool_candidates if is_effective_virtual_order(str(oid))))
+                )
+            dropped_pool_candidates = _rank_alns_candidate_orders(
+                dropped_pool_candidates,
+                orders_df=orders_df,
+                line=line,
+                cfg=cfg,
+                target_gap_tons=_target_gap_tons,
+            )
+
         # Total candidate list for local inserter
         candidate_orders = list(segment_reinsert_candidates) + list(dropped_pool_candidates)
 
@@ -2974,6 +3373,9 @@ def _run_alns_iteration(
                 NeighborhoodType.LOW_FILL_SEGMENT,
                 NeighborhoodType.HIGH_DROP_PRESSURE,
                 NeighborhoodType.GROUP_SWITCH_HOTSPOT,
+                NeighborhoodType.WIDTH_TENSION_HOTSPOT,
+                NeighborhoodType.BRIDGE_DEPENDENT_SEGMENT,
+                NeighborhoodType.TAIL_REBALANCE,
             }
         ))
         _family_reason = (
@@ -3138,6 +3540,8 @@ def _run_alns_iteration(
         if result.status in (InsertStatus.OPTIMAL, InsertStatus.FEASIBLE):
             repair_count += 1
             accepted_ids = set(result.inserted_order_ids)
+            if is_near_viable_segment(primary_seg, cfg) and accepted_ids:
+                tail_repair_diag["near_viable_rescue_success"] += 1
             tail_repair_diag["graph_unused_repair_success"] = (
                 tail_repair_diag.get("graph_unused_repair_success", 0)
                 + len(accepted_ids & set(dropped_pool_candidates))
@@ -3149,6 +3553,10 @@ def _run_alns_iteration(
                     for oid in accepted_ids & set(dropped_pool_candidates)
                     if str(oid).startswith(("VIRTUAL_", "PREBUILT_VIRTUAL_"))
                 )
+            )
+            tail_repair_diag["virtual_hotspot_move_success"] = (
+                tail_repair_diag.get("virtual_hotspot_move_success", 0)
+                + sum(1 for oid in accepted_ids & set(dropped_pool_candidates) if is_effective_virtual_order(str(oid)))
             )
 
             # Rescue candidates that WERE in LNS_REPAIR_REJECTED and got accepted
@@ -3258,6 +3666,12 @@ def _run_alns_iteration(
     # Propagate round-level family stats to tail_repair_diag for consistency
     tail_repair_diag["virtual_family_enabled_for_this_round"] = _allow_guarded_family_this_round
     tail_repair_diag["virtual_family_enable_reason"] = _family_enable_reason
+    underfilled_after_ids = {
+        (str(seg.line), int(seg.campaign_local_id))
+        for seg in new_segs
+        if bool(getattr(seg, "order_ids", []) or []) and not bool(getattr(seg, "is_valid", True))
+    }
+    tail_repair_diag["active_underfilled_promoted_count"] = int(len(underfilled_before_ids - underfilled_after_ids))
 
     return (
         new_segs,
@@ -3563,6 +3977,30 @@ def run_constructive_lns_master(
     # Collect initial segments
     initial_segments: List[CampaignSegment] = list(cut_result.segments)
     underfilled_segments: List[CampaignSegment] = list(cut_result.underfilled_segments)
+    underfilled_total_count = int(len(underfilled_segments))
+    include_underfilled_fragments = bool(getattr(cfg.model, "alns_include_underfilled_fragments", True))
+    underfilled_fragment_max_count = int(getattr(cfg.model, "alns_underfilled_fragment_max_count", 80) or 80)
+    underfilled_fragment_min_tons = float(getattr(cfg.model, "alns_underfilled_fragment_min_tons", 80.0) or 80.0)
+    underfilled_priority_near_min = bool(getattr(cfg.model, "alns_underfilled_fragment_priority_near_min", True))
+    active_underfilled_fragments: List[CampaignSegment] = []
+    if include_underfilled_fragments and underfilled_segments:
+        eligible_underfilled = [
+            seg for seg in underfilled_segments
+            if float(getattr(seg, "total_tons", 0.0) or 0.0) >= underfilled_fragment_min_tons
+            and bool(getattr(seg, "order_ids", []) or [])
+        ]
+        eligible_underfilled.sort(
+            key=lambda seg: (
+                abs(float(cfg.rule.campaign_ton_min) - float(seg.total_tons)) if underfilled_priority_near_min else -float(seg.total_tons),
+                -float(seg.total_tons),
+                str(seg.line),
+                int(seg.campaign_local_id),
+            )
+        )
+        active_underfilled_fragments = list(eligible_underfilled[:underfilled_fragment_max_count])
+    active_underfilled_order_ids: Set[str] = set()
+    for seg in active_underfilled_fragments:
+        active_underfilled_order_ids.update(str(oid) for oid in seg.order_ids)
     recon_diag = {
         "underfilled_reconstruction_enabled": False,
         "underfilled_reconstruction_not_entered_reason": "REMOVED_REPAIR_BRIDGE_POOL_MAINLINE",
@@ -3581,16 +4019,15 @@ def run_constructive_lns_master(
     # Planned = valid segments
     planned_segs: List[CampaignSegment] = list(initial_segments)
 
-    # Dropped: underfilled + dead islands from build
+    # Dropped: dead islands + inactive underfilled tails.
+    # Active underfilled fragments stay occupied in ALNS and are only dropped at finalization.
     # NOTE: build_result.dropped_seed_orders may include orders that WERE placed
     # on the first processed line (big_roll) but appeared as dead islands on the
     # second line (small_roll). We must exclude orders that appear in any chain.
     all_placed_oids: Set[str] = set()
     for seg in initial_segments:
         all_placed_oids.update(seg.order_ids)
-    # Also collect from underfilled (they are dropped, not placed)
-    for seg in underfilled_segments:
-        pass  # not placed
+    all_placed_oids.update(active_underfilled_order_ids)
 
     # Build true dropped set
     dropped_by_reason: Dict[str, List[str]] = {}
@@ -3599,11 +4036,11 @@ def run_constructive_lns_master(
     for oid in no_feasible_oids:
         dropped_by_reason.setdefault(DropReason.NO_FEASIBLE_LINE.value, []).append(oid)
 
-    # TAIL_UNDERFILLED
+    # TAIL_UNDERFILLED: only underfilled fragments not kept active for ALNS
     for seg in underfilled_segments:
-        dropped_by_reason.setdefault(DropReason.TAIL_UNDERFILLED.value, []).extend(
-            seg.order_ids
-        )
+        if any(str(oid) in active_underfilled_order_ids for oid in seg.order_ids):
+            continue
+        dropped_by_reason.setdefault(DropReason.TAIL_UNDERFILLED.value, []).extend(seg.order_ids)
 
     # DEAD_ISLAND_ORDER: only orders that are truly not in any chain
     for dead_order in cut_result.dropped_orders:
@@ -3619,8 +4056,9 @@ def run_constructive_lns_master(
             if oid not in dropped_by_reason.get(DropReason.DEAD_ISLAND_ORDER.value, []):
                 dropped_by_reason.setdefault(DropReason.CONSTRUCTIVE_REJECTED.value, []).append(oid)
 
-    # Recalculate tons for planned segments
+    # Recalculate tons for planned segments and keep active underfilled fragments occupied.
     planned_segs = _recalculate_segment_tons(planned_segs, orders_df)
+    active_underfilled_fragments = _recalculate_segment_tons(active_underfilled_fragments, orders_df)
 
     # Build constructive phase line_hint_map:
     # - TAIL_UNDERFILLED orders: use the segment's line
@@ -3660,13 +4098,25 @@ def run_constructive_lns_master(
     best_snap = _build_snapshot_from_dfs(
         initial_planned_df, initial_dropped_df, orders_df, tpl_df,
     )
-    current_segs = list(planned_segs)
+    current_segs = list(planned_segs) + list(active_underfilled_fragments)
     current_dropped: Dict[str, List[str]] = {
         k: list(v) for k, v in dropped_by_reason.items()
     }
+    active_underfilled_ids_initial = {
+        (str(seg.line), int(seg.campaign_local_id))
+        for seg in active_underfilled_fragments
+        if bool(seg.order_ids)
+    }
+    print(
+        f"[APS][UNDERFILLED_ACTIVE_POOL] total={underfilled_total_count}, "
+        f"eligible={len(active_underfilled_fragments)}, selected_by_alns=0, promoted=0, finally_dropped=0"
+    )
 
     # ---- Step D: ALNS iterations ----
-    n_rounds = getattr(cfg.model, "rounds", 8) or 8
+    n_rounds = max(
+        int(getattr(cfg.model, "rounds", 8) or 8),
+        int(getattr(cfg.model, "constructive_lns_alns_rounds", 0) or 0),
+    ) or 8
     # LNS Early Stop Configuration (runtime compression)
     lns_early_stop_no_improve_rounds = getattr(cfg.model, "lns_early_stop_no_improve_rounds", 3) or 3
     lns_max_total_rounds = getattr(cfg.model, "lns_max_total_rounds", 10) or 10
@@ -3677,6 +4127,11 @@ def run_constructive_lns_master(
     # In direct_only mode (allow_virtual=False AND allow_real=False),
     # HIGH_VIRTUAL_USAGE has no business meaning and is excluded.
     is_direct_only = not allow_virtual_bridge and not allow_real_bridge
+    _profile_name = str(getattr(getattr(cfg, "model", None), "profile_name", "") or "").lower()
+    _is_guarded_profile = (
+        _profile_name == "constructive_lns_virtual_guarded_frontload"
+        or bool(getattr(getattr(cfg, "model", None), "virtual_family_frontload_enabled", False))
+    )
     base_neighborhoods: List[NeighborhoodType]
     # Current production neighborhoods only (HIGH_VIRTUAL_USAGE and SMALL_ROLL_RESCUE removed)
     base_neighborhoods = [
@@ -3684,6 +4139,16 @@ def run_constructive_lns_master(
         NeighborhoodType.HIGH_DROP_PRESSURE,
         NeighborhoodType.TAIL_REBALANCE,
     ]
+    if bool(getattr(getattr(cfg, "model", None), "alns_underfilled_stitch_enabled", True)):
+        base_neighborhoods.insert(0, NeighborhoodType.UNDERFILLED_FRAGMENT_STITCH)
+    if _is_guarded_profile:
+        for _nb in [
+            NeighborhoodType.WIDTH_TENSION_HOTSPOT,
+            NeighborhoodType.GROUP_SWITCH_HOTSPOT,
+            NeighborhoodType.BRIDGE_DEPENDENT_SEGMENT,
+        ]:
+            if _nb not in base_neighborhoods:
+                base_neighborhoods.append(_nb)
     print(
         f"[APS][constructive_lns] neighborhood_pool={[n.value for n in base_neighborhoods]}"
     )
@@ -3749,6 +4214,17 @@ def run_constructive_lns_master(
         "drop_pressure_score": 0.0,
         "drop_pressure_nearby_dropped_count": 0,
         "drop_pressure_recoverable_tons_estimate": 0.0,
+        "neighborhood_hotspot_counts": {},
+        "selected_hotspot_type_counts": {},
+        "near_viable_rescue_attempts": 0,
+        "near_viable_rescue_success": 0,
+        "hopeless_segment_skipped_count": 0,
+        "virtual_hotspot_move_attempts": 0,
+        "virtual_hotspot_move_success": 0,
+        "virtual_hotspot_move_reject_by_penalty": 0,
+        "virtual_hotspot_move_reject_by_hard_rule": 0,
+        "active_underfilled_selected_count": 0,
+        "active_underfilled_promoted_count": 0,
         "active_neighborhoods_this_run": "",
         "hotspot_neighborhood_enable_reason": "",
     }
@@ -3784,6 +4260,8 @@ def run_constructive_lns_master(
                 if nb == NeighborhoodType.TAIL_REBALANCE:
                     neighborhoods.append(nb)
             # Add LOW_FILL if not already present
+            if NeighborhoodType.UNDERFILLED_FRAGMENT_STITCH not in neighborhoods and bool(getattr(cfg.model, "alns_underfilled_stitch_enabled", True)):
+                neighborhoods.insert(0, NeighborhoodType.UNDERFILLED_FRAGMENT_STITCH)
             if NeighborhoodType.LOW_FILL_SEGMENT not in neighborhoods:
                 neighborhoods.insert(0, NeighborhoodType.LOW_FILL_SEGMENT)
         else:
@@ -3822,15 +4300,32 @@ def run_constructive_lns_master(
                     _group_switch_count += 1
 
         # Thresholds for enabling hotspot neighborhoods
-        _DROP_THRESHOLD = 5
-        _WIDTH_RANGE_THRESHOLD = 200.0
-        _GROUP_SWITCH_THRESHOLD = 2
+        _DROP_THRESHOLD = 3
+        _WIDTH_RANGE_THRESHOLD = 120.0
+        _GROUP_SWITCH_THRESHOLD = 1
         _BRIDGE_THRESHOLD = 1
+        _near_viable_segments = [s for s in current_segs if is_near_viable_segment(s, cfg)]
+        _hopeless_segments = [s for s in current_segs if s.total_tons < ton_min_local * 0.65]
+        _reverse_budget_tight_segments = [
+            s for s in current_segs
+            if int(getattr(s, "reverse_width_count_used", 0) or 0) >= int(getattr(cfg.model, "constructive_reverse_width_max_count", 2) or 2)
+        ]
         _ENABLE_HOTSPOT = (
             _is_guarded_profile
             or _total_dropped > _DROP_THRESHOLD
-            or underfilled_count >= 3
+            or underfilled_count >= 1
+            or bool(_near_viable_segments)
+            or bool(_reverse_budget_tight_segments)
         )
+        _hotspot_counts = {
+            "LOW_FILL_SEGMENT": int(underfilled_count),
+            "HIGH_DROP_PRESSURE": int(_total_dropped),
+            "TAIL_REBALANCE": int(len(underfilled_segs)),
+            "WIDTH_TENSION_HOTSPOT": int(1 if _width_range_max > _WIDTH_RANGE_THRESHOLD else 0),
+            "GROUP_SWITCH_HOTSPOT": int(_group_switch_count),
+            "REVERSE_BUDGET_TIGHT_SEGMENT": int(len(_reverse_budget_tight_segments)),
+            "NEAR_VIABLE_SEGMENT": int(len(_near_viable_segments)),
+        }
 
         _hotspot_added = False
         if _ENABLE_HOTSPOT:
@@ -3851,6 +4346,13 @@ def run_constructive_lns_master(
                     _hotspot_added = True
 
         neighborhood = neighborhoods[r % len(neighborhoods)]
+        _selected_hist = dict(accum_tail_repair_diag.get("selected_hotspot_type_counts", {}) or {})
+        _selected_hist[str(neighborhood.value)] = int(_selected_hist.get(str(neighborhood.value), 0) or 0) + 1
+        accum_tail_repair_diag["selected_hotspot_type_counts"] = _selected_hist
+        accum_tail_repair_diag["neighborhood_hotspot_counts"] = _hotspot_counts
+        accum_tail_repair_diag["hopeless_segment_skipped_count"] = int(
+            accum_tail_repair_diag.get("hopeless_segment_skipped_count", 0) or 0
+        ) + int(len(_hopeless_segments))
 
         # Record active neighborhoods and hotspot activation reason for diagnostics
         _nb_names = [str(nb.value) for nb in neighborhoods]
@@ -3899,8 +4401,8 @@ def run_constructive_lns_master(
             neighborhood=neighborhood,
             round_num=r + 1,
             rand=rand,
-            max_destroy_orders=45,
-            time_limit=8.0,
+            max_destroy_orders=int(getattr(cfg.model, "constructive_subproblem_max_orders", 45) or 45),
+            time_limit=float(getattr(cfg.model, "constructive_local_cpsat_time_limit_seconds", 8.0) or 8.0),
             underfilled_segs=underfilled_segs,
             repair_family_edges=repair_family_edges,
             family_repair_already_attempted_keys=family_repair_already_attempted_keys,
@@ -3916,6 +4418,11 @@ def run_constructive_lns_master(
         for k, v in round_tail_diag.items():
             if k in accum_tail_repair_diag and isinstance(v, (int, float)):
                 accum_tail_repair_diag[k] += v
+            elif k in accum_tail_repair_diag and isinstance(v, dict):
+                merged = dict(accum_tail_repair_diag.get(k, {}) or {})
+                for sub_k, sub_v in v.items():
+                    merged[str(sub_k)] = (merged.get(str(sub_k), 0) or 0) + int(sub_v or 0)
+                accum_tail_repair_diag[k] = merged
             elif k == "local_inserter_edge_policy_used" and v:
                 accum_tail_repair_diag[k] = str(v)
             elif k == "low_fill_candidates":
@@ -4473,11 +4980,33 @@ def run_constructive_lns_master(
     if lns_line_hint_map:
         final_line_hint_map.update(lns_line_hint_map)
 
+    unresolved_active_underfilled = [
+        seg for seg in current_segs
+        if bool(getattr(seg, "order_ids", []) or [])
+        and (str(seg.line), int(seg.campaign_local_id)) in active_underfilled_ids_initial
+        and not bool(getattr(seg, "is_valid", True))
+    ]
+    promoted_active_underfilled_ids = active_underfilled_ids_initial - {
+        (str(seg.line), int(seg.campaign_local_id))
+        for seg in unresolved_active_underfilled
+    }
+    for seg in unresolved_active_underfilled:
+        current_dropped.setdefault(DropReason.TAIL_UNDERFILLED.value, []).extend(
+            [str(oid) for oid in seg.order_ids]
+        )
+
     # Use full orders_df for dropped so NO_FEASIBLE_LINE orders are included
     final_dropped_df = _dropped_to_df(
         current_dropped, orders_df,
         stage="final", round_hint=-1,
         line_hint_map=final_line_hint_map,
+    )
+    print(
+        f"[APS][UNDERFILLED_ACTIVE_POOL] total={underfilled_total_count}, "
+        f"eligible={len(active_underfilled_fragments)}, "
+        f"selected_by_alns={int(accum_tail_repair_diag.get('active_underfilled_selected_count', 0) or 0)}, "
+        f"promoted={len(promoted_active_underfilled_ids)}, "
+        f"finally_dropped={len(unresolved_active_underfilled)}"
     )
 
     # Determine final status
@@ -4734,6 +5263,11 @@ def run_constructive_lns_master(
         "joint_master_branch_enabled": False,
         "old_master_blocked": True,
         "campaign_id_string_preserved": True,
+        "active_underfilled_fragments_total": underfilled_total_count,
+        "active_underfilled_fragments_eligible": len(active_underfilled_fragments),
+        "active_underfilled_fragments_selected_by_alns": int(accum_tail_repair_diag.get("active_underfilled_selected_count", 0) or 0),
+        "active_underfilled_fragments_promoted": len(promoted_active_underfilled_ids),
+        "active_underfilled_fragments_finally_dropped": len(unresolved_active_underfilled),
         # neighborhood pool diagnostics
         "neighborhood_pool_used": [n.value for n in neighborhoods],
         # bridge_edge_leak_detected is already set by the leak detection block above;
@@ -4791,6 +5325,11 @@ def run_constructive_lns_master(
             DropReason.HARD_CONSTRAINT_PROTECTED_DROP.value, 0
         ),
         "drop_reason_counts": drop_reason_counts,
+        "active_underfilled_fragments_total": underfilled_total_count,
+        "active_underfilled_fragments_eligible": len(active_underfilled_fragments),
+        "active_underfilled_fragments_selected_by_alns": int(accum_tail_repair_diag.get("active_underfilled_selected_count", 0) or 0),
+        "active_underfilled_fragments_promoted": len(promoted_active_underfilled_ids),
+        "active_underfilled_fragments_finally_dropped": len(unresolved_active_underfilled),
         "improvement_delta_orders": (
             int(final_planned_df.shape[0]) - int(initial_planned_df.shape[0])
             if not final_planned_df.empty and not initial_planned_df.empty else 0
@@ -4885,6 +5424,15 @@ def run_constructive_lns_master(
         "local_cpsat_no_improve_count": accum_tail_repair_diag.get("local_cpsat_no_improve_count", 0),
         "local_cpsat_infeasible_count": accum_tail_repair_diag.get("local_cpsat_infeasible_count", 0),
         "local_cpsat_total_seconds": accum_tail_repair_diag.get("local_cpsat_total_seconds", 0.0),
+        "neighborhood_hotspot_counts": accum_tail_repair_diag.get("neighborhood_hotspot_counts", {}),
+        "selected_hotspot_type_counts": accum_tail_repair_diag.get("selected_hotspot_type_counts", {}),
+        "near_viable_rescue_attempts": accum_tail_repair_diag.get("near_viable_rescue_attempts", 0),
+        "near_viable_rescue_success": accum_tail_repair_diag.get("near_viable_rescue_success", 0),
+        "hopeless_segment_skipped_count": accum_tail_repair_diag.get("hopeless_segment_skipped_count", 0),
+        "virtual_hotspot_move_attempts": accum_tail_repair_diag.get("virtual_hotspot_move_attempts", 0),
+        "virtual_hotspot_move_success": accum_tail_repair_diag.get("virtual_hotspot_move_success", 0),
+        "virtual_hotspot_move_reject_by_penalty": accum_tail_repair_diag.get("virtual_hotspot_move_reject_by_penalty", 0),
+        "virtual_hotspot_move_reject_by_hard_rule": accum_tail_repair_diag.get("virtual_hotspot_move_reject_by_hard_rule", 0),
         "rounds_summary": {
             "accepted_count": sum(1 for r in rounds_records if r.accepted),
             "total_destroy_count": sum(r.destroy_count for r in rounds_records),
@@ -4898,6 +5446,16 @@ def run_constructive_lns_master(
             "total_pool_skipped_already_tried": accum_pool_stats["skipped_already_tried_count"],
         },
     })
+
+    print(
+        f"[APS][ALNS_HOTSPOTS] neighborhood_hotspot_counts={engine_meta.get('neighborhood_hotspot_counts', {})}, "
+        f"selected_hotspot_type_counts={engine_meta.get('selected_hotspot_type_counts', {})}, "
+        f"near_viable_rescue_attempts={engine_meta.get('near_viable_rescue_attempts', 0)}, "
+        f"near_viable_rescue_success={engine_meta.get('near_viable_rescue_success', 0)}, "
+        f"hopeless_segment_skipped_count={engine_meta.get('hopeless_segment_skipped_count', 0)}, "
+        f"virtual_hotspot_move_attempts={engine_meta.get('virtual_hotspot_move_attempts', 0)}, "
+        f"virtual_hotspot_move_success={engine_meta.get('virtual_hotspot_move_success', 0)}"
+    )
 
     return ConstructiveLnsResult(
         status=final_status,

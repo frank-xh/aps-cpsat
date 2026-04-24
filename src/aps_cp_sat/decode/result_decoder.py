@@ -1,12 +1,220 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
-from typing import List
+from typing import Any, List
 
 import pandas as pd
 
 from aps_cp_sat.config import PlannerConfig
 from aps_cp_sat.decode.joint_solution_decoder import materialize_master_plan
 from aps_cp_sat.domain.models import ColdRollingResult
+from aps_cp_sat.model.virtual_order_utils import count_effective_virtual_rows, normalize_effective_virtual_flags
+
+REQUIRED_FINAL_SCHEDULE_COLUMNS = [
+    "temp_min",
+    "temp_max",
+    "line_capability",
+    "virtual_origin",
+    "virtual_spec_key",
+    "virtual_usage_type",
+    "is_virtual",
+    "width",
+    "thickness",
+    "steel_group",
+    "tons",
+    "order_id",
+    "line",
+    "campaign_id",
+    "sequence",
+]
+
+REQUIRED_NON_NULL_RECOVERY_COLUMNS = [
+    "temp_min",
+    "temp_max",
+]
+
+
+def _recovery_df_from_object(obj: Any) -> pd.DataFrame:
+    if isinstance(obj, pd.DataFrame):
+        return obj.copy()
+    if isinstance(obj, dict):
+        if "order_id" in obj:
+            return pd.DataFrame([obj])
+        rows: list[dict[str, Any]] = []
+        for key, value in obj.items():
+            if not isinstance(value, dict):
+                continue
+            row = dict(value)
+            row.setdefault("order_id", key)
+            rows.append(row)
+        return pd.DataFrame(rows)
+    return pd.DataFrame()
+
+
+def _collect_recovery_sources(source_df: pd.DataFrame, meta: dict[str, Any]) -> list[pd.DataFrame]:
+    sources: list[pd.DataFrame] = []
+    if isinstance(source_df, pd.DataFrame) and not source_df.empty:
+        sources.append(source_df.copy())
+    for key in ["order_lookup", "decode_order_lookup", "source_orders_df", "best_candidate_source_orders_df", "normalized_orders_df", "graph_orders_df"]:
+        frame = _recovery_df_from_object(meta.get(key))
+        if not frame.empty:
+            sources.append(frame)
+    return sources
+
+
+def _ensure_validation_columns(
+    final_df: pd.DataFrame,
+    source_df: pd.DataFrame,
+    recovery_sources: list[pd.DataFrame] | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Backfill validator/export sensitive columns from source rows and ensure required columns exist."""
+    df = final_df.copy()
+    backfilled_cols: list[str] = []
+    missing_cols: list[str] = []
+    recovered_cols: list[str] = []
+    defaults = {
+        "width": pd.NA,
+        "thickness": pd.NA,
+        "temp_min": pd.NA,
+        "temp_max": pd.NA,
+        "steel_group": "",
+        "line_capability": "",
+        "tons": pd.NA,
+        "virtual_origin": "",
+        "virtual_spec_key": "",
+        "virtual_usage_type": "",
+        "is_virtual": False,
+        "order_id": "",
+        "line": "",
+        "campaign_id": "",
+        "sequence": pd.NA,
+    }
+    candidate_cols = [
+        "width", "thickness", "temp_min", "temp_max",
+        "steel_group", "line_capability", "tons",
+        "virtual_origin", "virtual_spec_key", "virtual_usage_type",
+        "is_virtual", "order_id", "line", "campaign_id", "sequence",
+    ]
+    if "sequence" not in df.columns:
+        if "seq" in df.columns:
+            df["sequence"] = df["seq"]
+        elif "campaign_seq" in df.columns:
+            df["sequence"] = df["campaign_seq"]
+    if "seq" not in df.columns and "sequence" in df.columns:
+        df["seq"] = df["sequence"]
+
+    recovery_frames = [frame for frame in (recovery_sources or []) if isinstance(frame, pd.DataFrame) and not frame.empty]
+    if "order_id" in df.columns:
+        # Normalize duplicate column labels before merge. Some upstream frames already
+        # contain order_id both as a base column and as a recovered/metadata column;
+        # pandas.merge rejects a right-hand frame with duplicate join-key labels.
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+        for source in recovery_frames:
+            if "order_id" not in source.columns:
+                continue
+            source = source.loc[:, ~source.columns.duplicated()].copy()
+            # Do not include order_id twice: candidate_cols itself contains order_id.
+            recoverable_cols = [c for c in candidate_cols if c != "order_id" and c in source.columns]
+            source_cols = ["order_id"] + recoverable_cols
+            if len(source_cols) <= 1:
+                continue
+            source_meta = source[source_cols].copy().drop_duplicates(subset=["order_id"], keep="last")
+            source_meta = source_meta.loc[:, ~source_meta.columns.duplicated()].copy()
+            df = df.merge(source_meta, on="order_id", how="left", suffixes=("", "__src"))
+            for col in candidate_cols:
+                src_col = f"{col}__src"
+                if src_col not in df.columns:
+                    continue
+                if col in df.columns:
+                    if pd.api.types.is_object_dtype(df[col]):
+                        mask = df[col].isna() | (df[col].astype(str).str.strip() == "")
+                        if bool(mask.any()):
+                            before_non_missing = int((~mask).sum())
+                            df.loc[mask, col] = df.loc[mask, src_col]
+                            if int(df[col].astype(str).str.strip().ne("").sum()) > before_non_missing:
+                                backfilled_cols.append(col)
+                                recovered_cols.append(col)
+                    else:
+                        before_missing = int(df[col].isna().sum()) if hasattr(df[col], "isna") else 0
+                        df[col] = df[col].where(df[col].notna(), df[src_col])
+                        after_missing = int(df[col].isna().sum()) if hasattr(df[col], "isna") else 0
+                        if after_missing < before_missing:
+                            backfilled_cols.append(col)
+                            recovered_cols.append(col)
+                else:
+                    df[col] = df[src_col]
+                    backfilled_cols.append(col)
+                    recovered_cols.append(col)
+                df.drop(columns=[src_col], inplace=True)
+
+    for col, default in defaults.items():
+        if col not in df.columns:
+            df[col] = default
+            missing_cols.append(col)
+
+    for col in REQUIRED_FINAL_SCHEDULE_COLUMNS:
+        if col not in df.columns:
+            df[col] = pd.NA if col not in {"line", "campaign_id", "steel_group", "order_id"} else ""
+            missing_cols.append(col)
+
+    missing_before = sorted(
+        set(missing_cols + [col for col in REQUIRED_NON_NULL_RECOVERY_COLUMNS if col in df.columns and df[col].isna().any()])
+    )
+    # Virtual orders are generated inventory rows. If their temperature columns
+    # are absent/blank, recover a broad business-safe default before the final
+    # audit contract check. Real orders must still be recovered from source data.
+    if "is_virtual" in df.columns:
+        try:
+            virtual_mask = df["is_virtual"].astype(bool)
+        except Exception:
+            virtual_mask = df["order_id"].astype(str).str.startswith("VIRTUAL_") if "order_id" in df.columns else pd.Series(False, index=df.index)
+        if "order_id" in df.columns:
+            virtual_mask = virtual_mask | df["order_id"].astype(str).str.startswith("VIRTUAL_")
+        if "temp_min" in df.columns:
+            mask = virtual_mask & (df["temp_min"].isna() | (pd.to_numeric(df["temp_min"], errors="coerce").fillna(0.0) <= 0.0))
+            if bool(mask.any()):
+                df.loc[mask, "temp_min"] = 600.0
+                recovered_cols.append("temp_min")
+        if "temp_max" in df.columns:
+            mask = virtual_mask & (df["temp_max"].isna() | (pd.to_numeric(df["temp_max"], errors="coerce").fillna(0.0) <= 0.0))
+            if bool(mask.any()):
+                df.loc[mask, "temp_max"] = 900.0
+                recovered_cols.append("temp_max")
+
+    failed_required_cols = [
+        col
+        for col in REQUIRED_FINAL_SCHEDULE_COLUMNS
+        if col not in df.columns
+    ] + [
+        col
+        for col in REQUIRED_NON_NULL_RECOVERY_COLUMNS
+        if col not in df.columns or bool(df[col].isna().any())
+    ]
+    if "sequence" in df.columns and "seq" not in df.columns:
+        df["seq"] = df["sequence"]
+    if "seq" in df.columns and "sequence" not in df.columns:
+        df["sequence"] = df["seq"]
+    recovered_cols = sorted(set(recovered_cols))
+    failed_required_cols = sorted(set(failed_required_cols))
+    print(
+        f"[APS][DECODE_COLUMN_RECOVERY] missing_before={missing_before}, "
+        f"recovered={recovered_cols}, failed={failed_required_cols}"
+    )
+
+    return df, {
+        "decode_validation_columns_backfilled": bool(backfilled_cols or missing_cols),
+        "decode_validation_missing_cols": sorted(
+            col for col in set(missing_cols) if col not in recovered_cols and col not in REQUIRED_NON_NULL_RECOVERY_COLUMNS
+        ),
+        "final_schedule_required_cols_ok": (
+            all(col in df.columns for col in REQUIRED_FINAL_SCHEDULE_COLUMNS) and not failed_required_cols
+        ),
+        "final_schedule_missing_required_cols": [
+            col for col in REQUIRED_FINAL_SCHEDULE_COLUMNS if col not in df.columns
+        ],
+        "final_schedule_backfilled_cols": sorted(set(backfilled_cols)),
+        "decode_required_column_recovery_failed": bool(failed_required_cols),
+        "decode_missing_required_cols": failed_required_cols,
+    }
 
 
 def _encoded_virtual_count(encoded: str) -> int:
@@ -119,6 +327,7 @@ def _lightweight_decode_constructive_lns(
     """
     meta = dict(result.engine_meta or {})
 
+    source_df = df.copy()
     df = df.copy()
 
     # 1. Get bridge_expansion_mode
@@ -281,6 +490,55 @@ def _lightweight_decode_constructive_lns(
         if col not in df.columns:
             df[col] = ""
 
+    # 9b. Backfill validation-sensitive columns from the original source rows.
+    metadata_cols = [
+        "width_rise", "logical_reverse_cnt_campaign",
+        "direct_reverse_step_violation", "virtual_attach_reverse_violation",
+        "bridge_reverse_step_flag",
+    ]
+    if "order_id" in df.columns and "order_id" in source_df.columns:
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+        source_df_meta = source_df.loc[:, ~source_df.columns.duplicated()].copy()
+        source_meta_cols = ["order_id"] + [c for c in metadata_cols if c in source_df_meta.columns]
+        if len(source_meta_cols) > 1:
+            source_meta = source_df_meta[source_meta_cols].copy().drop_duplicates(subset=["order_id"], keep="last")
+            source_meta = source_meta.loc[:, ~source_meta.columns.duplicated()].copy()
+            df = df.merge(source_meta, on="order_id", how="left", suffixes=("", "__src"))
+            for col in metadata_cols:
+                src_col = f"{col}__src"
+                if src_col not in df.columns:
+                    continue
+                if col in df.columns:
+                    if pd.api.types.is_object_dtype(df[col]):
+                        mask = df[col].isna() | (df[col].astype(str).str.strip() == "")
+                        df.loc[mask, col] = df.loc[mask, src_col]
+                    else:
+                        df[col] = df[col].where(df[col].notna(), df[src_col])
+                else:
+                    df[col] = df[src_col]
+                df.drop(columns=[src_col], inplace=True)
+
+    # 9c. Ensure validation-sensitive columns always exist.
+    for col, default in {
+        "width_rise": 0.0,
+        "logical_reverse_cnt_campaign": 0,
+        "direct_reverse_step_violation": False,
+        "virtual_attach_reverse_violation": False,
+        "bridge_reverse_step_flag": False,
+    }.items():
+        if col not in df.columns:
+            df[col] = default
+
+    recovery_sources = _collect_recovery_sources(source_df, meta)
+    df, validation_column_meta = _ensure_validation_columns(df, source_df, recovery_sources=recovery_sources)
+    decode_meta.update(validation_column_meta)
+    print(
+        f"[APS][DECODE_COLUMN_CONTRACT] final_schedule_required_cols_ok={decode_meta.get('final_schedule_required_cols_ok', False)}, "
+        f"missing_required={decode_meta.get('final_schedule_missing_required_cols', [])}, "
+        f"backfilled_cols={decode_meta.get('final_schedule_backfilled_cols', [])}, "
+        f"decode_validation_missing_cols={decode_meta.get('decode_validation_missing_cols', [])}"
+    )
+
     # 10. dropped_df passes through unchanged
     dropped = result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else pd.DataFrame()
 
@@ -322,6 +580,7 @@ def decode_solution(result: ColdRollingResult) -> ColdRollingResult:
     decode_meta: dict = {}
     if _is_constructive_lns_path(df, meta):
         final_df, rounds_df, dropped_df, decode_meta = _lightweight_decode_constructive_lns(df, result)
+        final_df = normalize_effective_virtual_flags(final_df)
 
         # Merge decode-demoted rows into dropped_df with DECODE_ORDER_MISMATCH reason
         # Use campaign_id_hint (original column before lightweight decode renamed to campaign_id)
@@ -366,6 +625,13 @@ def decode_solution(result: ColdRollingResult) -> ColdRollingResult:
             "decode_order_mismatch_examples": decode_meta.get("decode_order_mismatch_examples", []),
             "decode_order_integrity_ok": decode_meta.get("decode_order_integrity_ok", True),
             "decode_demoted_order_count": decode_meta.get("decode_demoted_order_count", 0),
+            "decode_validation_columns_backfilled": decode_meta.get("decode_validation_columns_backfilled", False),
+            "decode_validation_missing_cols": decode_meta.get("decode_validation_missing_cols", []),
+            "decode_required_column_recovery_failed": decode_meta.get("decode_required_column_recovery_failed", False),
+            "decode_missing_required_cols": decode_meta.get("decode_missing_required_cols", []),
+            "final_schedule_required_cols_ok": decode_meta.get("final_schedule_required_cols_ok", False),
+            "final_schedule_missing_required_cols": decode_meta.get("final_schedule_missing_required_cols", []),
+            "final_schedule_backfilled_cols": decode_meta.get("final_schedule_backfilled_cols", []),
         })
 
         # Get bridge_expansion_mode
@@ -425,11 +691,19 @@ def decode_solution(result: ColdRollingResult) -> ColdRollingResult:
             "real_bridge_ratio": float(selected_real_bridge_edge_count / max(1, len(final_df) - 1)),
             "bridge_expansion_mode": bridge_expand_mode,
             "lns_lightweight_decode": True,
+            "final_virtual_rows_snapshot": int(count_effective_virtual_rows(final_df)),
             "decode_order_mismatch_count": decode_meta.get("decode_order_mismatch_count", 0),
             "decode_order_mismatch_campaigns": decode_meta.get("decode_order_mismatch_campaigns", []),
             "decode_order_mismatch_examples": decode_meta.get("decode_order_mismatch_examples", []),
             "decode_order_integrity_ok": decode_meta.get("decode_order_integrity_ok", True),
             "decode_demoted_order_count": decode_meta.get("decode_demoted_order_count", 0),
+            "decode_validation_columns_backfilled": decode_meta.get("decode_validation_columns_backfilled", False),
+            "decode_validation_missing_cols": decode_meta.get("decode_validation_missing_cols", []),
+            "decode_required_column_recovery_failed": decode_meta.get("decode_required_column_recovery_failed", False),
+            "decode_missing_required_cols": decode_meta.get("decode_missing_required_cols", []),
+            "final_schedule_required_cols_ok": decode_meta.get("final_schedule_required_cols_ok", False),
+            "final_schedule_missing_required_cols": decode_meta.get("final_schedule_missing_required_cols", []),
+            "final_schedule_backfilled_cols": decode_meta.get("final_schedule_backfilled_cols", []),
         })
         meta["joint_estimates"] = joint_estimates
         return ColdRollingResult(
@@ -463,7 +737,8 @@ def decode_solution(result: ColdRollingResult) -> ColdRollingResult:
         cfg,
         pre_dropped=result.dropped_df if isinstance(result.dropped_df, pd.DataFrame) else None,
     )
-    decoded_virtual_cnt = int(final_df["is_virtual"].sum()) if not final_df.empty and "is_virtual" in final_df.columns else 0
+    final_df = normalize_effective_virtual_flags(final_df)
+    decoded_virtual_cnt = int(count_effective_virtual_rows(final_df))
     joint_estimates = dict(meta.get("joint_estimates", {}) or {})
     meta["bridgeTemplateSelectedPairCount"] = int(selected_pair_count)
     meta["selectedTemplateVirtualCountTotal"] = int(selected_template_virtual_count_total)
@@ -480,6 +755,7 @@ def decode_solution(result: ColdRollingResult) -> ColdRollingResult:
     meta["real_bridge_ratio"] = float(selected_real_bridge_edge_count / total_selected_edges)
     meta["virtual_bridge_ratio"] = float(selected_virtual_bridge_edge_count / total_selected_edges)
     meta["virtual_bridge_family_ratio"] = float(selected_virtual_bridge_family_edge_count / total_selected_edges)
+    meta["final_virtual_rows_snapshot"] = int(decoded_virtual_cnt)
     joint_estimates.update(
         {
             "bridgeTemplateSelectedPairCount": int(selected_pair_count),

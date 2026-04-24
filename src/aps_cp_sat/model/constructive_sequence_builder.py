@@ -20,13 +20,23 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
 from aps_cp_sat.config import PlannerConfig
 from aps_cp_sat.model.candidate_graph_types import DIRECT_EDGE, REAL_BRIDGE_EDGE, VIRTUAL_BRIDGE_EDGE, VIRTUAL_BRIDGE_FAMILY_EDGE
-from aps_cp_sat.model.edge_hard_filter import sequence_pair_passes_final_hard_rules
+from aps_cp_sat.model.business_scoring_common import compute_extendability_metrics
+from aps_cp_sat.model.edge_hard_filter import (
+    accumulate_adj_hard_filter_rejection,
+    log_adj_hard_filter,
+    sequence_pair_passes_final_hard_rules,
+)
+from aps_cp_sat.model.reverse_width_budget import (
+    CampaignBuildState,
+    can_accept_reverse_width_pair,
+)
+from aps_cp_sat.model.seed_scoring import rank_seed_candidates
 from aps_cp_sat.model.local_router import _template_total_cost
 
 
@@ -211,6 +221,28 @@ class TemplateEdgeGraph:
         self.greedy_future_bridgeability_penalty_hits: int = 0
         self.greedy_tail_underfill_risk_penalty_hits: int = 0
         self.greedy_bridge_scarcity_penalty_hits: int = 0
+        # Reverse-width budget diagnostics (campaign-state constraint)
+        self.skipped_by_reverse_width_budget: int = 0
+        self.accepted_with_reverse_width_budget: int = 0
+        self.reverse_width_count_used_max: int = 0
+        self.adj_hard_filter_rejections: dict[str, int] = {}
+        # Continuation bias diagnostics
+        self.continuation_bonus_total: float = 0.0
+        self.continuation_cross_min_hits: int = 0
+        self.chains_crossed_ton_min_during_constructive: int = 0
+        self.virtual_rescue_attempt_count: int = 0
+        self.virtual_rescue_eligible_count: int = 0
+        self.virtual_rescue_selected_count: int = 0
+        self.virtual_rescue_selected_big_roll_count: int = 0
+        self.virtual_rescue_selected_small_roll_count: int = 0
+        self.virtual_rescue_cross_min_count: int = 0
+        self.virtual_rescue_rejected_by_hard: int = 0
+        self.virtual_rescue_rejected_by_budget: int = 0
+        self.virtual_rescue_reason_counts_by_line: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self.virtual_rescue_line_stats: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self.successor_cross_min_selected: int = 0
+        self.successor_near_min_selected: int = 0
+        self.successor_deadend_rejected_under_min: int = 0
 
         self._build_graph(candidate_graph=candidate_graph)
 
@@ -303,7 +335,12 @@ class TemplateEdgeGraph:
             )
             if not hard_ok:
                 self.rejected_edges_by_hard_filter_total += 1
+                self.adj_hard_filter_rejections = accumulate_adj_hard_filter_rejection(
+                    self.adj_hard_filter_rejections, hard_reason
+                )
                 if hard_reason == "FINAL_WIDTH_RULE":
+                    self.skipped_by_final_width_rule += 1
+                elif hard_reason == "FINAL_WIDTH_DROP_RULE":
                     self.skipped_by_final_width_rule += 1
                 elif hard_reason == "FINAL_THICKNESS_RULE":
                     self.skipped_by_final_thickness_rule += 1
@@ -365,6 +402,7 @@ class TemplateEdgeGraph:
             )
             self.big_deg[oid] = big_out + big_in
             self.small_deg[oid] = small_out + small_in
+        log_adj_hard_filter("transition_edge_build", self.adj_hard_filter_rejections)
 
     def _is_virtual_order(self, oid: str) -> bool:
         rec = self.order_record.get(str(oid), {})
@@ -567,6 +605,419 @@ def _compute_chain_score(
     return base_score, penalty_hits
 
 
+def continuation_bias_score(
+    current_state: CampaignBuildState,
+    candidate_order: dict,
+    cfg: PlannerConfig | None,
+) -> tuple[float, bool]:
+    """Bias legal successors toward forming campaign-shape chains near ton_min."""
+    rule = getattr(cfg, "rule", None) if cfg is not None else None
+    model = getattr(cfg, "model", None) if cfg is not None else None
+    ton_min = float(getattr(rule, "campaign_ton_min", 700.0) or 700.0)
+    ton_max = float(getattr(rule, "campaign_ton_max", 2000.0) or 2000.0)
+
+    w_gain = float(getattr(model, "continuation_bias_gain_weight", 0.35) if model else 0.35)
+    bonus_cross = float(getattr(model, "continuation_bias_cross_min_bonus", 20.0) if model else 20.0)
+    penalty_near_max = float(getattr(model, "continuation_bias_near_max_penalty", 25.0) if model else 25.0)
+    near_max_ratio = float(getattr(model, "continuation_bias_near_max_ratio", 0.9) if model else 0.9)
+    short_chain_hold = float(getattr(model, "continuation_bias_short_chain_hold_bonus", 8.0) if model else 8.0)
+
+    curr_tons = float(current_state.current_tons)
+    cand_tons = float(candidate_order.get("tons", 0.0) or 0.0)
+    next_tons = curr_tons + cand_tons
+
+    gap_before = max(0.0, ton_min - curr_tons)
+    gap_after = max(0.0, ton_min - next_tons)
+    gain = gap_before - gap_after
+    score = float(w_gain) * float(gain)
+    crossed = curr_tons < ton_min - 1e-6 and next_tons >= ton_min - 1e-6
+    if crossed:
+        score += bonus_cross
+
+    if next_tons >= ton_max * near_max_ratio:
+        score -= penalty_near_max
+
+    if curr_tons < 200.0:
+        score += short_chain_hold
+
+    if ton_min <= curr_tons <= min(1000.0, ton_max):
+        score *= 0.5
+    return score, crossed
+
+
+def _estimate_extendable_successors(
+    *,
+    graph: "TemplateEdgeGraph",
+    current_oid: str,
+    line: str,
+    used_orders: set[str],
+    current_state: CampaignBuildState,
+    max_reverse_count: int,
+) -> tuple[int, int]:
+    valid_total = 0
+    real_total = 0
+    current_rec = graph.order_record.get(str(current_oid), {})
+    current_virtual_chain_len = int(getattr(current_state, "virtual_chain_length", 0) or 0)
+    campaign_order_count = int(getattr(current_state, "order_count", 0) or 0)
+    for succ_oid, tpl_row, _cost in graph.get_valid_successors(str(current_oid), used_orders, str(line)):
+        succ_rec = graph.order_record.get(str(succ_oid), {})
+        ok, _ = sequence_pair_passes_final_hard_rules(
+            current_rec,
+            succ_rec,
+            graph.cfg,
+            {
+                "line": line,
+                "edge_type": str(tpl_row.get("edge_type", DIRECT_EDGE) or DIRECT_EDGE),
+                "template_row": tpl_row,
+                "bridge_count": int(tpl_row.get("bridge_count", 0) or 0),
+                "current_virtual_chain_length": current_virtual_chain_len,
+                "campaign_order_count": campaign_order_count,
+                "campaign_virtual_count": current_virtual_chain_len,
+            },
+        )
+        if not ok:
+            continue
+        ok_budget, _, _ = can_accept_reverse_width_pair(
+            current_rec,
+            succ_rec,
+            current_state,
+            max_reverse_count=max_reverse_count,
+        )
+        if not ok_budget:
+            continue
+        valid_total += 1
+        if not graph._is_virtual_order(str(succ_oid)):
+            real_total += 1
+    return int(valid_total), int(real_total)
+
+
+def _virtual_rescue_bonus(
+    *,
+    graph: "TemplateEdgeGraph",
+    line: str,
+    current_state: CampaignBuildState,
+    candidate_order: dict[str, Any],
+    candidate_state: CampaignBuildState,
+    candidate_extendable_degree: float,
+    real_successor_count: int,
+    real_successor_dead_end_count: int,
+    used_orders_for_candidate: set[str],
+    campaign_ton_min: float,
+    max_reverse_count: int,
+) -> dict[str, Any]:
+    model = getattr(graph.cfg, "model", None) if graph.cfg is not None else None
+    line = str(line)
+    line_reason_counts = graph.virtual_rescue_reason_counts_by_line[line]
+    line_stats = graph.virtual_rescue_line_stats[line]
+    result = {
+        "bonus": 0.0,
+        "eligible": False,
+        "cross_min": False,
+        "reason": "not_virtual",
+        "dead_end_help": False,
+    }
+    candidate_oid = str(candidate_order.get("order_id", "") or "")
+    if not graph._is_virtual_order(candidate_oid):
+        return result
+
+    graph.virtual_rescue_attempt_count += 1
+    line_stats["attempt"] += 1
+
+    if not bool(getattr(model, "constructive_virtual_rescue_enabled", True) if model else True):
+        line_reason_counts["disabled"] += 1
+        line_stats["reject_disabled"] += 1
+        result["reason"] = "disabled"
+        return result
+
+    curr_tons = float(current_state.current_tons)
+    min_current_tons = float(getattr(model, "constructive_virtual_rescue_min_current_tons", 0.0) if model else 0.0)
+    if curr_tons < min_current_tons - 1e-6:
+        line_reason_counts["below_min_current_tons"] += 1
+        line_stats["reject_below_min_current_tons"] += 1
+        result["reason"] = "below_min_current_tons"
+        return result
+
+    if bool(getattr(model, "constructive_virtual_rescue_under_min_only", True) if model else True) and curr_tons >= campaign_ton_min - 1e-6:
+        line_reason_counts["not_under_min"] += 1
+        line_stats["reject_not_under_min"] += 1
+        result["reason"] = "not_under_min"
+        return result
+
+    if line == "big_roll" and bool(getattr(model, "constructive_virtual_rescue_big_roll_enabled", True) if model else True):
+        rich_threshold = int(getattr(model, "constructive_virtual_rescue_big_roll_real_successor_threshold", 8) if model else 8)
+        ignore_rich_when_deadend = bool(getattr(model, "constructive_virtual_rescue_ignore_rich_real_when_under_min_deadend", True) if model else True)
+    else:
+        rich_threshold = int(getattr(model, "constructive_virtual_rescue_real_successor_threshold", 2) if model else 2)
+        ignore_rich_when_deadend = False
+    real_rich = real_successor_count > rich_threshold
+    real_mostly_dead = real_successor_count > 0 and real_successor_dead_end_count >= max(1, int(real_successor_count * 0.6))
+    if real_rich and not (ignore_rich_when_deadend and real_mostly_dead):
+        line_reason_counts["real_successor_rich"] += 1
+        line_stats["reject_real_successor_rich"] += 1
+        result["reason"] = "real_successor_rich"
+        return result
+
+    max_virtual_chain = int(getattr(model, "constructive_virtual_rescue_max_virtual_chain", 5) if model else 5)
+    if int(getattr(candidate_state, "virtual_chain_length", 0) or 0) > max_virtual_chain:
+        graph.virtual_rescue_rejected_by_budget += 1
+        line_reason_counts["virtual_chain_budget"] += 1
+        line_stats["reject_virtual_chain_budget"] += 1
+        result["reason"] = "virtual_chain_budget"
+        return result
+
+    future_total, _future_real = _estimate_extendable_successors(
+        graph=graph,
+        current_oid=candidate_oid,
+        line=line,
+        used_orders=used_orders_for_candidate,
+        current_state=candidate_state,
+        max_reverse_count=max_reverse_count,
+    )
+    next_tons = float(curr_tons + float(candidate_order.get("tons", 0.0) or 0.0))
+    gap_before = abs(campaign_ton_min - curr_tons)
+    gap_after = abs(campaign_ton_min - next_tons)
+    crosses_min = bool(curr_tons < campaign_ton_min - 1e-6 and next_tons >= campaign_ton_min - 1e-6)
+
+    if line == "big_roll":
+        near_min_ratio = float(getattr(model, "constructive_virtual_rescue_big_roll_near_min_ratio", 0.65) if model else 0.65)
+    else:
+        near_min_ratio = float(getattr(model, "constructive_virtual_rescue_near_min_ratio", 0.75) if model else 0.75)
+    helps_min = bool(gap_after < gap_before - 1e-6 or next_tons >= campaign_ton_min * near_min_ratio)
+    if not helps_min and not crosses_min and future_total <= 0:
+        line_reason_counts["not_closer_to_min"] += 1
+        line_stats["reject_not_closer_to_min"] += 1
+        result["reason"] = "not_closer_to_min"
+        return result
+
+    graph.virtual_rescue_eligible_count += 1
+    line_reason_counts["eligible"] += 1
+    line_stats["eligible"] += 1
+    result["eligible"] = True
+    result["cross_min"] = crosses_min
+    result["reason"] = "eligible"
+
+    if line == "big_roll":
+        bonus = float(getattr(model, "constructive_virtual_rescue_big_roll_bonus", 70.0) if model else 70.0)
+        cross_bonus = float(getattr(model, "constructive_virtual_rescue_big_roll_cross_min_bonus", 110.0) if model else 110.0)
+    else:
+        bonus = float(getattr(model, "constructive_virtual_rescue_bonus", 45.0) if model else 45.0)
+        cross_bonus = float(getattr(model, "constructive_virtual_rescue_cross_min_bonus", 85.0) if model else 85.0)
+    if crosses_min:
+        bonus += cross_bonus
+    if real_successor_count <= 0 or (real_successor_dead_end_count >= max(1, real_successor_count) and candidate_extendable_degree > 0 and future_total > 0):
+        bonus += float(getattr(model, "constructive_virtual_rescue_dead_end_bonus", 40.0) if model else 40.0)
+        result["dead_end_help"] = True
+    penalty_floor = float(getattr(model, "constructive_virtual_rescue_penalty_floor", 0.0) if model else 0.0)
+    scale = float(getattr(model, "constructive_virtual_rescue_score_scale", 1.0) if model else 1.0)
+    result["bonus"] = float(max(penalty_floor, bonus) * max(0.0, scale))
+    return result
+
+
+def _log_seed_scoring(line: str, seed_df: pd.DataFrame, selected_seed_rows: list[dict[str, Any]]) -> None:
+    if seed_df is None or seed_df.empty:
+        print(
+            f"[APS][SeedScoring] line={line}, candidates=0, low_formability=0, "
+            f"avg_projected_tons=0.0, selected_avg_projected_tons=0.0, selected_width_percentile_avg=0.0"
+        )
+        return
+    selected_df = pd.DataFrame(selected_seed_rows) if selected_seed_rows else pd.DataFrame()
+    selected_avg_projected_tons = float(selected_df["seed_projected_tons_5step"].fillna(0.0).mean()) if not selected_df.empty else 0.0
+    selected_width_percentile_avg = float(selected_df["seed_width_percentile"].fillna(0.0).mean()) if not selected_df.empty else 0.0
+    print(
+        f"[APS][SeedScoring] line={line}, "
+        f"candidates={len(seed_df)}, "
+        f"low_formability={int(seed_df['seed_low_formability'].fillna(False).astype(bool).sum())}, "
+        f"avg_projected_tons={float(seed_df['seed_projected_tons_5step'].fillna(0.0).mean()):.1f}, "
+        f"selected_avg_projected_tons={selected_avg_projected_tons:.1f}, "
+        f"selected_width_percentile_avg={selected_width_percentile_avg:.3f}"
+    )
+
+
+def compute_successor_business_score(
+    current_state: CampaignBuildState,
+    candidate_order: dict,
+    candidate_state: CampaignBuildState,
+    edge_meta: dict,
+    graph: "TemplateEdgeGraph",
+    cfg: PlannerConfig | None,
+    line: str,
+    used_orders_for_candidate: set[str],
+    real_successor_count: int,
+    real_successor_dead_end_count: int,
+    campaign_ton_min: float,
+    campaign_ton_max: float,
+    max_reverse_count: int,
+) -> dict[str, float]:
+    model = getattr(cfg, "model", None) if cfg is not None else None
+    current_rec = graph.order_record.get(str(current_state.last_order_id), {}) if current_state.last_order_id else {}
+    current_width = float(current_rec.get("width", 0.0) or 0.0)
+    cand_width = float(candidate_order.get("width", 0.0) or 0.0)
+    current_thickness = float(current_rec.get("thickness", 0.0) or 0.0)
+    cand_thickness = float(candidate_order.get("thickness", 0.0) or 0.0)
+    current_group = str(current_rec.get("steel_group", "") or "")
+    cand_group = str(candidate_order.get("steel_group", "") or "")
+    current_temp_center = (
+        float(current_rec.get("temp_min", 0.0) or 0.0) + float(current_rec.get("temp_max", 0.0) or 0.0)
+    ) * 0.5
+    cand_temp_center = (
+        float(candidate_order.get("temp_min", 0.0) or 0.0) + float(candidate_order.get("temp_max", 0.0) or 0.0)
+    ) * 0.5
+    width_drop = max(0.0, current_width - cand_width)
+    width_rise = max(0.0, cand_width - current_width)
+    width_desc_score = 1.0
+    if width_rise > 0:
+        width_desc_score = max(0.0, 0.25 - min(0.25, width_rise / 200.0))
+    elif width_drop > 250.0:
+        width_desc_score = max(0.0, 1.0 - min(1.0, (width_drop - 250.0) / 250.0))
+    elif width_drop > 0:
+        width_desc_score = max(0.55, 1.0 - (width_drop / 500.0))
+
+    continuation_bonus, crossed = continuation_bias_score(current_state=current_state, candidate_order=candidate_order, cfg=cfg)
+
+    next_oid = str(candidate_order.get("order_id", "") or "")
+    future_total_count, future_real_count = _estimate_extendable_successors(
+        graph=graph,
+        current_oid=next_oid,
+        line=str(line),
+        used_orders=used_orders_for_candidate,
+        current_state=candidate_state,
+        max_reverse_count=max_reverse_count,
+    )
+    future_successors = graph.get_valid_successors(next_oid, used_orders_for_candidate, str(line))
+    extendability_metrics = compute_extendability_metrics(
+        current_order=current_rec,
+        candidate_order=candidate_order,
+        candidate_successor_ids=[str(sid) for sid, _tpl, _cost in future_successors],
+        order_record_by_oid=graph.order_record,
+        cfg=cfg,
+        line=str(line),
+        current_state=current_state,
+        edge_meta=edge_meta,
+    )
+    extendable_degree = max(float(extendability_metrics["successor_extendable_out_degree"]), float(future_total_count))
+    same_group_degree = float(extendability_metrics["successor_same_group_extendable_degree"])
+    width_desc_degree = float(extendability_metrics["successor_width_desc_extendable_degree"])
+    dead_end_risk = float(extendability_metrics["successor_dead_end_risk_score"])
+    reverse_tight_degree = float(extendability_metrics["successor_reverse_budget_tight_degree"])
+    extendability_score = max(
+        0.0,
+        min(
+            1.0,
+            (0.45 * min(1.0, extendable_degree / 6.0))
+            + (0.30 * (same_group_degree / max(1.0, extendable_degree)))
+            + (0.25 * (width_desc_degree / max(1.0, extendable_degree))),
+        ),
+    )
+    group_continuity_score = 1.0 if current_group and current_group == cand_group else 0.4
+    smoothness_score = max(
+        0.0,
+        1.0 - ((abs(cand_thickness - current_thickness) * 1.5) + (abs(cand_temp_center - current_temp_center) * 0.005)),
+    )
+    reverse_budget_cost = 1.0 if cand_width > current_width else 0.0
+    if reverse_tight_degree > 0:
+        reverse_budget_cost += min(1.0, reverse_tight_degree / max(1.0, extendable_degree + reverse_tight_degree))
+
+    curr_tons = float(current_state.current_tons)
+    cand_tons = float(candidate_order.get("tons", 0.0) or 0.0)
+    next_tons = curr_tons + cand_tons
+    ton_gap_before = max(0.0, campaign_ton_min - curr_tons)
+    ton_gap_after = max(0.0, campaign_ton_min - next_tons)
+    ton_gain = max(0.0, ton_gap_before - ton_gap_after)
+    under_min_gain_weight = float(getattr(model, "successor_under_min_gain_weight", 0.70) if model else 0.70)
+    cross_min_bonus = float(getattr(model, "successor_cross_min_bonus", 95.0) if model else 95.0)
+    near_min_bonus = float(getattr(model, "successor_near_min_bonus", 35.0) if model else 35.0)
+    near_max_penalty = float(getattr(model, "successor_near_max_penalty", 60.0) if model else 60.0)
+    near_max_ratio = float(getattr(model, "successor_near_max_ratio", 0.92) if model else 0.92)
+    short_chain_deadend_penalty = float(getattr(model, "successor_short_chain_deadend_penalty", 55.0) if model else 55.0)
+    crossed_direct = bool(curr_tons < campaign_ton_min - 1e-6 and next_tons >= campaign_ton_min - 1e-6)
+    near_min_selected = bool(
+        curr_tons < campaign_ton_min - 1e-6
+        and next_tons >= campaign_ton_min * 0.75
+        and next_tons < campaign_ton_min - 1e-6
+    )
+    tonnage_bonus = 0.0
+    if curr_tons < campaign_ton_min - 1e-6:
+        tonnage_bonus += under_min_gain_weight * ton_gain
+        if crossed_direct:
+            tonnage_bonus += cross_min_bonus
+        elif near_min_selected:
+            tonnage_bonus += near_min_bonus
+        if extendable_degree > 0:
+            tonnage_bonus += min(near_min_bonus, float(extendable_degree) * 6.0)
+    elif next_tons >= campaign_ton_max * near_max_ratio:
+        tonnage_bonus -= near_max_penalty
+    tonnage_formability_score = max(0.0, min(1.0, (continuation_bonus + tonnage_bonus) / 120.0))
+
+    dead_end_penalty = 0.0
+    if extendable_degree <= 0:
+        dead_end_penalty = 1.0
+    elif extendable_degree <= 1:
+        dead_end_penalty = 0.65
+    elif extendable_degree <= 2:
+        dead_end_penalty = 0.3
+    dead_end_penalty = max(dead_end_penalty, dead_end_risk)
+    if current_group and extendable_degree > 0 and (same_group_degree / max(1.0, extendable_degree)) < 0.25:
+        dead_end_penalty = min(1.0, dead_end_penalty + 0.2)
+    if extendable_degree > 0 and (width_desc_degree / max(1.0, extendable_degree)) < 0.35:
+        dead_end_penalty = min(1.0, dead_end_penalty + 0.15)
+    if curr_tons < campaign_ton_min - 1e-6 and extendable_degree <= 0:
+        dead_end_penalty = min(1.5, dead_end_penalty + (short_chain_deadend_penalty / 100.0))
+
+    w_width = float(getattr(model, "successor_weight_width_desc", 0.22) if model else 0.22)
+    w_cont = float(getattr(model, "successor_weight_continuation", 0.24) if model else 0.24)
+    w_ext = float(getattr(model, "successor_weight_extendability", 0.30) if model else 0.30)
+    w_group = float(getattr(model, "successor_weight_group_continuity", 0.14) if model else 0.14)
+    w_reverse = float(getattr(model, "successor_weight_reverse_budget_cost", 0.14) if model else 0.14)
+    w_dead = float(getattr(model, "successor_weight_dead_end_penalty", 0.32) if model else 0.32)
+
+    total_score = (
+        w_width * width_desc_score
+        + w_cont * tonnage_formability_score
+        + w_ext * extendability_score
+        + w_group * group_continuity_score
+        + 0.10 * smoothness_score
+        - w_reverse * reverse_budget_cost
+        - w_dead * dead_end_penalty
+    )
+    virtual_rescue = _virtual_rescue_bonus(
+        graph=graph,
+        line=str(line),
+        current_state=current_state,
+        candidate_order=candidate_order,
+        candidate_state=candidate_state,
+        candidate_extendable_degree=extendable_degree,
+        real_successor_count=real_successor_count,
+        real_successor_dead_end_count=real_successor_dead_end_count,
+        used_orders_for_candidate=used_orders_for_candidate,
+        campaign_ton_min=campaign_ton_min,
+        max_reverse_count=max_reverse_count,
+    )
+    total_score += float(virtual_rescue["bonus"] / 100.0)
+    return {
+        "successor_business_score_total": float(total_score),
+        "width_desc_score": float(width_desc_score),
+        "tonnage_formability_score": float(tonnage_formability_score),
+        "extendability_score": float(extendability_score),
+        "group_continuity_score": float(group_continuity_score),
+        "smoothness_score": float(smoothness_score),
+        "reverse_budget_cost": float(reverse_budget_cost),
+        "dead_end_penalty": float(dead_end_penalty),
+        "successor_extendable_out_degree": float(extendable_degree),
+        "successor_same_group_extendable_degree": float(same_group_degree),
+        "successor_width_desc_extendable_degree": float(width_desc_degree),
+        "successor_dead_end_risk_score": float(dead_end_risk),
+        "continuation_bonus": float(continuation_bonus + tonnage_bonus),
+        "crossed_ton_min": float(1 if crossed or crossed_direct else 0),
+        "near_min_bonus_hit": float(1 if near_min_selected else 0),
+        "near_max_penalty_hit": float(1 if next_tons >= campaign_ton_max * near_max_ratio else 0),
+        "deadend_rejected_under_min": float(1 if curr_tons < campaign_ton_min - 1e-6 and extendable_degree <= 0 else 0),
+        "virtual_rescue_bonus": float(virtual_rescue["bonus"]),
+        "virtual_rescue_eligible": float(1 if virtual_rescue["eligible"] else 0),
+        "virtual_rescue_cross_min": float(1 if virtual_rescue["cross_min"] else 0),
+        "future_real_successor_count": float(future_real_count),
+    }
+
+
 def _bridge_family_type_from_row(tpl_row: dict) -> str:
     """Derive bridge_family from a template row for family edge scoring."""
     raw = str(tpl_row.get("bridge_family", "")).strip().upper()
@@ -606,6 +1057,7 @@ def _build_single_chain(
     start_oid: str,
     line: str,
     used_orders: set[str],
+    campaign_ton_min: float,
     campaign_ton_max: float,
     chain_counter: Dict[str, int],
     blocked_successor_bucket: set[str] | None = None,
@@ -632,6 +1084,19 @@ def _build_single_chain(
     current_oid = start_oid
     current_tons = float(graph.order_record.get(start_oid, {}).get("tons", 0) or 0)
     steel_groups = [str(graph.order_record.get(start_oid, {}).get("steel_group", "") or "")]
+    current_state = CampaignBuildState(
+        current_tons=current_tons,
+        reverse_width_count=0,
+        reverse_width_total_mm=0.0,
+        virtual_chain_length=1 if graph._is_virtual_order(start_oid) else 0,
+        last_order_id=str(start_oid),
+        line=str(line),
+        order_count=1,
+        last_width=float(graph.order_record.get(start_oid, {}).get("width", 0.0) or 0.0),
+        episode_state={},
+    )
+    chain_crossed_ton_min = bool(current_tons >= campaign_ton_min - 1e-6)
+    max_reverse_count = int(getattr(getattr(graph.cfg, "model", None), "constructive_reverse_width_max_count", 2) or 2)
 
     # Segment budget key: stable within the same greedy chain (use seed + line).
     # Each chain gets its own segment scope; family budget per segment = 1.
@@ -675,10 +1140,55 @@ def _build_single_chain(
                 },
             )
             if ok:
-                hard_filtered_successors.append((succ_oid, tpl_row, cost))
+                ok_budget, _, budget_state = can_accept_reverse_width_pair(
+                    graph.order_record.get(current_oid, {}),
+                    graph.order_record.get(succ_oid, {}),
+                    current_state,
+                    max_reverse_count=max_reverse_count,
+                )
+                if ok_budget:
+                    graph.accepted_with_reverse_width_budget += 1
+                    graph.reverse_width_count_used_max = max(
+                        graph.reverse_width_count_used_max, int(budget_state.reverse_width_count)
+                    )
+                    if graph._is_virtual_order(str(succ_oid)):
+                        graph.virtual_rescue_line_stats[str(line)]["raw_virtual_seen"] += 1
+                        graph.virtual_rescue_line_stats[str(line)]["hard_pass"] += 1
+                    hard_filtered_successors.append((succ_oid, tpl_row, cost, budget_state))
+                else:
+                    graph.skipped_by_reverse_width_budget += 1
+                    if graph._is_virtual_order(str(succ_oid)):
+                        graph.virtual_rescue_line_stats[str(line)]["raw_virtual_seen"] += 1
+                        graph.virtual_rescue_line_stats[str(line)]["reject_reverse_budget"] += 1
             else:
                 graph.rejected_edges_by_hard_filter_total += 1
+                if graph._is_virtual_order(str(succ_oid)):
+                    _vr_stats = graph.virtual_rescue_line_stats[str(line)]
+                    _vr_stats["raw_virtual_seen"] += 1
+                    _vr_stats["hard_reject"] += 1
+                    graph.virtual_rescue_rejected_by_hard += 1
+                    graph.virtual_rescue_reason_counts_by_line[str(line)]["hard_filter"] += 1
+                    _reason_key = str(reason or "")
+                    if _reason_key in {"FINAL_WIDTH_RULE", "FINAL_WIDTH_DROP_RULE"}:
+                        _vr_stats["reject_width"] += 1
+                    elif _reason_key == "FINAL_THICKNESS_RULE":
+                        _vr_stats["reject_thickness"] += 1
+                    elif _reason_key == "FINAL_TEMP_RULE":
+                        _vr_stats["reject_temp"] += 1
+                    elif _reason_key == "FINAL_GROUP_RULE":
+                        _vr_stats["reject_group"] += 1
+                    elif _reason_key in {"FINAL_VIRTUAL_CHAIN_RULE", "FINAL_VIRTUAL_RATIO_RULE"}:
+                        _vr_stats["reject_virtual_chain"] += 1
+                    elif _reason_key == "FINAL_REVERSE_WIDTH_BUDGET_RULE":
+                        _vr_stats["reject_reverse_budget"] += 1
+                    else:
+                        _vr_stats["reject_other"] += 1
+                graph.adj_hard_filter_rejections = accumulate_adj_hard_filter_rejection(
+                    graph.adj_hard_filter_rejections, reason
+                )
                 if reason == "FINAL_WIDTH_RULE":
+                    graph.skipped_by_final_width_rule += 1
+                elif reason == "FINAL_WIDTH_DROP_RULE":
                     graph.skipped_by_final_width_rule += 1
                 elif reason == "FINAL_THICKNESS_RULE":
                     graph.skipped_by_final_thickness_rule += 1
@@ -691,6 +1201,9 @@ def _build_single_chain(
         successors = hard_filtered_successors
 
         if not successors:
+            graph.candidate_graph_diagnostics["dead_end_successor_count"] = int(
+                graph.candidate_graph_diagnostics.get("dead_end_successor_count", 0) or 0
+            ) + 1
             break
 
         # Score and sort successors
@@ -701,7 +1214,8 @@ def _build_single_chain(
 
         # ---- Compute future-aware context for scoring ----
         # remaining_chain_capacity: estimated remaining orders based on ton capacity
-        avg_order_tons = 150.0  # heuristic
+        avg_order_tons = float(getattr(cfg_model, "constructive_typical_order_tons", 25.0) if cfg_model else 25.0)
+        avg_order_tons = max(1.0, avg_order_tons)
         remaining_orders_est = max(1, int((campaign_ton_max - current_tons) / avg_order_tons))
         remaining_chain_capacity = remaining_orders_est
 
@@ -717,7 +1231,26 @@ def _build_single_chain(
         else:
             bridge_scarcity_score = 0.0
 
-        for succ_oid, tpl_row, cost in successors:
+        real_successor_count = 0
+        real_successor_dead_end_count = 0
+        successor_future_counts: dict[str, tuple[int, int]] = {}
+        for succ_oid, _tpl_row, _cost, budget_state in successors:
+            if graph._is_virtual_order(str(succ_oid)):
+                continue
+            real_successor_count += 1
+            future_total, future_real = _estimate_extendable_successors(
+                graph=graph,
+                current_oid=str(succ_oid),
+                line=str(line),
+                used_orders=set(used_orders) | {str(succ_oid)},
+                current_state=budget_state,
+                max_reverse_count=max_reverse_count,
+            )
+            successor_future_counts[str(succ_oid)] = (future_total, future_real)
+            if future_total <= 0:
+                real_successor_dead_end_count += 1
+
+        for succ_oid, tpl_row, cost, budget_state in successors:
             succ_rec = graph.order_record.get(succ_oid, {})
             edge_type = str(tpl_row.get("edge_type", DIRECT_EDGE))
             bridge_count = int(tpl_row.get("bridge_count", 0) or 0)
@@ -749,25 +1282,93 @@ def _build_single_chain(
                 if small_deg > 0 and big_deg > 0:
                     # This order can run on both lines and has small_roll connectivity
                     dual_small_reserve_score = min(small_deg, 10)
-                    score += dual_small_reserve_score * dual_reserve_penalty
+                    # Penalize, not reward, big_roll taking dual orders with small_roll connectivity.
+                    # The previous "+=" made the reserve signal work in the opposite direction.
+                    score -= dual_small_reserve_score * dual_reserve_penalty
 
-            scored_successors.append((score, succ_oid, tpl_row, cost))
+            business_score = compute_successor_business_score(
+                current_state=current_state,
+                candidate_order=succ_rec,
+                candidate_state=budget_state,
+                edge_meta=tpl_row,
+                graph=graph,
+                cfg=graph.cfg,
+                line=str(line),
+                used_orders_for_candidate=set(used_orders) | {str(succ_oid)},
+                real_successor_count=real_successor_count,
+                real_successor_dead_end_count=real_successor_dead_end_count,
+                campaign_ton_min=campaign_ton_min,
+                campaign_ton_max=campaign_ton_max,
+                max_reverse_count=max_reverse_count,
+            )
+            score += float(business_score["successor_business_score_total"] * 100.0)
+            graph.continuation_bonus_total += float(business_score["continuation_bonus"])
+            graph.candidate_graph_diagnostics["successor_reverse_budget_cost_total"] = float(
+                graph.candidate_graph_diagnostics.get("successor_reverse_budget_cost_total", 0.0) or 0.0
+            ) + float(business_score["reverse_budget_cost"])
+            graph.candidate_graph_diagnostics["dead_end_penalty_total"] = float(
+                graph.candidate_graph_diagnostics.get("dead_end_penalty_total", 0.0) or 0.0
+            ) + float(business_score["dead_end_penalty"])
+            graph.candidate_graph_diagnostics["virtual_rescue_bonus_total"] = float(
+                graph.candidate_graph_diagnostics.get("virtual_rescue_bonus_total", 0.0) or 0.0
+            ) + float(business_score["virtual_rescue_bonus"])
+            graph.candidate_graph_diagnostics["successor_score_component_sum"] = float(
+                graph.candidate_graph_diagnostics.get("successor_score_component_sum", 0.0) or 0.0
+            ) + float(business_score["successor_business_score_total"])
+            graph.candidate_graph_diagnostics["successor_score_component_count"] = int(
+                graph.candidate_graph_diagnostics.get("successor_score_component_count", 0) or 0
+            ) + 1
+            graph.candidate_graph_diagnostics["successor_extendability_component_sum"] = float(
+                graph.candidate_graph_diagnostics.get("successor_extendability_component_sum", 0.0) or 0.0
+            ) + float(business_score["extendability_score"])
+            graph.candidate_graph_diagnostics["successor_dead_end_penalty_sum"] = float(
+                graph.candidate_graph_diagnostics.get("successor_dead_end_penalty_sum", 0.0) or 0.0
+            ) + float(business_score["dead_end_penalty"])
+            if float(business_score["successor_extendable_out_degree"]) <= 0:
+                graph.candidate_graph_diagnostics["successor_zero_extendable_degree_count"] = int(
+                    graph.candidate_graph_diagnostics.get("successor_zero_extendable_degree_count", 0) or 0
+                ) + 1
+            elif float(business_score["successor_extendable_out_degree"]) <= 1:
+                graph.candidate_graph_diagnostics["successor_low_extendable_degree_count"] = int(
+                    graph.candidate_graph_diagnostics.get("successor_low_extendable_degree_count", 0) or 0
+                ) + 1
+            if business_score["crossed_ton_min"] > 0:
+                graph.continuation_cross_min_hits += 1
+            if business_score["deadend_rejected_under_min"] > 0:
+                graph.successor_deadend_rejected_under_min += 1
+            scored_successors.append(
+                (
+                    score,
+                    succ_oid,
+                    tpl_row,
+                    cost,
+                    budget_state,
+                    business_score,
+                )
+            )
 
         # Sort by score descending (best first)
         scored_successors.sort(key=lambda x: -x[0])
 
         # Try best successor
-        best_score, best_succ, best_tpl, best_cost = scored_successors[0]
+        best_score, best_succ, best_tpl, best_cost, best_state, _best_business = scored_successors[0]
         succ_tons = float(graph.order_record.get(best_succ, {}).get("tons", 0) or 0)
 
         # Check if adding would exceed campaign ton max
         if current_tons + succ_tons > campaign_ton_max:
             # Try other successors if they fit
             fit_found = False
-            for score, succ_oid, tpl_row, cost in scored_successors[1:]:
+            for score, succ_oid, tpl_row, cost, budget_state, _biz in scored_successors[1:]:
                 succ_tons = float(graph.order_record.get(succ_oid, {}).get("tons", 0) or 0)
                 if current_tons + succ_tons <= campaign_ton_max:
-                    best_succ, best_tpl, best_cost, succ_tons = succ_oid, tpl_row, cost, succ_tons
+                    best_succ, best_tpl, best_cost, succ_tons, best_state, _best_business = (
+                        succ_oid,
+                        tpl_row,
+                        cost,
+                        succ_tons,
+                        budget_state,
+                        _biz,
+                    )
                     fit_found = True
                     break
             if not fit_found:
@@ -786,9 +1387,13 @@ def _build_single_chain(
                 graph.greedy_virtual_family_edge_rejects += 1
                 graph.greedy_virtual_family_budget_blocked_count += 1
                 # Try next-best non-family successor
-                non_family = [(s, o, t, c) for s, o, t, c in scored_successors[1:] if str(t.get("edge_type", "")) != VIRTUAL_BRIDGE_FAMILY_EDGE]
+                non_family = [
+                    (s, o, t, c, st, biz)
+                    for s, o, t, c, st, biz in scored_successors[1:]
+                    if str(t.get("edge_type", "")) != VIRTUAL_BRIDGE_FAMILY_EDGE
+                ]
                 if non_family:
-                    best_score, best_succ, best_tpl, best_cost = non_family[0]
+                    best_score, best_succ, best_tpl, best_cost, best_state, _best_business = non_family[0]
                     succ_tons = float(graph.order_record.get(best_succ, {}).get("tons", 0) or 0)
                     best_is_family = False
                     if current_tons + succ_tons > campaign_ton_max:
@@ -796,14 +1401,30 @@ def _build_single_chain(
                 else:
                     break  # No acceptable non-family successor
 
+        if float(_best_business.get("crossed_ton_min", 0.0) or 0.0) > 0:
+            graph.successor_cross_min_selected += 1
+        if float(_best_business.get("near_min_bonus_hit", 0.0) or 0.0) > 0:
+            graph.successor_near_min_selected += 1
+        if float(_best_business.get("virtual_rescue_eligible", 0.0) or 0.0) > 0 and graph._is_virtual_order(str(best_succ)):
+            graph.virtual_rescue_selected_count += 1
+            if str(line) == "big_roll":
+                graph.virtual_rescue_selected_big_roll_count += 1
+            else:
+                graph.virtual_rescue_selected_small_roll_count += 1
+            if float(_best_business.get("virtual_rescue_cross_min", 0.0) or 0.0) > 0:
+                graph.virtual_rescue_cross_min_count += 1
+
         # Extend chain
         order_ids.append(best_succ)
         used_orders.add(best_succ)
         current_oid = best_succ
         current_tons += succ_tons
+        if not chain_crossed_ton_min and current_tons >= campaign_ton_min - 1e-6:
+            chain_crossed_ton_min = True
         sg = str(graph.order_record.get(best_succ, {}).get("steel_group", "") or "")
         if sg and sg not in steel_groups:
             steel_groups.append(sg)
+        current_state = best_state
 
         # ---- Count family edge usage AFTER successful selection ----
         if best_is_family:
@@ -813,6 +1434,8 @@ def _build_single_chain(
 
     # Only return chain if it has at least 1 order
     if len(order_ids) >= 1:
+        if chain_crossed_ton_min:
+            graph.chains_crossed_ton_min_during_constructive += 1
         line_count = chain_counter.get(line, 0)
         chain_counter[line] = line_count + 1
 
@@ -836,6 +1459,7 @@ def _retry_line_after_quota_release(
     graph: TemplateEdgeGraph,
     used_orders: set[str],
     released_orders: set[str],
+    campaign_ton_min: float,
     campaign_ton_max: float,
     diagnostics: dict,
     existing_chains_by_line: dict[str, list[ConstructiveChain]],
@@ -897,16 +1521,18 @@ def _retry_line_after_quota_release(
         return 0
 
     # Sort retry orders by seed quality
-    def retry_seed_quality_key(item: Tuple[str, dict]) -> Tuple[float, int, int]:
-        oid, rec = item
-        due_rank = _safe_int_value(rec.get("due_rank", 999), 999)
-        priority = _safe_int_value(rec.get("priority", 0), 0)
-        tons = float(rec.get("tons", 0) or 0)
-        connectivity = graph.out_degree.get(oid, 0) + graph.in_degree.get(oid, 0)
-        score = (priority * 10000) + ((100 - min(due_rank, 100)) * 100) + (tons * 0.1) + (connectivity * 10)
-        return (-score, due_rank, oid)
-
-    retry_available.sort(key=retry_seed_quality_key)
+    retry_seed_scored = rank_seed_candidates(
+        pd.DataFrame([dict(rec, order_id=oid, line=collapsed_line) for oid, rec in retry_available]),
+        graph,
+        cfg=graph.cfg,
+    )
+    retry_seed_rank = {str(row["order_id"]): dict(row) for row in retry_seed_scored.to_dict("records")}
+    retry_available.sort(
+        key=lambda item: (
+            -float(retry_seed_rank.get(str(item[0]), {}).get("seed_score_total", 0.0)),
+            str(item[0]),
+        )
+    )
 
     # Get or create chain counter for this line
     chain_counter: Dict[str, int] = {}
@@ -930,6 +1556,7 @@ def _retry_line_after_quota_release(
             start_oid=oid,
             line=collapsed_line,
             used_orders=used_orders,
+            campaign_ton_min=campaign_ton_min,
             campaign_ton_max=campaign_ton_max,
             chain_counter=chain_counter,
             blocked_successor_bucket=None,  # No blocking for retry - all released orders available
@@ -1106,6 +1733,45 @@ def build_constructive_sequences(
         "greedy_future_bridgeability_penalty_hits": 0,
         "greedy_tail_underfill_risk_penalty_hits": 0,
         "greedy_bridge_scarcity_penalty_hits": 0,
+        "skipped_by_reverse_width_budget": 0,
+        "accepted_with_reverse_width_budget": 0,
+        "reverse_width_count_used_max": 0,
+        "seed_scoring_enabled": True,
+        "width_desc_seed_bias_enabled": True,
+        "selected_seed_score_avg": 0.0,
+        "selected_seed_width_percentile_avg": 0.0,
+        "top_seed_width_avg": 0.0,
+        "top_seed_extendability_avg": 0.0,
+        "top_seed_formability_avg": 0.0,
+        "continuation_bias_used": True,
+        "continuation_bonus_total": 0.0,
+        "continuation_cross_min_hits": 0,
+        "chains_crossed_ton_min_during_constructive": 0,
+        "successor_business_scoring_enabled": True,
+        "width_desc_successor_bias_enabled": True,
+        "successor_extendability_bias_enabled": True,
+        "successor_group_continuity_bias_enabled": True,
+        "successor_dead_end_penalty_enabled": True,
+        "successor_reverse_budget_cost_total": 0.0,
+        "dead_end_penalty_total": 0.0,
+        "successor_zero_extendable_degree_count": 0,
+        "successor_low_extendable_degree_count": 0,
+        "successor_score_component_sum": 0.0,
+        "successor_score_component_count": 0,
+        "successor_extendability_component_sum": 0.0,
+        "successor_dead_end_penalty_sum": 0.0,
+        "dead_end_successor_count": 0,
+        "virtual_rescue_attempt_count": 0,
+        "virtual_rescue_eligible_count": 0,
+        "virtual_rescue_selected_count": 0,
+        "virtual_rescue_selected_big_roll_count": 0,
+        "virtual_rescue_selected_small_roll_count": 0,
+        "virtual_rescue_cross_min_count": 0,
+        "virtual_rescue_rejected_by_hard": 0,
+        "virtual_rescue_rejected_by_budget": 0,
+        "successor_cross_min_selected": 0,
+        "successor_near_min_selected": 0,
+        "successor_deadend_rejected_under_min": 0,
         # Dual-order small-roll reserve diagnostics
         "dual_orders_with_small_roll_option": 0,
         "dual_orders_reserved_from_big_roll": 0,
@@ -1139,6 +1805,8 @@ def build_constructive_sequences(
         pre_built_cg = transition_pack.get("candidate_graph")
     graph = TemplateEdgeGraph(orders_df, tpl_df, cfg, candidate_graph=pre_built_cg)
     graph._init_used_orders()
+    seed_diag_samples: list[dict] = []
+    line_seed_diag_samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
     # Track single-build diagnostics in result
     diagnostics["candidate_graph_source"] = graph.candidate_graph_source
@@ -1146,6 +1814,7 @@ def build_constructive_sequences(
     graph.set_used_orders(used_orders)
 
     # Get campaign ton limits
+    campaign_ton_min = float(cfg.rule.campaign_ton_min) if cfg.rule else 700.0
     campaign_ton_max = float(cfg.rule.campaign_ton_max) if cfg.rule else 2000.0
 
     # Process each line
@@ -1184,7 +1853,23 @@ def build_constructive_sequences(
                 score = (small_d * 100) + (tons * 0.1) + max(0, 100 - due_rank)
                 small_roll_reserve_candidates.append((-score, oid, rec))  # negative for ascending sort
 
-        small_roll_reserve_candidates.sort()  # lowest score first (best candidates first after negate)
+        reserve_seed_df = rank_seed_candidates(
+            pd.DataFrame([dict(rec, order_id=oid, line="small_roll") for _, oid, rec in small_roll_reserve_candidates]),
+            graph,
+            cfg,
+        )
+        reserve_rank = {str(row["order_id"]): dict(row) for row in reserve_seed_df.to_dict("records")}
+        if not reserve_seed_df.empty:
+            diagnostics["top_seed_width_avg"] = float(reserve_seed_df.head(10)["width_headroom_score"].mean())
+            diagnostics["top_seed_extendability_avg"] = float(reserve_seed_df.head(10)["extendability_score"].mean())
+            diagnostics["top_seed_formability_avg"] = float(reserve_seed_df.head(10)["tonnage_formability_score"].mean())
+        small_roll_reserve_candidates.sort(
+            key=lambda item: (
+                -float(reserve_rank.get(str(item[1]), {}).get("seed_score_total", 0.0)),
+                item[0],
+                str(item[1]),
+            )
+        )
         k = min(int(len(small_roll_reserve_candidates) * reserve_bucket_ratio), reserve_bucket_max)
 
         # ---- TWO-LAYER RESERVE BUCKET (candidates + quota) ----
@@ -1264,14 +1949,18 @@ def build_constructive_sequences(
         # Sort reserve seeds by: high small_deg, high tons, tight due_rank
         reserve_seeds = [(oid, rec) for _, oid, rec in small_roll_reserve_candidates if oid in reserve_bucket]
         if reserve_seeds:
-            def reserve_seed_key(item: Tuple[str, dict]) -> Tuple[float, int, int]:
-                oid, rec = item
-                small_d = graph.small_deg.get(oid, 0)
-                tons = float(rec.get("tons", 0) or 0)
-                due_rank = _safe_int_value(rec.get("due_rank", 999), 999)
-                score = (small_d * 10000) + (tons * 10) + max(0, 200 - due_rank)
-                return (-score, due_rank, oid)
-            reserve_seeds.sort(key=reserve_seed_key)
+            reserve_seed_scored = rank_seed_candidates(
+                pd.DataFrame([dict(rec, order_id=oid, line="small_roll") for oid, rec in reserve_seeds]),
+                graph,
+                cfg,
+            )
+            reserve_seed_rank = {str(row["order_id"]): dict(row) for row in reserve_seed_scored.to_dict("records")}
+            reserve_seeds.sort(
+                key=lambda item: (
+                    -float(reserve_seed_rank.get(str(item[0]), {}).get("seed_score_total", 0.0)),
+                    str(item[0]),
+                )
+            )
 
             # ---- Build chains and track quota progress ----
             for oid, rec in reserve_seeds:
@@ -1291,12 +1980,16 @@ def build_constructive_sequences(
                     start_oid=oid,
                     line="small_roll",
                     used_orders=used_orders,
+                    campaign_ton_min=campaign_ton_min,
                     campaign_ton_max=campaign_ton_max,
                     chain_counter=small_roll_seed_chain_counter,
                     blocked_successor_bucket=None,  # small_roll has full access to all orders
                 )
                 if chain is not None and len(chain.order_ids) >= 1:
                     small_roll_seed_chains.append(chain)
+                    if oid in reserve_seed_rank:
+                        seed_diag_samples.append(dict(reserve_seed_rank[oid]))
+                        line_seed_diag_samples["small_roll"].append(dict(reserve_seed_rank[oid]))
                     small_roll_seed_orders_placed += len(chain.order_ids)
                     small_roll_seed_tons10_placed += int(chain.total_tons * 10)
                     small_roll_seed_used_oids.update(chain.order_ids)
@@ -1509,18 +2202,22 @@ def build_constructive_sequences(
 
         diagnostics["dead_island_count"] += line_dead_islands
 
-        # Sort remaining orders by seed quality
-        def seed_quality_key(item: Tuple[str, dict]) -> Tuple[float, int, int]:
-            oid, rec = item
-            due_rank = _safe_int_value(rec.get("due_rank", 999), 999)
-            priority = _safe_int_value(rec.get("priority", 0), 0)
-            tons = float(rec.get("tons", 0) or 0)
-            # Score: prefer high priority, urgent due, large tons, good connectivity
-            connectivity = graph.out_degree.get(oid, 0) + graph.in_degree.get(oid, 0)
-            score = (priority * 10000) + ((100 - min(due_rank, 100)) * 100) + (tons * 0.1) + (connectivity * 10)
-            return (-score, due_rank, oid)  # Negative for descending sort
-
-        remaining_orders.sort(key=seed_quality_key)
+        remaining_seed_scored = rank_seed_candidates(
+            pd.DataFrame([dict(rec, order_id=oid, line=line) for oid, rec in remaining_orders]),
+            graph,
+            cfg,
+        )
+        remaining_seed_rank = {str(row["order_id"]): dict(row) for row in remaining_seed_scored.to_dict("records")}
+        if not remaining_seed_scored.empty and diagnostics.get("top_seed_width_avg", 0.0) == 0.0:
+            diagnostics["top_seed_width_avg"] = float(remaining_seed_scored.head(10)["width_headroom_score"].mean())
+            diagnostics["top_seed_extendability_avg"] = float(remaining_seed_scored.head(10)["extendability_score"].mean())
+            diagnostics["top_seed_formability_avg"] = float(remaining_seed_scored.head(10)["tonnage_formability_score"].mean())
+        remaining_orders.sort(
+            key=lambda item: (
+                -float(remaining_seed_rank.get(str(item[0]), {}).get("seed_score_total", 0.0)),
+                str(item[0]),
+            )
+        )
 
         # Build chains greedily
         for oid, rec in remaining_orders:
@@ -1545,6 +2242,7 @@ def build_constructive_sequences(
                 start_oid=oid,
                 line=line,
                 used_orders=used_orders,
+                campaign_ton_min=campaign_ton_min,
                 campaign_ton_max=campaign_ton_max,
                 chain_counter=chain_counter,
                 blocked_successor_bucket=locked_bucket if line == "big_roll" else None,
@@ -1552,6 +2250,9 @@ def build_constructive_sequences(
 
             if chain is not None and len(chain.order_ids) >= 1:
                 line_chains.append(chain)
+                if oid in remaining_seed_rank:
+                    seed_diag_samples.append(dict(remaining_seed_rank[oid]))
+                    line_seed_diag_samples[str(line)].append(dict(remaining_seed_rank[oid]))
 
         chains_by_line[line] = line_chains
 
@@ -1587,6 +2288,7 @@ def build_constructive_sequences(
             f"avg_length={line_avg_length:.1f}, "
             f"avg_tons={line_avg_tons:.0f}"
         )
+        _log_seed_scoring(line, remaining_seed_scored, line_seed_diag_samples.get(str(line), []))
 
         # ---- Dual-order small-roll reserve diagnostics ----
         dual_with_small = 0
@@ -1724,6 +2426,7 @@ def build_constructive_sequences(
                     graph=graph,
                     used_orders=used_orders,
                     released_orders=retry_released_unused,
+                    campaign_ton_min=campaign_ton_min,
                     campaign_ton_max=campaign_ton_max,
                     diagnostics=diagnostics,
                     existing_chains_by_line=chains_by_line,
@@ -1754,6 +2457,92 @@ def build_constructive_sequences(
     diagnostics["total_orders_dropped"] = len(dropped_seed_orders)
     diagnostics["utilization_rate"] = (
         diagnostics["total_orders_placed"] / max(1, len(orders_df))
+    )
+    if seed_diag_samples:
+        seed_diag_df = pd.DataFrame(seed_diag_samples)
+        diagnostics["selected_seed_score_avg"] = float(seed_diag_df["seed_score_total"].mean())
+        diagnostics["selected_seed_width_percentile_avg"] = float(seed_diag_df["seed_width_percentile"].mean())
+    diagnostics["dead_end_successor_count"] = int(
+        graph.candidate_graph_diagnostics.get("dead_end_successor_count", 0) or 0
+    )
+    diagnostics["successor_reverse_budget_cost_total"] = float(
+        graph.candidate_graph_diagnostics.get("successor_reverse_budget_cost_total", 0.0) or 0.0
+    )
+    diagnostics["dead_end_penalty_total"] = float(
+        graph.candidate_graph_diagnostics.get("dead_end_penalty_total", 0.0) or 0.0
+    )
+    diagnostics["successor_zero_extendable_degree_count"] = int(
+        graph.candidate_graph_diagnostics.get("successor_zero_extendable_degree_count", 0) or 0
+    )
+    diagnostics["successor_low_extendable_degree_count"] = int(
+        graph.candidate_graph_diagnostics.get("successor_low_extendable_degree_count", 0) or 0
+    )
+    _succ_score_count = int(graph.candidate_graph_diagnostics.get("successor_score_component_count", 0) or 0)
+    diagnostics["successor_score_component_avg"] = float(
+        (graph.candidate_graph_diagnostics.get("successor_score_component_sum", 0.0) or 0.0)
+        / max(1, _succ_score_count)
+    )
+    diagnostics["successor_extendability_component_avg"] = float(
+        (graph.candidate_graph_diagnostics.get("successor_extendability_component_sum", 0.0) or 0.0)
+        / max(1, _succ_score_count)
+    )
+    diagnostics["successor_dead_end_penalty_avg"] = float(
+        (graph.candidate_graph_diagnostics.get("successor_dead_end_penalty_sum", 0.0) or 0.0)
+        / max(1, _succ_score_count)
+    )
+    diagnostics["virtual_rescue_attempt_count"] = int(graph.virtual_rescue_attempt_count)
+    diagnostics["virtual_rescue_eligible_count"] = int(graph.virtual_rescue_eligible_count)
+    diagnostics["virtual_rescue_selected_count"] = int(graph.virtual_rescue_selected_count)
+    diagnostics["virtual_rescue_selected_big_roll_count"] = int(graph.virtual_rescue_selected_big_roll_count)
+    diagnostics["virtual_rescue_selected_small_roll_count"] = int(graph.virtual_rescue_selected_small_roll_count)
+    diagnostics["virtual_rescue_cross_min_count"] = int(graph.virtual_rescue_cross_min_count)
+    diagnostics["virtual_rescue_rejected_by_hard"] = int(graph.virtual_rescue_rejected_by_hard)
+    diagnostics["virtual_rescue_rejected_by_budget"] = int(graph.virtual_rescue_rejected_by_budget)
+    diagnostics["successor_cross_min_selected"] = int(graph.successor_cross_min_selected)
+    diagnostics["successor_near_min_selected"] = int(graph.successor_near_min_selected)
+    diagnostics["successor_deadend_rejected_under_min"] = int(graph.successor_deadend_rejected_under_min)
+
+    diagnostics["virtual_rescue_line_stats"] = {
+        str(line): dict(stats) for line, stats in graph.virtual_rescue_line_stats.items()
+    }
+    for _line in diagnostics.get("lines_processed", []):
+        _line = str(_line)
+        line_reason_counts = dict(graph.virtual_rescue_reason_counts_by_line.get(_line, {}))
+        line_stats = dict(graph.virtual_rescue_line_stats.get(_line, {}))
+        line_selected = int(
+            graph.virtual_rescue_selected_big_roll_count if _line == "big_roll"
+            else graph.virtual_rescue_selected_small_roll_count
+        )
+        reason_summary = ",".join(f"{k}:{v}" for k, v in sorted(line_reason_counts.items())) if line_reason_counts else "none"
+        print(
+            f"[APS][VirtualRescueLine] "
+            f"line={_line}, "
+            f"raw_virtual_seen={int(line_stats.get('raw_virtual_seen', 0) or 0)}, "
+            f"hard_pass={int(line_stats.get('hard_pass', 0) or 0)}, "
+            f"hard_reject={int(line_stats.get('hard_reject', 0) or 0)}, "
+            f"attempts={int(line_stats.get('attempt', 0) or 0)}, "
+            f"eligible={int(line_stats.get('eligible', 0) or 0)}, "
+            f"selected={line_selected}, "
+            f"reject_width={int(line_stats.get('reject_width', 0) or 0)}, "
+            f"reject_thickness={int(line_stats.get('reject_thickness', 0) or 0)}, "
+            f"reject_temp={int(line_stats.get('reject_temp', 0) or 0)}, "
+            f"reject_group={int(line_stats.get('reject_group', 0) or 0)}, "
+            f"reject_virtual_chain={int(line_stats.get('reject_virtual_chain', 0) or 0)}, "
+            f"reject_reverse_budget={int(line_stats.get('reject_reverse_budget', 0) or 0)}, "
+            f"reject_real_successor_rich={int(line_stats.get('reject_real_successor_rich', 0) or 0)}, "
+            f"reject_not_under_min={int(line_stats.get('reject_not_under_min', 0) or 0)}, "
+            f"reject_not_closer_to_min={int(line_stats.get('reject_not_closer_to_min', 0) or 0)}, "
+            f"reject_budget={int(line_stats.get('reject_virtual_chain_budget', 0) or 0)}, "
+            f"reasons={reason_summary}"
+        )
+
+    print(
+        f"[APS][SuccessorScoring] "
+        f"cross_min_hits={graph.continuation_cross_min_hits}, "
+        f"cross_min_selected={graph.successor_cross_min_selected}, "
+        f"near_min_selected={graph.successor_near_min_selected}, "
+        f"deadend_rejected_under_min={graph.successor_deadend_rejected_under_min}, "
+        f"virtual_rescue_selected={graph.virtual_rescue_selected_count}"
     )
 
     print(
@@ -1787,13 +2576,38 @@ def build_constructive_sequences(
         f"skipped_by_final_temp_rule={graph.skipped_by_final_temp_rule}, "
         f"skipped_by_final_group_rule={graph.skipped_by_final_group_rule}, "
         f"skipped_by_virtual_chain_rule={graph.skipped_by_virtual_chain_rule}, "
+        f"skipped_by_reverse_width_budget={graph.skipped_by_reverse_width_budget}, "
+        f"accepted_with_reverse_width_budget={graph.accepted_with_reverse_width_budget}, "
+        f"reverse_width_count_used_max={graph.reverse_width_count_used_max}, "
+        f"seed_scoring_enabled={True}, "
+        f"width_desc_seed_bias_enabled={True}, "
+        f"selected_seed_score_avg={diagnostics.get('selected_seed_score_avg', 0.0):.3f}, "
+        f"selected_seed_width_percentile_avg={diagnostics.get('selected_seed_width_percentile_avg', 0.0):.3f}, "
+        f"top_seed_width_avg={diagnostics.get('top_seed_width_avg', 0.0):.3f}, "
+        f"top_seed_extendability_avg={diagnostics.get('top_seed_extendability_avg', 0.0):.3f}, "
+        f"top_seed_formability_avg={diagnostics.get('top_seed_formability_avg', 0.0):.3f}, "
+        f"continuation_bias_used={True}, "
+        f"continuation_bonus_total={graph.continuation_bonus_total:.3f}, "
+        f"continuation_cross_min_hits={graph.continuation_cross_min_hits}, "
+        f"chains_crossed_ton_min_during_constructive={graph.chains_crossed_ton_min_during_constructive}, "
+        f"virtual_rescue_attempt_count={graph.virtual_rescue_attempt_count}, "
+        f"virtual_rescue_eligible_count={graph.virtual_rescue_eligible_count}, "
+        f"virtual_rescue_selected_count={graph.virtual_rescue_selected_count}, "
+        f"virtual_rescue_cross_min_count={graph.virtual_rescue_cross_min_count}, "
+        f"successor_business_scoring_enabled={True}, "
+        f"width_desc_successor_bias_enabled={True}, "
+        f"successor_extendability_bias_enabled={True}, "
+        f"successor_dead_end_penalty_enabled={True}, "
+        f"successor_group_continuity_bias_enabled={True}, "
+        f"successor_reverse_budget_cost_total={diagnostics.get('successor_reverse_budget_cost_total', 0.0):.3f}, "
+        f"successor_zero_extendable_degree_count={diagnostics.get('successor_zero_extendable_degree_count', 0)}, "
+        f"successor_low_extendable_degree_count={diagnostics.get('successor_low_extendable_degree_count', 0)}, "
+        f"successor_score_component_avg={diagnostics.get('successor_score_component_avg', 0.0):.3f}, "
+        f"successor_extendability_component_avg={diagnostics.get('successor_extendability_component_avg', 0.0):.3f}, "
+        f"successor_dead_end_penalty_avg={diagnostics.get('successor_dead_end_penalty_avg', 0.0):.3f}, "
+        f"dead_end_successor_count={diagnostics.get('dead_end_successor_count', 0)}, "
         f"filtered_virtual={graph.filtered_virtual_bridge_edge_count}, "
         f"filtered_real={graph.filtered_real_bridge_edge_count}, "
-        f"virtual_family_in_graph={graph.candidate_graph_diagnostics.get('virtual_family_edge_count', 0)}, "
-        f"virtual_family_pruned_by_chain={graph.candidate_graph_diagnostics.get('virtual_family_filtered_by_chain_limit_count', 0)}, "
-        f"virtual_family_pruned_by_temp={graph.candidate_graph_diagnostics.get('virtual_family_filtered_by_temp_count', 0)}, "
-        f"virtual_family_pruned_by_group={graph.candidate_graph_diagnostics.get('virtual_family_filtered_by_group_count', 0)}, "
-        f"virtual_family_topk_pruned={graph.candidate_graph_diagnostics.get('virtual_family_topk_pruned_count', 0)}, "
         f"seed_first={diagnostics.get('small_roll_seed_first_enabled', False)}, "
         f"small_seed_orders={diagnostics.get('small_roll_seed_orders', 0)}, "
         f"small_seed_tons10={diagnostics.get('small_roll_seed_tons10', 0)}, "
@@ -1838,6 +2652,25 @@ def build_constructive_sequences(
     diagnostics["skipped_by_final_temp_rule"] = graph.skipped_by_final_temp_rule
     diagnostics["skipped_by_final_group_rule"] = graph.skipped_by_final_group_rule
     diagnostics["skipped_by_virtual_chain_rule"] = graph.skipped_by_virtual_chain_rule
+    diagnostics["skipped_by_reverse_width_budget"] = graph.skipped_by_reverse_width_budget
+    diagnostics["accepted_with_reverse_width_budget"] = graph.accepted_with_reverse_width_budget
+    diagnostics["reverse_width_count_used_max"] = graph.reverse_width_count_used_max
+    diagnostics["seed_scoring_enabled"] = True
+    diagnostics["width_desc_seed_bias_enabled"] = True
+    diagnostics["continuation_bias_used"] = True
+    diagnostics["continuation_bonus_total"] = float(graph.continuation_bonus_total)
+    diagnostics["continuation_cross_min_hits"] = int(graph.continuation_cross_min_hits)
+    diagnostics["chains_crossed_ton_min_during_constructive"] = int(
+        graph.chains_crossed_ton_min_during_constructive
+    )
+    diagnostics["virtual_rescue_reason_counts_by_line"] = {
+        str(line): dict(counts) for line, counts in graph.virtual_rescue_reason_counts_by_line.items()
+    }
+    diagnostics["successor_business_scoring_enabled"] = True
+    diagnostics["width_desc_successor_bias_enabled"] = True
+    diagnostics["successor_extendability_bias_enabled"] = True
+    diagnostics["successor_dead_end_penalty_enabled"] = True
+    diagnostics["successor_group_continuity_bias_enabled"] = True
     diagnostics["accepted_virtual_chain_paths"] = int(
         graph.candidate_graph_diagnostics.get("accepted_virtual_chain_paths", 0) or 0
     )
@@ -1873,9 +2706,15 @@ def build_constructive_sequences(
     )
 
 
+# Compatibility alias while mainline wording shifts from "template" to
+# "transition edge cache". Internal storage and behavior are unchanged.
+TransitionEdgeGraph = TemplateEdgeGraph
+
+
 __all__ = [
     "ConstructiveChain",
     "ConstructiveBuildResult",
     "TemplateEdgeGraph",
+    "TransitionEdgeGraph",
     "build_constructive_sequences",
 ]

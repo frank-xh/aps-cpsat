@@ -21,6 +21,21 @@ from aps_cp_sat.config.rule_config import RuleConfig
 from aps_cp_sat.config.score_config import ScoreConfig
 
 
+def _log_model_overrides(base_model: ModelConfig, overrides: dict, source: str) -> None:
+    default_model = ModelConfig()
+    for key, profile_value in overrides.items():
+        if not hasattr(base_model, key):
+            continue
+        base_value = getattr(base_model, key)
+        if base_value == profile_value:
+            continue
+        default_value = getattr(default_model, key, base_value)
+        print(
+            f"[APS][CONFIG_OVERRIDE] key={key}, default={default_value!r}, "
+            f"profile_value={profile_value!r}, source={source}"
+        )
+
+
 def build_profile_config(
     profile_name: str = "default",
     *,
@@ -482,14 +497,14 @@ def build_profile_config(
                 "tail_rebalance_max_pullback_tons10": 2500,
                 "tail_rebalance_accept_if_prev_stays_above_min": True,
                 # ---- Tail Repair Budget: limit search scope ----
-                "max_tail_repair_windows_per_line": 12,
-                "max_tail_repair_windows_total": 24,
+                "max_tail_repair_windows_per_line": 16,
+                "max_tail_repair_windows_total": 32,
                 "max_recut_cutpoints_per_window": 12,
-                "max_fill_candidates_per_tail": 20,
-                "tail_repair_gap_to_min_limit": 220.0,
+                "max_fill_candidates_per_tail": 30,
+                "tail_repair_gap_to_min_limit": 320.0,
                 # ---- Tail Fill From Dropped: make fill branch actually trigger ----
                 "tail_fill_from_dropped_enabled": True,
-                "tail_fill_gap_to_min_limit": 220.0,
+                "tail_fill_gap_to_min_limit": 320.0,
                 "tail_fill_accept_partial_progress": True,
                 "tail_fill_max_inserts_per_tail": 2,
                 "tail_fill_second_pass_gap_limit": 30.0,
@@ -549,20 +564,20 @@ def build_profile_config(
                 "real_bridge_penalty": 40,
             }
         )
-        model = ModelConfig(
-            **{
-                **base_model.__dict__,
+        model_overrides = {
                 "profile_name": "constructive_lns_virtual_guarded_frontload",
                 "main_solver_strategy": "constructive_lns",
                 # LNS parameters
-                "rounds": 10,
-                "constructive_lns_rounds": 10,
-                "lns_early_stop_no_improve_rounds": 3,
-                "lns_max_total_rounds": 10,
-                "lns_min_rounds_before_early_stop": 4,
+                "rounds": 16,
+                "constructive_lns_rounds": 16,
+                "lns_early_stop_no_improve_rounds": 5,
+                "lns_max_total_rounds": 16,
+                "lns_min_rounds_before_early_stop": 6,
                 "constructive_destroy_ratio_min": 0.20,
                 "constructive_destroy_ratio_max": 0.35,
-                "constructive_subproblem_max_orders": 40,
+                "constructive_subproblem_max_orders": 56,
+                "local_cpsat_max_orders": 56,
+                "constructive_local_cpsat_time_limit_seconds": 8.0,
                 "constructive_enable_cp_sat_repair": True,
                 # ---- Guarded virtual family frontload (受控前移实验线) ----
                 # allow_virtual = True means VIRTUAL_BRIDGE_FAMILY_EDGE is allowed (not legacy)
@@ -640,30 +655,109 @@ def build_profile_config(
                 "tail_rebalance_max_pullback_orders": 8,
                 "tail_rebalance_max_pullback_tons10": 2500,
                 "tail_rebalance_accept_if_prev_stays_above_min": True,
-                "max_tail_repair_windows_per_line": 12,
-                "max_tail_repair_windows_total": 24,
-                "max_recut_cutpoints_per_window": 12,
-                "max_fill_candidates_per_tail": 20,
-                "tail_repair_gap_to_min_limit": 220.0,
+                "max_tail_repair_windows_per_line": 6,
+                "max_tail_repair_windows_total": 12,
+                "max_recut_cutpoints_per_window": 6,
+                "max_fill_candidates_per_tail": 30,
+                "tail_repair_gap_to_min_limit": 320.0,
+                "tail_repair_gap_limit_tons": 320.0,
+                "tail_repair_min_fill_ratio": 0.55,
+                "tail_repair_enable_near_viable_only": True,
+                "tail_repair_max_windows_per_line": 6,
+                "constructive_reverse_width_max_count": 3,
+                "continuation_bias_gain_weight": 0.55,
+                "continuation_bias_cross_min_bonus": 65.0,
+                "continuation_bias_near_max_penalty": 45.0,
+                "continuation_bias_near_max_ratio": 0.92,
+                "continuation_bias_short_chain_hold_bonus": 18.0,
+                "successor_weight_width_desc": 0.30,
+                "successor_weight_continuation": 0.48,
+                "successor_weight_extendability": 0.24,
+                "successor_weight_group_continuity": 0.12,
+                "successor_weight_reverse_budget_cost": 0.18,
+                "successor_weight_dead_end_penalty": 0.20,
+                "seed_formability_lookahead_orders": 28,
+                "constructive_typical_order_tons": 25.0,
+                "seed_weight_width_headroom": 0.38,
+                "seed_weight_extendability": 0.16,
+                "seed_weight_tonnage_formability": 0.28,
+                "seed_weight_group_continuity": 0.08,
+                "seed_weight_smoothness": 0.06,
+                "seed_weight_reverse_friendliness": 0.04,
+                "seed_formability_min_projected_tons": 350.0,
+                "seed_formability_soft_gate_enabled": True,
+                "seed_formability_hard_gate_enabled": False,
+                "seed_penalty_low_formability": 80.0,
+                "seed_bonus_width_head": 35.0,
+                "seed_bonus_high_extendability": 25.0,
+                "constructive_virtual_rescue_enabled": True,
+                "constructive_virtual_rescue_under_min_only": True,
+                "constructive_virtual_rescue_real_successor_threshold": 2,
+                "constructive_virtual_rescue_bonus": 45.0,
+                "constructive_virtual_rescue_cross_min_bonus": 85.0,
+                "constructive_virtual_rescue_dead_end_bonus": 40.0,
+                "constructive_virtual_rescue_near_min_ratio": 0.75,
+                "constructive_virtual_rescue_max_virtual_chain": 5,
+                "constructive_virtual_rescue_penalty_floor": 0.0,
+                "constructive_virtual_rescue_big_roll_enabled": True,
+                "constructive_virtual_rescue_big_roll_real_successor_threshold": 8,
+                "constructive_virtual_rescue_ignore_rich_real_when_under_min_deadend": True,
+                "constructive_virtual_rescue_big_roll_bonus": 70.0,
+                "constructive_virtual_rescue_big_roll_cross_min_bonus": 110.0,
+                "constructive_virtual_rescue_big_roll_near_min_ratio": 0.65,
+                "constructive_virtual_rescue_score_scale": 1.0,
+                "constructive_virtual_rescue_min_current_tons": 80.0,
+                "constructive_virtual_rescue_try_even_when_real_successor_exists": True,
+                "successor_cross_min_bonus": 95.0,
+                "successor_near_min_bonus": 35.0,
+                "successor_under_min_gain_weight": 0.70,
+                "successor_near_max_penalty": 60.0,
+                "successor_near_max_ratio": 0.92,
+                "successor_short_chain_deadend_penalty": 55.0,
+                "alns_include_underfilled_fragments": True,
+                "alns_underfilled_fragment_max_count": 80,
+                "alns_underfilled_fragment_min_tons": 80.0,
+                "alns_underfilled_fragment_priority_near_min": True,
+                "alns_underfilled_fragment_allow_virtual_rescue": True,
+                "alns_underfilled_stitch_enabled": True,
+                "alns_underfilled_stitch_max_pairs_per_round": 200,
+                "alns_underfilled_stitch_max_bridge_trials": 3,
+                "alns_underfilled_stitch_allow_virtual": True,
+                "alns_underfilled_stitch_allow_real_bridge": True,
+                "alns_underfilled_stitch_min_combined_tons": 650.0,
+                "alns_underfilled_stitch_max_combined_tons": 2000.0,
+                "alns_underfilled_stitch_prefer_same_line": True,
+                "tail_borrow_from_adjacent_enabled": True,
+                "tail_borrow_max_orders_per_attempt": 2,
                 "tail_fill_from_dropped_enabled": True,
-                "tail_fill_gap_to_min_limit": 220.0,
+                "tail_fill_gap_to_min_limit": 320.0,
                 "tail_fill_accept_partial_progress": True,
                 "tail_fill_max_inserts_per_tail": 2,
                 "tail_fill_second_pass_gap_limit": 30.0,
                 "small_roll_dual_reserve_enabled": True,
                 "small_roll_dual_reserve_penalty": 15,
                 "small_roll_dual_reserve_bucket_enabled": True,
-                "small_roll_dual_reserve_bucket_ratio": 0.45,
+                "small_roll_dual_reserve_bucket_ratio": 0.38,
                 "small_roll_dual_reserve_bucket_max_orders": 120,
                 "small_roll_seed_first_enabled": True,
-                "small_roll_seed_min_orders": 20,
-                "small_roll_seed_min_tons10": 5000,
+                "small_roll_seed_min_orders": 16,
+                "small_roll_seed_min_tons10": 4500,
                 "small_roll_dual_reserve_quota_enabled": True,
                 "small_roll_dual_reserve_quota_min_orders": 25,
                 "small_roll_dual_reserve_quota_min_tons10": 6000,
-                "small_roll_dual_reserve_quota_max_orders": 60,
-                "small_roll_dual_reserve_quota_max_tons10": 14000,
+                "small_roll_dual_reserve_quota_max_orders": 50,
+                "small_roll_dual_reserve_quota_max_tons10": 12000,
                 "big_roll_dual_release_after_small_seed": True,
+        }
+        _log_model_overrides(
+            base_model,
+            model_overrides,
+            source="aps_cp_sat.config.parameters:constructive_lns_virtual_guarded_frontload",
+        )
+        model = ModelConfig(
+            **{
+                **base_model.__dict__,
+                **model_overrides,
             }
         )
         return PlannerConfig(rule=base_rule, model=model, score=score)
@@ -695,14 +789,14 @@ def build_profile_config(
                 # Same ALNS master path as constructive_lns_search
                 "main_solver_strategy": "constructive_lns",
                 # LNS parameters
-                "rounds": 10,
-                "constructive_lns_rounds": 10,
-                "lns_early_stop_no_improve_rounds": 3,
-                "lns_max_total_rounds": 10,
-                "lns_min_rounds_before_early_stop": 4,
+                "rounds": 16,
+                "constructive_lns_rounds": 16,
+                "lns_early_stop_no_improve_rounds": 5,
+                "lns_max_total_rounds": 16,
+                "lns_min_rounds_before_early_stop": 6,
                 "constructive_destroy_ratio_min": 0.20,
                 "constructive_destroy_ratio_max": 0.35,
-                "constructive_subproblem_max_orders": 40,
+                "constructive_subproblem_max_orders": 56,
                 "constructive_enable_cp_sat_repair": True,
                 "constructive_lns_alns_enable_real_bridge_moves": True,
                 # Same direct_only mode as constructive_lns_search
@@ -759,14 +853,14 @@ def build_profile_config(
                 "tail_rebalance_max_pullback_tons10": 2500,
                 "tail_rebalance_accept_if_prev_stays_above_min": True,
                 # ---- Tail Repair Budget: limit search scope ----
-                "max_tail_repair_windows_per_line": 12,
-                "max_tail_repair_windows_total": 24,
+                "max_tail_repair_windows_per_line": 16,
+                "max_tail_repair_windows_total": 32,
                 "max_recut_cutpoints_per_window": 12,
-                "max_fill_candidates_per_tail": 20,
-                "tail_repair_gap_to_min_limit": 220.0,
+                "max_fill_candidates_per_tail": 30,
+                "tail_repair_gap_to_min_limit": 320.0,
                 # ---- Tail Fill From Dropped: make fill branch actually trigger ----
                 "tail_fill_from_dropped_enabled": True,
-                "tail_fill_gap_to_min_limit": 220.0,
+                "tail_fill_gap_to_min_limit": 320.0,
                 "tail_fill_accept_partial_progress": True,
                 "tail_fill_max_inserts_per_tail": 2,
                 "tail_fill_second_pass_gap_limit": 30.0,
@@ -837,12 +931,12 @@ def build_profile_config(
                 # LNS parameters (for block ALNS, not order ALNS)
                 "rounds": 8,  # block-first 默认 8 轮块级 ALNS，先稳后强
                 "constructive_lns_rounds": 8,  # 兼容字段，保持与块级 ALNS 一致
-                "lns_early_stop_no_improve_rounds": 3,
-                "lns_max_total_rounds": 10,
-                "lns_min_rounds_before_early_stop": 4,
+                "lns_early_stop_no_improve_rounds": 5,
+                "lns_max_total_rounds": 16,
+                "lns_min_rounds_before_early_stop": 6,
                 "constructive_destroy_ratio_min": 0.20,
                 "constructive_destroy_ratio_max": 0.35,
-                "constructive_subproblem_max_orders": 40,
+                "constructive_subproblem_max_orders": 56,
                 "constructive_enable_cp_sat_repair": True,
                 # ---- Bridge edge policy: same as guarded frontload ----
                 "allow_virtual_bridge_edge_in_constructive": True,
@@ -966,13 +1060,13 @@ def build_profile_config(
                 "tail_rebalance_max_pullback_orders": 8,
                 "tail_rebalance_max_pullback_tons10": 2500,
                 "tail_rebalance_accept_if_prev_stays_above_min": True,
-                "max_tail_repair_windows_per_line": 12,
-                "max_tail_repair_windows_total": 24,
+                "max_tail_repair_windows_per_line": 16,
+                "max_tail_repair_windows_total": 32,
                 "max_recut_cutpoints_per_window": 12,
-                "max_fill_candidates_per_tail": 20,
-                "tail_repair_gap_to_min_limit": 220.0,
+                "max_fill_candidates_per_tail": 30,
+                "tail_repair_gap_to_min_limit": 320.0,
                 "tail_fill_from_dropped_enabled": True,
-                "tail_fill_gap_to_min_limit": 220.0,
+                "tail_fill_gap_to_min_limit": 320.0,
                 "tail_fill_accept_partial_progress": True,
                 "tail_fill_max_inserts_per_tail": 2,
                 "tail_fill_second_pass_gap_limit": 30.0,

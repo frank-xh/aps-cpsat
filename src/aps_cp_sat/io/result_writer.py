@@ -16,6 +16,7 @@ import pandas as pd
 from openpyxl.utils import get_column_letter
 
 from aps_cp_sat.config.rule_config import RuleConfig
+from aps_cp_sat.model.virtual_order_utils import count_effective_virtual_rows, normalize_effective_virtual_flags
 from aps_cp_sat.rules import RULE_REGISTRY, RuleKey
 from aps_cp_sat.validate.solution_validator import recompute_final_schedule_summary
 
@@ -567,7 +568,7 @@ def export_schedule_results(
     failure_diagnostics: Dict[str, object] | None = None,
     engine_meta: Dict[str, object] | None = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    final_df = final_df.copy()
+    final_df = normalize_effective_virtual_flags(final_df)
     rounds_df = rounds_df.copy()
     dropped_df = dropped_df.copy()
     final_df["engine_used"] = str(engine_used)
@@ -656,6 +657,7 @@ def export_schedule_results(
             unroutable_slot_count = computed_unroutable
     final_schedule_summary = recompute_final_schedule_summary(final_df, rule)
     if isinstance(em, dict):
+        em["final_virtual_rows_exported"] = int(count_effective_virtual_rows(final_df))
         em["campaign_cnt"] = int(final_schedule_summary.get("campaign_cnt", 0) or 0)
         em["campaign_count"] = int(final_schedule_summary.get("campaign_cnt", 0) or 0)
         em["underfilled_slot_count"] = int(final_schedule_summary.get("underfilled_slot_count", 0) or 0)
@@ -1383,7 +1385,7 @@ def export_schedule_results(
 
     show_cols = [
         "global_seq", "line_name", "line", "line_seq", "master_slot", "campaign_id", "campaign_id_hint", "campaign_seq", "campaign_real_seq",
-        "order_id", "source_order_id", "parent_order_id", "lot_id", "is_virtual", "grade", "steel_group",
+        "order_id", "source_order_id", "parent_order_id", "lot_id", "is_virtual", "virtual_origin", "virtual_spec_key", "grade", "steel_group",
         "width", "thickness", "temp_min", "temp_max", "temp_mean", "tons", "backlog", "due_date", "due_bucket",
     ]
     schedule = final_df[[c for c in show_cols if c in final_df.columns]].copy()

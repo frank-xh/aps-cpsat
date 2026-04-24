@@ -3064,6 +3064,165 @@ def smoke_select_neighborhood_orders_df_passthrough() -> bool:
     return all_ok
 
 
+def smoke_final_audit_contract_violation_on_missing_temp() -> bool:
+    print("\n[smoke_final_audit_contract_violation_on_missing_temp]")
+    import pandas as pd
+
+    from aps_cp_sat.validate.final_schedule_audit import run_final_schedule_audit
+
+    cfg = build_profile_config("constructive_lns_real_bridge_frontload")
+    schedule_df = pd.DataFrame([
+        {
+            "order_id": "o1",
+            "line": "big_roll",
+            "campaign_id": "C1",
+            "sequence": 1,
+            "width": 1262.0,
+            "thickness": 2.0,
+            "steel_group": "G1",
+            "tons": 100.0,
+            "is_virtual": False,
+            "line_capability": "dual",
+            "virtual_origin": "",
+            "virtual_spec_key": "",
+            "virtual_usage_type": "",
+            "temp_min": pd.NA,
+            "temp_max": 610.0,
+        },
+        {
+            "order_id": "o2",
+            "line": "big_roll",
+            "campaign_id": "C1",
+            "sequence": 2,
+            "width": 1250.0,
+            "thickness": 2.0,
+            "steel_group": "G1",
+            "tons": 100.0,
+            "is_virtual": False,
+            "line_capability": "dual",
+            "virtual_origin": "",
+            "virtual_spec_key": "",
+            "virtual_usage_type": "",
+            "temp_min": 580.0,
+            "temp_max": 620.0,
+        },
+    ])
+    audit = run_final_schedule_audit(schedule_df, cfg.rule, {})
+    summary = audit.get("summary", {})
+    details = audit.get("details", {})
+    _check_result("data_contract_violation_count", int(summary.get("data_contract_violation_count", 0)) == 1)
+    _check_result("temperature_violation_count_zero", int(summary.get("temperature_violation_count", 0)) == 0)
+    _check_result("final_hard_violation_count_total_zero", int(summary.get("final_hard_violation_count_total", 0)) == 0)
+    contract_rows = details.get("contract", [])
+    _check_result(
+        "contract_detail_result",
+        bool(contract_rows) and str(contract_rows[0].get("audit_result", "")) == "DATA_CONTRACT_VIOLATION",
+    )
+    return (
+        int(summary.get("data_contract_violation_count", 0)) == 1
+        and int(summary.get("temperature_violation_count", 0)) == 0
+        and int(summary.get("final_hard_violation_count_total", 0)) == 0
+    )
+
+
+def smoke_decode_recovers_required_temp_columns() -> bool:
+    print("\n[smoke_decode_recovers_required_temp_columns]")
+    import pandas as pd
+
+    from aps_cp_sat.decode.result_decoder import decode_solution
+    from aps_cp_sat.domain.models import ColdRollingResult
+
+    cfg = build_profile_config("constructive_lns_real_bridge_frontload")
+    planned_df = pd.DataFrame([
+        {
+            "order_id": "r1",
+            "line": "big_roll",
+            "campaign_id_hint": "C1",
+            "campaign_seq_hint": 1,
+            "master_seq": 1,
+            "tons": 100.0,
+            "is_virtual": False,
+            "width": 1262.0,
+            "thickness": 2.0,
+            "steel_group": "G1",
+        },
+        {
+            "order_id": "r2",
+            "line": "big_roll",
+            "campaign_id_hint": "C1",
+            "campaign_seq_hint": 2,
+            "master_seq": 2,
+            "tons": 100.0,
+            "is_virtual": False,
+            "width": 1250.0,
+            "thickness": 2.0,
+            "steel_group": "G1",
+        },
+    ])
+    order_lookup = {
+        "r1": {"order_id": "r1", "temp_min": 580.0, "temp_max": 620.0, "line_capability": "dual"},
+        "r2": {"order_id": "r2", "temp_min": 585.0, "temp_max": 625.0, "line_capability": "dual"},
+    }
+    result = ColdRollingResult(
+        schedule_df=planned_df,
+        rounds_df=pd.DataFrame(),
+        output_path="smoke.xlsx",
+        dropped_df=pd.DataFrame(),
+        engine_meta={"engine_used": "constructive_lns", "order_lookup": order_lookup},
+        config=cfg,
+    )
+    decoded = decode_solution(result)
+    schedule_df = decoded.schedule_df
+    meta = decoded.engine_meta or {}
+    _check_result("decoded_has_temp_min", "temp_min" in schedule_df.columns and schedule_df["temp_min"].notna().all())
+    _check_result("decoded_has_temp_max", "temp_max" in schedule_df.columns and schedule_df["temp_max"].notna().all())
+    _check_result("decoded_has_sequence", "sequence" in schedule_df.columns)
+    _check_result("decode_missing_required_cols_empty", meta.get("decode_missing_required_cols", []) == [])
+    missing_cols = set(meta.get("decode_validation_missing_cols", []))
+    _check_result("decode_validation_missing_cols_no_temp", "temp_min" not in missing_cols and "temp_max" not in missing_cols)
+    return (
+        "temp_min" in schedule_df.columns
+        and "temp_max" in schedule_df.columns
+        and schedule_df["temp_min"].notna().all()
+        and schedule_df["temp_max"].notna().all()
+        and meta.get("decode_missing_required_cols", []) == []
+        and "temp_min" not in missing_cols
+        and "temp_max" not in missing_cols
+    )
+
+
+def smoke_virtual_to_real_width_increase_rejected() -> bool:
+    print("\n[smoke_virtual_to_real_width_increase_rejected]")
+    from aps_cp_sat.model.edge_hard_filter import is_hard_adjacent_feasible
+
+    cfg = build_profile_config("constructive_lns_real_bridge_frontload")
+    prev_order = {
+        "order_id": "VIRTUAL_PREBUILT__small_roll__W1250__T2.00__01",
+        "is_virtual": True,
+        "virtual_origin": "prebuilt_inventory",
+        "width": 1250.0,
+        "thickness": 2.0,
+        "temp_min": 580.0,
+        "temp_max": 620.0,
+        "steel_group": "G1",
+        "line_capability": "small_only",
+    }
+    next_order = {
+        "order_id": "0030084048-000070",
+        "is_virtual": False,
+        "width": 1262.0,
+        "thickness": 2.0,
+        "temp_min": 585.0,
+        "temp_max": 625.0,
+        "steel_group": "G1",
+        "line_capability": "small_only",
+    }
+    ok, reason = is_hard_adjacent_feasible(prev_order, next_order, cfg, {"line": "small_roll", "edge_type": "DIRECT_EDGE"})
+    _check_result("virtual_to_real_width_increase_blocked", not ok)
+    _check_result("virtual_to_real_width_reason", reason == "FINAL_WIDTH_RULE")
+    return (not ok) and reason == "FINAL_WIDTH_RULE"
+
+
 def smoke_bridge_ton_rescue_current_block_segment_count() -> bool:
     """
     Verify _try_bridge_ton_rescue_recut has current_block_segment_count parameter
@@ -3239,6 +3398,10 @@ def _main() -> int:
         ("smoke_bridge_ton_rescue_current_block_segment_count", smoke_bridge_ton_rescue_current_block_segment_count),
         # ---- Smoke test for candidate vs target tons decoupling ----
         ("smoke_candidate_vs_target_tons_decoupling", smoke_candidate_vs_target_tons_decoupling),
+        # ---- Decode / final audit / hard adjacency contract smokes ----
+        ("smoke_final_audit_contract_violation_on_missing_temp", smoke_final_audit_contract_violation_on_missing_temp),
+        ("smoke_decode_recovers_required_temp_columns", smoke_decode_recovers_required_temp_columns),
+        ("smoke_virtual_to_real_width_increase_rejected", smoke_virtual_to_real_width_increase_rejected),
     ]:
         try:
             ok = fn()

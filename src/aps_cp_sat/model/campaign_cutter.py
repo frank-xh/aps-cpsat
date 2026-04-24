@@ -30,8 +30,16 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from aps_cp_sat.config import PlannerConfig
+from aps_cp_sat.model.business_scoring_common import is_near_viable_tons
+from aps_cp_sat.model.candidate_graph_types import DIRECT_EDGE
 from aps_cp_sat.model.constructive_sequence_builder import ConstructiveChain
+from aps_cp_sat.model.edge_hard_filter import (
+    accumulate_adj_hard_filter_rejection,
+    log_adj_hard_filter,
+    sequence_pair_passes_final_hard_rules,
+)
 from aps_cp_sat.model.graph_unused_pool import collect_graph_unused_candidates
+from aps_cp_sat.model.reverse_width_budget import evaluate_sequence_reverse_width_budget
 from aps_cp_sat.transition.bridge_rules import _is_pc, _temp_overlap_len, _thick_ok, _txt
 
 
@@ -324,12 +332,301 @@ def _build_segment(
 # Tail Rebalancing: rescue underfilled tails by pullback from previous segment
 # ---------------------------------------------------------------------------
 
+def _build_order_record_by_oid(df: pd.DataFrame | None) -> dict[str, dict]:
+    if df is None or df.empty or "order_id" not in df.columns:
+        return {}
+    recs: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        oid = str(row.get("order_id", ""))
+        if not oid:
+            continue
+        recs[oid] = dict(row)
+    return recs
+
+
+def _segment_passes_pair_and_reverse_budget(
+    order_ids: List[str],
+    line: str,
+    cfg: PlannerConfig,
+    order_record_by_oid: dict[str, dict],
+    tpl_keys: set[tuple[str, str]] | None = None,
+) -> tuple[bool, str]:
+    if len(order_ids) <= 1:
+        return True, "OK"
+    tpl_keyset = set(tpl_keys or set())
+    rejection_counts: dict[str, int] = {}
+    for i in range(len(order_ids) - 1):
+        left = str(order_ids[i])
+        right = str(order_ids[i + 1])
+        if tpl_keyset and (left, right) not in tpl_keyset:
+            return False, "TEMPLATE_PAIR_INVALID_AFTER_REPAIR"
+        ok, reason = sequence_pair_passes_final_hard_rules(
+            order_record_by_oid.get(left, {}),
+            order_record_by_oid.get(right, {}),
+            cfg,
+            {
+                "line": line,
+                "edge_type": DIRECT_EDGE,
+            },
+        )
+        if not ok:
+            rejection_counts = accumulate_adj_hard_filter_rejection(rejection_counts, str(reason or ""))
+            log_adj_hard_filter("campaign_cutter_segment_check", rejection_counts)
+            return False, str(reason or "FINAL_HARD_RULE_FAIL")
+
+    max_reverse = int(getattr(getattr(cfg, "model", None), "constructive_reverse_width_max_count", 2) or 2)
+    rev_ok, _state = evaluate_sequence_reverse_width_budget(
+        order_ids=order_ids,
+        order_record_by_oid=order_record_by_oid,
+        line=line,
+        max_reverse_count=max_reverse,
+    )
+    if not rev_ok:
+        rejection_counts = accumulate_adj_hard_filter_rejection(rejection_counts, "FINAL_REVERSE_WIDTH_BUDGET_RULE")
+        log_adj_hard_filter("campaign_cutter_segment_check", rejection_counts)
+        return False, "REVERSE_WIDTH_BUDGET_EXCEEDED"
+    return True, "OK"
+
+
+def _segment_reverse_width_count(
+    order_ids: List[str],
+    order_record_by_oid: dict[str, dict],
+    line: str,
+    cfg: PlannerConfig,
+) -> int:
+    max_reverse = int(getattr(getattr(cfg, "model", None), "constructive_reverse_width_max_count", 2) or 2)
+    _ok, state = evaluate_sequence_reverse_width_budget(
+        order_ids=order_ids,
+        order_record_by_oid=order_record_by_oid,
+        line=line,
+        max_reverse_count=max_reverse,
+    )
+    return int(getattr(state, "reverse_width_count", 0) or 0)
+
+
+def is_near_viable_segment(seg: CampaignSegment, cfg: PlannerConfig) -> bool:
+    """业务化 near-viable 判定：接近 ton_min 的尾段值得进入 repair。"""
+    cfg_model = getattr(cfg, "model", None) if cfg else None
+    ton_min = float(getattr(cfg.rule, "campaign_ton_min", 700.0) if cfg.rule else 700.0)
+    gap_limit = float(
+        getattr(cfg_model, "tail_repair_gap_limit_tons", getattr(cfg_model, "tail_repair_gap_to_min_limit", 220.0))
+        if cfg_model else 220.0
+    )
+    min_fill_ratio = float(getattr(cfg_model, "tail_repair_min_fill_ratio", 0.8) if cfg_model else 0.8)
+    return is_near_viable_tons(
+        seg.total_tons,
+        ton_min,
+        gap_limit=gap_limit,
+        min_fill_ratio=min_fill_ratio,
+    )
+
+
+def _try_borrow_from_adjacent_segment(
+    prev_seg: CampaignSegment | None,
+    tail_seg: CampaignSegment,
+    next_seg: CampaignSegment | None,
+    order_tons: Dict[str, float],
+    cfg: PlannerConfig,
+    tpl_df: pd.DataFrame | None,
+    candidate_graph=None,
+    graph_orders_df: pd.DataFrame | None = None,
+    order_record_by_oid: dict[str, dict] | None = None,
+) -> tuple[bool, CampaignSegment | None, CampaignSegment | None, CampaignSegment | None, dict]:
+    """Borrow 1~2 orders from adjacent segment when dropped-pool fill is empty."""
+    _ = candidate_graph
+    diag = {
+        "method": "BORROW_FROM_ADJACENT_SEGMENT",
+        "attempted": True,
+        "success": False,
+        "borrow_side": "",
+        "borrow_k": 0,
+        "donor_rank_score": 0.0,
+        "failure_reason": "",
+    }
+    ton_min = float(getattr(cfg.rule, "campaign_ton_min", 700.0) if cfg.rule else 700.0)
+    ton_max = float(getattr(cfg.rule, "campaign_ton_max", 2000.0) if cfg.rule else 2000.0)
+    ton_target = float(getattr(cfg.rule, "campaign_ton_target", 1800.0) if cfg.rule else 1800.0)
+    cfg_model = getattr(cfg, "model", None) if cfg else None
+    if not bool(getattr(cfg_model, "tail_borrow_from_adjacent_enabled", True) if cfg_model else True):
+        diag["failure_reason"] = "BORROW_DISABLED"
+        return False, None, None, None, diag
+    max_borrow_k = int(getattr(cfg_model, "tail_borrow_max_orders_per_attempt", 2) if cfg_model else 2)
+    max_borrow_k = max(1, min(2, max_borrow_k))
+    order_record_by_oid = dict(order_record_by_oid or _build_order_record_by_oid(graph_orders_df))
+
+    tpl_keys: set[tuple[str, str]] = set()
+    if tpl_df is not None and not tpl_df.empty:
+        for _, trow in tpl_df.iterrows():
+            tpl_keys.add((str(trow.get("from_order_id", "")), str(trow.get("to_order_id", ""))))
+
+    options = []
+    if prev_seg is not None:
+        options.append(("prev", prev_seg))
+    if next_seg is not None:
+        options.append(("next", next_seg))
+    if not options:
+        diag["failure_reason"] = "NO_ADJACENT_DONOR"
+        return False, None, None, None, diag
+
+    # Prefer donors with more extra tons above min
+    options.sort(key=lambda x: float(x[1].total_tons - ton_min), reverse=True)
+
+    best = None
+    best_score = float("inf")
+    reject_counter = Counter()
+    for side, donor in options:
+        donor_oids = list(donor.order_ids)
+        if len(donor_oids) <= 1:
+            continue
+        for k in range(1, max_borrow_k + 1):
+            if len(donor_oids) <= k:
+                continue
+            if side == "prev":
+                moved = donor_oids[-k:]
+                donor_new_oids = donor_oids[:-k]
+                recv_new_oids = list(moved) + list(tail_seg.order_ids)
+            else:
+                moved = donor_oids[:k]
+                donor_new_oids = donor_oids[k:]
+                recv_new_oids = list(tail_seg.order_ids) + list(moved)
+            moved_tons = sum(float(order_tons.get(oid, 0.0) or 0.0) for oid in moved)
+            donor_new_tons = float(donor.total_tons) - moved_tons
+            recv_new_tons = float(tail_seg.total_tons) + moved_tons
+            print(
+                f"[APS][TAIL_BORROW_ATTEMPT] line={tail_seg.line}, "
+                f"donor_seg={donor.campaign_local_id}, receiver_seg={tail_seg.campaign_local_id}, "
+                f"side={side}, k={k}, borrowed_orders={moved}, "
+                f"donor_tons_before={donor.total_tons:.1f}, donor_tons_after={donor_new_tons:.1f}, "
+                f"receiver_tons_before={tail_seg.total_tons:.1f}, receiver_tons_after={recv_new_tons:.1f}"
+            )
+            if donor_new_tons < ton_min - 1e-6:
+                reject_counter["TON_WINDOW_DONOR_BELOW_MIN"] += 1
+                print(
+                    f"[APS][TAIL_BORROW_CHECK] line={tail_seg.line}, donor_seg={donor.campaign_local_id}, "
+                    f"receiver_seg={tail_seg.campaign_local_id}, side={side}, k={k}, "
+                    f"result=FAIL, fail_reason=TON_WINDOW_DONOR_BELOW_MIN"
+                )
+                continue
+            if recv_new_tons > ton_max + 1e-6:
+                reject_counter["TON_WINDOW_RECEIVER_ABOVE_MAX"] += 1
+                print(
+                    f"[APS][TAIL_BORROW_CHECK] line={tail_seg.line}, donor_seg={donor.campaign_local_id}, "
+                    f"receiver_seg={tail_seg.campaign_local_id}, side={side}, k={k}, "
+                    f"result=FAIL, fail_reason=TON_WINDOW_RECEIVER_ABOVE_MAX"
+                )
+                continue
+            donor_ok, donor_reason = _segment_passes_pair_and_reverse_budget(
+                donor_new_oids, donor.line, cfg, order_record_by_oid, tpl_keys
+            )
+            if not donor_ok:
+                _reason_key = str(donor_reason or "DONOR_INVALID")
+                reject_counter[_reason_key] += 1
+                print(
+                    f"[APS][TAIL_BORROW_CHECK] line={tail_seg.line}, donor_seg={donor.campaign_local_id}, "
+                    f"receiver_seg={tail_seg.campaign_local_id}, side={side}, k={k}, "
+                    f"result=FAIL, fail_reason={_reason_key}"
+                )
+                continue
+            recv_ok, recv_reason = _segment_passes_pair_and_reverse_budget(
+                recv_new_oids, tail_seg.line, cfg, order_record_by_oid, tpl_keys
+            )
+            if not recv_ok:
+                _reason_key = str(recv_reason or "RECEIVER_INVALID")
+                reject_counter[_reason_key] += 1
+                print(
+                    f"[APS][TAIL_BORROW_CHECK] line={tail_seg.line}, donor_seg={donor.campaign_local_id}, "
+                    f"receiver_seg={tail_seg.campaign_local_id}, side={side}, k={k}, "
+                    f"result=FAIL, fail_reason={_reason_key}"
+                )
+                continue
+            reverse_after = _segment_reverse_width_count(
+                recv_new_oids, order_record_by_oid, tail_seg.line, cfg
+            )
+            print(
+                f"[APS][TAIL_BORROW_CHECK] line={tail_seg.line}, donor_seg={donor.campaign_local_id}, "
+                f"receiver_seg={tail_seg.campaign_local_id}, side={side}, k={k}, "
+                f"reverse_width_count_after={reverse_after}, result=OK"
+            )
+            gap_after = max(0.0, ton_min - recv_new_tons)
+            donor_slack = max(0.0, donor_new_tons - ton_min)
+            smooth_penalty = abs(recv_new_tons - ton_target) / max(1.0, ton_target)
+            reverse_penalty = reverse_after * 8.0
+            donor_rank_score = (
+                (gap_after * 1.0)
+                + smooth_penalty
+                + reverse_penalty
+                - min(300.0, donor_slack) * 0.02
+            )
+            if donor_rank_score < best_score:
+                best_score = donor_rank_score
+                best = {
+                    "side": side,
+                    "k": k,
+                    "donor_seg": donor,
+                    "donor_new_oids": donor_new_oids,
+                    "recv_new_oids": recv_new_oids,
+                    "donor_new_tons": donor_new_tons,
+                    "recv_new_tons": recv_new_tons,
+                    "donor_rank_score": donor_rank_score,
+                }
+
+    if not best:
+        if reject_counter:
+            diag["failure_reason"] = str(reject_counter.most_common(1)[0][0])
+        else:
+            diag["failure_reason"] = "BORROW_NOT_FEASIBLE"
+        print(
+            f"[APS][TAIL_BORROW_RESULT] line={tail_seg.line}, donor_seg={getattr(prev_seg, 'campaign_local_id', None)}, "
+            f"receiver_seg={tail_seg.campaign_local_id}, result=FAIL, fail_reason={diag['failure_reason']}"
+        )
+        return False, None, None, None, diag
+
+    donor_seg = best["donor_seg"]
+    new_donor = CampaignSegment(
+        line=donor_seg.line,
+        campaign_local_id=donor_seg.campaign_local_id,
+        order_ids=list(best["donor_new_oids"]),
+        total_tons=float(best["donor_new_tons"]),
+        cut_reason=donor_seg.cut_reason,
+        start_order_id=str(best["donor_new_oids"][0]),
+        end_order_id=str(best["donor_new_oids"][-1]),
+        edge_count=max(0, len(best["donor_new_oids"]) - 1),
+        is_valid=float(best["donor_new_tons"]) >= ton_min - 1e-6,
+    )
+    new_tail = CampaignSegment(
+        line=tail_seg.line,
+        campaign_local_id=tail_seg.campaign_local_id,
+        order_ids=list(best["recv_new_oids"]),
+        total_tons=float(best["recv_new_tons"]),
+        cut_reason=tail_seg.cut_reason,
+        start_order_id=str(best["recv_new_oids"][0]),
+        end_order_id=str(best["recv_new_oids"][-1]),
+        edge_count=max(0, len(best["recv_new_oids"]) - 1),
+        is_valid=float(best["recv_new_tons"]) >= ton_min - 1e-6,
+    )
+    diag["success"] = True
+    diag["borrow_side"] = str(best["side"])
+    diag["borrow_k"] = int(best["k"])
+    diag["donor_rank_score"] = float(best.get("donor_rank_score", 0.0) or 0.0)
+    reverse_after = _segment_reverse_width_count(
+        list(best["recv_new_oids"]), order_record_by_oid, tail_seg.line, cfg
+    )
+    print(
+        f"[APS][TAIL_BORROW_RESULT] line={tail_seg.line}, donor_seg={donor_seg.campaign_local_id}, "
+        f"receiver_seg={tail_seg.campaign_local_id}, side={diag['borrow_side']}, k={diag['borrow_k']}, "
+        f"donor_tons_before={donor_seg.total_tons:.1f}, donor_tons_after={float(best['donor_new_tons']):.1f}, "
+        f"receiver_tons_before={tail_seg.total_tons:.1f}, receiver_tons_after={float(best['recv_new_tons']):.1f}, "
+        f"reverse_width_count_after={reverse_after}, result=OK"
+    )
+    return True, new_donor, new_tail, donor_seg, diag
+
 def _try_shift_from_prev(
     prev_seg: CampaignSegment,
     tail_seg: CampaignSegment,
     order_tons: Dict[str, float],
     cfg: PlannerConfig,
     tpl_df: pd.DataFrame | None = None,
+    order_record_by_oid: dict[str, dict] | None = None,
 ) -> Tuple[bool, Optional[CampaignSegment], Optional[CampaignSegment], dict]:
     """
     Strategy B (SECONDARY): Shift K orders from the END of prev_seg to the START of tail_seg.
@@ -378,6 +675,7 @@ def _try_shift_from_prev(
     ton_min = float(getattr(cfg.rule, "campaign_ton_min", 500.0) if cfg.rule else 500.0)
     ton_max = float(getattr(cfg.rule, "campaign_ton_max", 2000.0) if cfg.rule else 2000.0)
     ton_target = float(getattr(cfg.rule, "campaign_ton_target", 1500.0) if cfg.rule else 1500.0)
+    order_record_by_oid = dict(order_record_by_oid or {})
 
     max_pullback_orders = int(getattr(cfg_model, "tail_rebalance_max_pullback_orders", 8) if cfg_model else 8)
     max_pullback_tons10 = int(getattr(cfg_model, "tail_rebalance_max_pullback_tons10", 2500) if cfg_model else 2500)
@@ -401,14 +699,16 @@ def _try_shift_from_prev(
         for _, trow in tpl_df.iterrows():
             tpl_keys.add((str(trow.get("from_order_id", "")), str(trow.get("to_order_id", ""))))
 
-    def check_pairs(oids: List[str]) -> bool:
-        """Check all adjacent pairs in oids are template-valid."""
-        if not tpl_keys or len(oids) < 2:
-            return True
-        for i in range(len(oids) - 1):
-            if (oids[i], oids[i + 1]) not in tpl_keys:
-                return False
-        return True
+    rec_by_oid = dict(order_record_by_oid or {})
+
+    def check_pairs(oids: List[str]) -> tuple[bool, str]:
+        return _segment_passes_pair_and_reverse_budget(
+            order_ids=oids,
+            line=tail_seg.line,
+            cfg=cfg,
+            order_record_by_oid=rec_by_oid,
+            tpl_keys=tpl_keys,
+        )
 
     best_k = 0
     best_score = float("inf")
@@ -442,9 +742,11 @@ def _try_shift_from_prev(
         new_tail_oids_k = pull_oids + tail_oids
 
         # Template pair validation for both new segments
-        if not check_pairs(new_prev_oids_k):
+        prev_ok, _prev_reason = check_pairs(new_prev_oids_k)
+        if not prev_ok:
             continue
-        if not check_pairs(new_tail_oids_k):
+        tail_ok, _tail_reason = check_pairs(new_tail_oids_k)
+        if not tail_ok:
             continue
 
         valid_k_count += 1
@@ -531,6 +833,7 @@ def _try_fill_from_dropped(
     tpl_df: pd.DataFrame | None = None,
     candidate_graph=None,
     graph_orders_df: pd.DataFrame | None = None,
+    order_record_by_oid: dict[str, dict] | None = None,
     max_candidates: int = 20,
 ) -> Tuple[bool, Optional[CampaignSegment], dict]:
     """
@@ -741,6 +1044,21 @@ def _try_fill_from_dropped(
         edge_count=max(0, len(new_tail_oids) - 1),
         is_valid=(best_tail_after_tons >= ton_min),
     )
+    rec_by_oid = dict(order_record_by_oid or _build_order_record_by_oid(graph_orders_df if graph_orders_df is not None else orders_df))
+    tpl_keys: set[tuple[str, str]] = set()
+    if tpl_df is not None and not tpl_df.empty:
+        for _, trow in tpl_df.iterrows():
+            tpl_keys.add((str(trow.get("from_order_id", "")), str(trow.get("to_order_id", ""))))
+    seq_ok, seq_reason = _segment_passes_pair_and_reverse_budget(
+        order_ids=new_tail_oids,
+        line=tail_seg.line,
+        cfg=cfg,
+        order_record_by_oid=rec_by_oid,
+        tpl_keys=tpl_keys,
+    )
+    if not seq_ok:
+        diagnostics["failure_reason"] = str(seq_reason)
+        return False, None, diagnostics
 
     if is_partial:
         diagnostics["success"] = True
@@ -780,6 +1098,7 @@ def _try_merge_with_prev(
     order_tons: Dict[str, float],
     cfg: PlannerConfig,
     tpl_df: pd.DataFrame | None = None,
+    order_record_by_oid: dict[str, dict] | None = None,
 ) -> Tuple[bool, Optional[CampaignSegment], dict]:
     """
     Strategy C (fallback): Merge tail_seg into prev_seg (append all tail orders to prev).
@@ -816,15 +1135,21 @@ def _try_merge_with_prev(
 
     merged_oids = list(prev_seg.order_ids) + list(tail_seg.order_ids)
 
-    # Template pair validation
+    tpl_keys: set[tuple[str, str]] = set()
     if tpl_df is not None and not tpl_df.empty:
-        tpl_keys: set = set()
         for _, trow in tpl_df.iterrows():
             tpl_keys.add((str(trow.get("from_order_id", "")), str(trow.get("to_order_id", ""))))
-        for i in range(len(merged_oids) - 1):
-            if (merged_oids[i], merged_oids[i + 1]) not in tpl_keys:
-                diagnostics["failure_reason"] = "TEMPLATE_PAIR_INVALID_AFTER_REPAIR"
-                return False, None, diagnostics
+    rec_by_oid = dict(order_record_by_oid or {})
+    seq_ok, seq_reason = _segment_passes_pair_and_reverse_budget(
+        order_ids=merged_oids,
+        line=tail_seg.line,
+        cfg=cfg,
+        order_record_by_oid=rec_by_oid,
+        tpl_keys=tpl_keys,
+    )
+    if not seq_ok:
+        diagnostics["failure_reason"] = str(seq_reason)
+        return False, None, diagnostics
 
     merged_seg = CampaignSegment(
         line=prev_seg.line,
@@ -854,6 +1179,7 @@ def _try_recut_two_segments(
     order_tons: Dict[str, float],
     cfg: PlannerConfig,
     tpl_df: pd.DataFrame | None = None,
+    order_record_by_oid: dict[str, dict] | None = None,
     recut_disabled: bool = False,
 ) -> Tuple[bool, Optional[CampaignSegment], Optional[CampaignSegment], dict]:
     """
@@ -936,16 +1262,11 @@ def _try_recut_two_segments(
             is_valid=(tons >= ton_min),
         ), tons
 
-    def check_template(oids: List[str]) -> bool:
-        if tpl_df is None or tpl_df.empty or len(oids) < 2:
-            return True
-        tpl_keys: set = set()
+    rec_by_oid = dict(order_record_by_oid or {})
+    tpl_keys: set[tuple[str, str]] = set()
+    if tpl_df is not None and not tpl_df.empty:
         for _, trow in tpl_df.iterrows():
             tpl_keys.add((str(trow.get("from_order_id", "")), str(trow.get("to_order_id", ""))))
-        for i in range(len(oids) - 1):
-            if (oids[i], oids[i + 1]) not in tpl_keys:
-                return False
-        return True
 
     best_k = -1
     best_score = (float("inf"), float("inf"), float("inf"))
@@ -1014,9 +1335,23 @@ def _try_recut_two_segments(
         right_oids = all_oids[k:]
 
         # Template validation
-        if not check_template(left_oids):
+        left_ok, _left_reason = _segment_passes_pair_and_reverse_budget(
+            order_ids=left_oids,
+            line=tail_seg.line,
+            cfg=cfg,
+            order_record_by_oid=rec_by_oid,
+            tpl_keys=tpl_keys,
+        )
+        if not left_ok:
             continue
-        if not check_template(right_oids):
+        right_ok, _right_reason = _segment_passes_pair_and_reverse_budget(
+            order_ids=right_oids,
+            line=tail_seg.line,
+            cfg=cfg,
+            order_record_by_oid=rec_by_oid,
+            tpl_keys=tpl_keys,
+        )
+        if not right_ok:
             continue
 
         right_is_valid = right_tons >= ton_min - 1e-6
@@ -4458,12 +4793,14 @@ def _rebalance_underfilled_segments(
         A. RECUT_TWO_SEGMENTS: recut immediately preceding + tail with exhaustive cut point search
         B. SHIFT_FROM_PREV: pull back K orders from the immediately preceding segment
         C. TAIL_FILL_FROM_DROPPED: fill underfilled tail from dropped candidates (small gap only)
-        D. MERGE_WITH_PREV: merge underfilled tail into the immediately preceding segment (LAST RESORT)
+        D. BORROW_FROM_ADJACENT_SEGMENT: borrow 1~2 orders from adjacent donor segments
+        E. MERGE_WITH_PREV: merge underfilled tail into the immediately preceding segment (LAST RESORT)
 
     Rationale for priority:
         - RECUT is preferred: can keep both segments valid, preserves structure
         - SHIFT is second: simple boundary adjustment, keeps both segments valid often
         - FILL is third: for gaps up to tail_fill_gap_to_min_limit (220 tons by default), adds orders from dropped pool
+        - BORROW is fourth: when dropped-pool empty, rebalance with adjacent donor without changing multiplicity
         - MERGE is last resort: destroys segment boundary, reduces total campaign count
 
     Window definition: an underfilled segment at index i in line_ordered_segments
@@ -4475,6 +4812,12 @@ def _rebalance_underfilled_segments(
     """
     if placed_oids is None:
         placed_oids = set()
+    base_orders_df = (
+        graph_orders_df
+        if isinstance(graph_orders_df, pd.DataFrame) and not graph_orders_df.empty
+        else orders_df
+    )
+    order_record_by_oid = _build_order_record_by_oid(base_orders_df)
 
     diag: dict = {
         "total_underfilled_before": len(underfilled_segments),
@@ -4534,6 +4877,23 @@ def _rebalance_underfilled_segments(
         "tail_fill_stop_after_partial_count": 0,
         "tail_fill_stop_after_full_count": 0,
         "merge_skipped_due_to_fill_progress_count": 0,
+        "borrow_attempts": 0,
+        "borrow_success": 0,
+        "borrow_from_prev_success": 0,
+        "borrow_from_next_success": 0,
+        "borrow_reject_reverse_budget": 0,
+        "borrow_reject_hard_rule": 0,
+        "borrow_reject_multiplicity": 0,
+        "borrow_reject_ton_window": 0,
+        "borrow_priority_for_small_gap_enabled": True,
+        "donor_rank_score_sum": 0.0,
+        "donor_rank_score_count": 0,
+        "donor_rank_reject_pair_invalid": 0,
+        "donor_rank_reject_reverse_budget": 0,
+        "donor_rank_reject_ton_window": 0,
+        "near_viable_tail_count": 0,
+        "near_viable_tail_attempted": 0,
+        "near_viable_tail_repaired": 0,
         "tail_fill_candidates_rejected_already_in_segments": 0,
         "tail_fill_candidates_rejected_already_in_underfilled": 0,
         "candidate_source": "graph_unused_nodes",
@@ -4572,10 +4932,15 @@ def _rebalance_underfilled_segments(
 # ---- Tail Repair Budget: read configuration ----
     cfg_model = getattr(cfg, "model", None) if cfg else None
     gap_limit = float(
-        getattr(cfg_model, "tail_repair_gap_to_min_limit", 220.0) if cfg_model else 220.0
+        getattr(cfg_model, "tail_repair_gap_limit_tons", getattr(cfg_model, "tail_repair_gap_to_min_limit", 220.0))
+        if cfg_model else 220.0
     )
+    near_viable_gap_limit = float(getattr(cfg_model, "tail_repair_gap_limit_tons", gap_limit) if cfg_model else gap_limit)
+    near_viable_fill_ratio = float(getattr(cfg_model, "tail_repair_min_fill_ratio", 0.8) if cfg_model else 0.8)
+    near_viable_only = bool(getattr(cfg_model, "tail_repair_enable_near_viable_only", False) if cfg_model else False)
     max_per_line = int(
-        getattr(cfg_model, "max_tail_repair_windows_per_line", 12) if cfg_model else 12
+        getattr(cfg_model, "tail_repair_max_windows_per_line", getattr(cfg_model, "max_tail_repair_windows_per_line", 12))
+        if cfg_model else 12
     )
     max_total = int(
         getattr(cfg_model, "max_tail_repair_windows_total", 24) if cfg_model else 24
@@ -4686,7 +5051,33 @@ def _rebalance_underfilled_segments(
 
         # ---- Budget check: enforce max windows limit ----
         gap_to_min = ton_min - u_seg.total_tons
-        if gap_to_min > gap_limit:
+        near_viable = is_near_viable_tons(
+            u_seg.total_tons,
+            ton_min,
+            gap_limit=near_viable_gap_limit,
+            min_fill_ratio=near_viable_fill_ratio,
+        )
+        donor_surplus_exists = False
+        next_seg_for_tail = ordered_line[u_idx + 1] if (u_idx + 1) < len(ordered_line) else None
+        for _donor_seg in (prev_seg, next_seg_for_tail):
+            if _donor_seg is None:
+                continue
+            if float(_donor_seg.total_tons) >= ton_min + max(30.0, min(120.0, gap_to_min)):
+                donor_surplus_exists = True
+                break
+        if near_viable:
+            diag["near_viable_tail_count"] += 1
+        worth_attempting = near_viable or donor_surplus_exists or gap_to_min <= gap_limit
+        if near_viable_only and not near_viable:
+            diag["tail_repair_windows_skipped_by_gap"] += 1
+            diag["fail_reasons"].append({
+                "line": line,
+                "segment_id": u_seg.campaign_local_id,
+                "method": "BUDGET_GAP_FILTER",
+                "reason": "not_near_viable",
+            })
+            continue
+        if not worth_attempting:
             diag["tail_repair_windows_skipped_by_gap"] += 1
             diag["fail_reasons"].append({
                 "line": line,
@@ -4720,12 +5111,15 @@ def _rebalance_underfilled_segments(
         total_attempted += 1
         windows_by_line[line] = windows_by_line.get(line, 0) + 1
         diag["tail_repair_windows_attempted_total"] += 1
+        if near_viable:
+            diag["near_viable_tail_attempted"] += 1
 
         print(
             f"[APS][TailRepairWindow] line={line}, "
             f"seg_prev={prev_seg.campaign_local_id}, "
             f"seg_tail={u_seg.campaign_local_id}, "
-            f"prev_tons={prev_seg.total_tons:.0f}, tail_tons={u_seg.total_tons:.0f}"
+            f"prev_tons={prev_seg.total_tons:.0f}, tail_tons={u_seg.total_tons:.0f}, "
+            f"near_viable={near_viable}, donor_surplus_exists={donor_surplus_exists}"
         )
 
         # ---- Helper: record failure reason with categorization ----
@@ -4746,6 +5140,7 @@ def _rebalance_underfilled_segments(
         recut_tried = False
         shift_tried = False
         fill_tried = False
+        borrow_tried = False
 
         # ---- Strategy A (PRIMARY): RECUT_TWO_SEGMENTS ----
         # Try smart cut point search to keep both segments valid
@@ -4758,7 +5153,13 @@ def _rebalance_underfilled_segments(
             ok_c, new_prev_c, new_tail_c = False, None, None
         else:
             ok_c, new_prev_c, new_tail_c, diag_c = _try_recut_two_segments(
-                prev_seg, u_seg, order_tons, cfg, tpl_df, recut_disabled=recut_disabled_this_run
+                prev_seg,
+                u_seg,
+                order_tons,
+                cfg,
+                tpl_df,
+                order_record_by_oid=order_record_by_oid,
+                recut_disabled=recut_disabled_this_run,
             )
         diag["recut_seconds"] = (diag.get("recut_seconds", 0.0) or 0.0) + (perf_counter() - t0_recut)
         recut_tried = True
@@ -4869,15 +5270,86 @@ def _rebalance_underfilled_segments(
             # Note: partial success (new_prev valid, new_tail invalid) is handled above.
             # It chains to SHIFT and FILL without setting repaired=True.
 
+        # ---- Near-viable windows: prefer BORROW ahead of fill/shift when gap is small ----
+        prefer_borrow_first = near_viable and gap_to_min <= 50.0
+        if not repaired and prefer_borrow_first:
+            borrow_tried = True
+            prev_now = ordered_line[u_idx - 1] if u_idx - 1 >= 0 else None
+            tail_now = ordered_line[u_idx] if 0 <= u_idx < len(ordered_line) else u_seg
+            next_now = ordered_line[u_idx + 1] if (u_idx + 1) < len(ordered_line) else None
+            diag["borrow_attempts"] = diag.get("borrow_attempts", 0) + 1
+            ok_br, new_donor_br, new_tail_br, donor_old_br, diag_br = _try_borrow_from_adjacent_segment(
+                prev_seg=prev_now,
+                tail_seg=tail_now,
+                next_seg=next_now,
+                order_tons=order_tons,
+                cfg=cfg,
+                tpl_df=tpl_df,
+                candidate_graph=candidate_graph,
+                graph_orders_df=graph_orders_df if graph_orders_df is not None else orders_df,
+                order_record_by_oid=order_record_by_oid,
+            )
+            diag["donor_rank_score_sum"] += float(diag_br.get("donor_rank_score", 0.0) or 0.0)
+            diag["donor_rank_score_count"] += 1 if float(diag_br.get("donor_rank_score", 0.0) or 0.0) > 0 else 0
+            if ok_br and new_donor_br is not None and new_tail_br is not None and donor_old_br is not None:
+                preserved, fail_reason, _mult_details = _check_order_multiplicity_preserved(
+                    [donor_old_br, tail_now],
+                    [new_donor_br, new_tail_br],
+                    "BORROW_FROM_ADJACENT_SEGMENT",
+                )
+                if not preserved:
+                    diag["borrow_reject_multiplicity"] += 1
+                    _record_fail("BORROW_FROM_ADJACENT_SEGMENT", fail_reason)
+                else:
+                    if str(diag_br.get("borrow_side", "")) == "prev":
+                        ordered_line[u_idx - 1] = new_donor_br
+                    else:
+                        ordered_line[u_idx + 1] = new_donor_br
+                    ordered_line[u_idx] = new_tail_br
+                    seg_index_map[(line, new_donor_br.campaign_local_id)] = new_donor_br
+                    seg_index_map[(line, new_tail_br.campaign_local_id)] = new_tail_br
+                    diag["borrow_success"] += 1
+                    if str(diag_br.get("borrow_side", "")) == "prev":
+                        diag["borrow_from_prev_success"] += 1
+                    elif str(diag_br.get("borrow_side", "")) == "next":
+                        diag["borrow_from_next_success"] += 1
+                    if new_tail_br.is_valid:
+                        repaired = True
+                        diag["rebalance_window_repairs_success"] += 1
+                        diag["total_repaired"] += 1
+                        if near_viable:
+                            diag["near_viable_tail_repaired"] += 1
+            else:
+                reason_br = str(diag_br.get("failure_reason", "BORROW_NOT_FEASIBLE") or "BORROW_NOT_FEASIBLE")
+                if reason_br == "REVERSE_WIDTH_BUDGET_EXCEEDED":
+                    diag["borrow_reject_reverse_budget"] += 1
+                    diag["donor_rank_reject_reverse_budget"] += 1
+                elif reason_br.startswith("TON_WINDOW_"):
+                    diag["borrow_reject_ton_window"] += 1
+                    diag["donor_rank_reject_ton_window"] += 1
+                elif reason_br not in {"NO_ADJACENT_DONOR", "BORROW_NOT_FEASIBLE"}:
+                    diag["borrow_reject_hard_rule"] += 1
+                    diag["donor_rank_reject_pair_invalid"] += 1
+                _record_fail("BORROW_FROM_ADJACENT_SEGMENT", reason_br)
+
         # ---- Strategy B (SECONDARY): SHIFT_FROM_PREV ----
         # Try pulling K orders from prev to tail (K up to 8)
-        t0_shift = perf_counter()
-        ok_a, new_prev_a, new_tail_a, diag_a = _try_shift_from_prev(
-            prev_seg, u_seg, order_tons, cfg, tpl_df
-        )
-        diag["shift_seconds"] = (diag.get("shift_seconds", 0.0) or 0.0) + (perf_counter() - t0_shift)
-        shift_tried = True
-        diag["tail_repair_shift_attempts"] += 1
+        if prefer_borrow_first:
+            ok_a, new_prev_a, new_tail_a = False, None, None
+            diag_a = {"failure_reason": "SHIFT_DEFERRED_AFTER_FILL"}
+        else:
+            t0_shift = perf_counter()
+            ok_a, new_prev_a, new_tail_a, diag_a = _try_shift_from_prev(
+                prev_seg,
+                u_seg,
+                order_tons,
+                cfg,
+                tpl_df,
+                order_record_by_oid=order_record_by_oid,
+            )
+            diag["shift_seconds"] = (diag.get("shift_seconds", 0.0) or 0.0) + (perf_counter() - t0_shift)
+            shift_tried = True
+            diag["tail_repair_shift_attempts"] += 1
 
         if ok_a and new_prev_a is not None and new_tail_a is not None:
             preserved, fail_reason, mult_details = _check_order_multiplicity_preserved(
@@ -4990,6 +5462,7 @@ def _rebalance_underfilled_segments(
                 cfg, tpl_df,
                 candidate_graph=candidate_graph,
                 graph_orders_df=graph_orders_df if graph_orders_df is not None else orders_df,
+                order_record_by_oid=order_record_by_oid,
             )
 
             diag["tail_repair_fill_attempts"] += 1
@@ -5195,7 +5668,109 @@ def _rebalance_underfilled_segments(
 
         diag["fill_seconds"] = (diag.get("fill_seconds", 0.0) or 0.0) + (perf_counter() - t0_fill)
 
-        # ---- Strategy D (LAST RESORT): MERGE_WITH_PREV ----
+        # ---- Deferred SHIFT for near-viable windows ----
+        if not repaired and prefer_borrow_first:
+            t0_shift = perf_counter()
+            ok_a, new_prev_a, new_tail_a, diag_a = _try_shift_from_prev(
+                prev_seg,
+                u_seg,
+                order_tons,
+                cfg,
+                tpl_df,
+                order_record_by_oid=order_record_by_oid,
+            )
+            diag["shift_seconds"] = (diag.get("shift_seconds", 0.0) or 0.0) + (perf_counter() - t0_shift)
+            shift_tried = True
+            diag["tail_repair_shift_attempts"] += 1
+            if ok_a and new_prev_a is not None and new_tail_a is not None:
+                preserved, fail_reason, _mult_details = _check_order_multiplicity_preserved(
+                    [prev_seg, u_seg],
+                    [new_prev_a, new_tail_a],
+                    "SHIFT_FROM_PREV",
+                )
+                if not preserved:
+                    diag["order_multiplicity_preserve_failures"] += 1
+                    _record_fail("SHIFT_FROM_PREV", fail_reason)
+                elif new_tail_a.is_valid:
+                    new_tail_a.campaign_local_id = prev_seg.campaign_local_id + 1
+                    ordered_line[u_idx - 1] = new_prev_a
+                    ordered_line[u_idx] = new_tail_a
+                    seg_index_map[(line, prev_seg.campaign_local_id)] = new_prev_a
+                    seg_index_map[(line, u_seg.campaign_local_id)] = new_tail_a
+                    diag["tail_repair_shift_success"] += 1
+                    diag["rebalance_window_repairs_success"] += 1
+                    diag["total_repaired"] += 1
+                    if near_viable:
+                        diag["near_viable_tail_repaired"] += 1
+                    repaired = True
+            elif not repaired:
+                _record_fail("SHIFT_FROM_PREV", diag_a.get("failure_reason", "unknown"))
+
+        # ---- Strategy D (NEW): BORROW_FROM_ADJACENT_SEGMENT ----
+        # Only after graph_unused fill failed to produce a repaired window.
+        if not repaired and not borrow_tried:
+            prev_now = ordered_line[u_idx - 1] if u_idx - 1 >= 0 else None
+            tail_now = ordered_line[u_idx] if 0 <= u_idx < len(ordered_line) else u_seg
+            next_now = ordered_line[u_idx + 1] if (u_idx + 1) < len(ordered_line) else None
+            diag["borrow_attempts"] = diag.get("borrow_attempts", 0) + 1
+            borrow_tried = True
+            ok_br, new_donor_br, new_tail_br, donor_old_br, diag_br = _try_borrow_from_adjacent_segment(
+                prev_seg=prev_now,
+                tail_seg=tail_now,
+                next_seg=next_now,
+                order_tons=order_tons,
+                cfg=cfg,
+                tpl_df=tpl_df,
+                candidate_graph=candidate_graph,
+                graph_orders_df=graph_orders_df if graph_orders_df is not None else orders_df,
+                order_record_by_oid=order_record_by_oid,
+            )
+            if ok_br and new_donor_br is not None and new_tail_br is not None and donor_old_br is not None:
+                preserved, fail_reason, _mult_details = _check_order_multiplicity_preserved(
+                    [donor_old_br, tail_now],
+                    [new_donor_br, new_tail_br],
+                    "BORROW_FROM_ADJACENT_SEGMENT",
+                )
+                if not preserved:
+                    diag["borrow_reject_multiplicity"] = diag.get("borrow_reject_multiplicity", 0) + 1
+                    _record_fail("BORROW_FROM_ADJACENT_SEGMENT", fail_reason)
+                else:
+                    if str(diag_br.get("borrow_side", "")) == "prev":
+                        ordered_line[u_idx - 1] = new_donor_br
+                    else:
+                        ordered_line[u_idx + 1] = new_donor_br
+                    ordered_line[u_idx] = new_tail_br
+                    seg_index_map[(line, new_donor_br.campaign_local_id)] = new_donor_br
+                    seg_index_map[(line, new_tail_br.campaign_local_id)] = new_tail_br
+                    diag["borrow_success"] = diag.get("borrow_success", 0) + 1
+                    if str(diag_br.get("borrow_side", "")) == "prev":
+                        diag["borrow_from_prev_success"] = diag.get("borrow_from_prev_success", 0) + 1
+                    elif str(diag_br.get("borrow_side", "")) == "next":
+                        diag["borrow_from_next_success"] = diag.get("borrow_from_next_success", 0) + 1
+                    if new_tail_br.is_valid:
+                        repaired = True
+                        diag["rebalance_window_repairs_success"] += 1
+                        diag["total_repaired"] += 1
+                        diag["repair_log"].append(
+                            {
+                                "method": "BORROW_FROM_ADJACENT_SEGMENT",
+                                "segment_id": new_tail_br.campaign_local_id,
+                                "borrow_side": str(diag_br.get("borrow_side", "")),
+                                "borrow_k": int(diag_br.get("borrow_k", 0) or 0),
+                                "multiplicity": "OK",
+                            }
+                        )
+            else:
+                reason_br = str(diag_br.get("failure_reason", "BORROW_NOT_FEASIBLE") or "BORROW_NOT_FEASIBLE")
+                if reason_br == "REVERSE_WIDTH_BUDGET_EXCEEDED":
+                    diag["borrow_reject_reverse_budget"] = diag.get("borrow_reject_reverse_budget", 0) + 1
+                elif reason_br.startswith("TON_WINDOW_"):
+                    diag["borrow_reject_ton_window"] = diag.get("borrow_reject_ton_window", 0) + 1
+                elif reason_br not in {"NO_ADJACENT_DONOR", "BORROW_NOT_FEASIBLE"}:
+                    diag["borrow_reject_hard_rule"] = diag.get("borrow_reject_hard_rule", 0) + 1
+                _record_fail("BORROW_FROM_ADJACENT_SEGMENT", reason_br)
+
+        # ---- Strategy E (LAST RESORT): MERGE_WITH_PREV ----
         # Only attempt MERGE when fill produced NO progress.
         # If fill made any progress (full or partial), the window state is already updated;
         # running MERGE would use stale prev_seg (not updated by RECUT/FILL) and corrupt
@@ -5222,7 +5797,12 @@ def _rebalance_underfilled_segments(
             )
             t0_merge = perf_counter()
             ok_b, merged_seg, diag_b = _try_merge_with_prev(
-                prev_seg, u_seg, order_tons, cfg, tpl_df
+                prev_seg,
+                u_seg,
+                order_tons,
+                cfg,
+                tpl_df,
+                order_record_by_oid=order_record_by_oid,
             )
             diag_b = {"method": "MERGE_WITH_PREV", "attempted": True}
             diag["tail_repair_merge_attempts"] += 1
@@ -5234,7 +5814,12 @@ def _rebalance_underfilled_segments(
             )
             t0_merge = perf_counter()
             ok_b, merged_seg, diag_b = _try_merge_with_prev(
-                prev_seg, u_seg, order_tons, cfg, tpl_df
+                prev_seg,
+                u_seg,
+                order_tons,
+                cfg,
+                tpl_df,
+                order_record_by_oid=order_record_by_oid,
             )
             diag["merge_seconds"] = (diag.get("merge_seconds", 0.0) or 0.0) + (perf_counter() - t0_merge)
             diag_b["merge_attempted_as_last_resort"] = True
@@ -5372,6 +5957,11 @@ def _rebalance_underfilled_segments(
         )
 
     diag["underfilled_after"] = len(still_under)
+    rev_counts = [
+        _segment_reverse_width_count(seg.order_ids, order_record_by_oid, seg.line, cfg)
+        for seg in (repaired_segments + still_under)
+    ]
+    diag["reverse_width_count_used_max"] = int(max(rev_counts) if rev_counts else 0)
 
     # ---- Compute total tail repair time ----
     diag["tail_repair_seconds"] = (diag.get("recut_seconds", 0.0) or 0.0) + \
@@ -5393,6 +5983,9 @@ def _rebalance_underfilled_segments(
         f"[APS][TAIL_REPAIR_BUDGET] total_attempted={diag.get('tail_repair_windows_attempted_total', 0)}, "
         f"skipped_by_gap={diag.get('tail_repair_windows_skipped_by_gap', 0)}, "
         f"skipped_by_budget={diag.get('tail_repair_windows_skipped_by_budget', 0)}, "
+        f"near_viable_tail_count={diag.get('near_viable_tail_count', 0)}, "
+        f"near_viable_tail_attempted={diag.get('near_viable_tail_attempted', 0)}, "
+        f"near_viable_tail_repaired={diag.get('near_viable_tail_repaired', 0)}, "
         f"per_line={windows_by_line}, "
         f"recut_disabled={diag.get('recut_disabled_after_failures', False)}, "
         f"recut_cutpoints_tested={diag.get('recut_candidate_points_tested', 0)}, "
@@ -5406,12 +5999,30 @@ def _rebalance_underfilled_segments(
     shift_suc = diag.get("tail_repair_shift_success", 0)
     fill_att = diag.get("tail_repair_fill_attempts", 0)
     fill_suc = diag.get("tail_repair_fill_success", 0)
+    borrow_att = diag.get("borrow_attempts", 0)
+    borrow_suc = diag.get("borrow_success", 0)
     merge_att = diag.get("tail_repair_merge_attempts", 0)
     merge_suc = diag.get("tail_repair_merge_success", 0)
+    donor_rank_score_avg = float(diag.get("donor_rank_score_sum", 0.0) or 0.0) / max(
+        1, int(diag.get("donor_rank_score_count", 0) or 0)
+    )
+    diag["donor_rank_score_avg"] = float(donor_rank_score_avg)
     print(
         f"[APS][TAIL_REPAIR_SUMMARY] recut_attempts={recut_att}, recut_success={recut_suc}, "
         f"shift_attempts={shift_att}, shift_success={shift_suc}, "
         f"fill_attempts={fill_att}, fill_success={fill_suc}, "
+        f"borrow_attempts={borrow_att}, borrow_success={borrow_suc}, "
+        f"borrow_priority_for_small_gap_enabled={diag.get('borrow_priority_for_small_gap_enabled', False)}, "
+        f"donor_rank_score_avg={diag.get('donor_rank_score_avg', 0.0):.3f}, "
+        f"borrow_from_prev_success={diag.get('borrow_from_prev_success', 0)}, "
+        f"borrow_from_next_success={diag.get('borrow_from_next_success', 0)}, "
+        f"borrow_reject_reverse_budget={diag.get('borrow_reject_reverse_budget', 0)}, "
+        f"borrow_reject_hard_rule={diag.get('borrow_reject_hard_rule', 0)}, "
+        f"borrow_reject_multiplicity={diag.get('borrow_reject_multiplicity', 0)}, "
+        f"borrow_reject_ton_window={diag.get('borrow_reject_ton_window', 0)}, "
+        f"donor_rank_reject_pair_invalid={diag.get('donor_rank_reject_pair_invalid', 0)}, "
+        f"donor_rank_reject_reverse_budget={diag.get('donor_rank_reject_reverse_budget', 0)}, "
+        f"donor_rank_reject_ton_window={diag.get('donor_rank_reject_ton_window', 0)}, "
         f"merge_attempts={merge_att}, merge_success={merge_suc}"
     )
     print(
@@ -5737,6 +6348,7 @@ def cut_sequences_into_campaigns(
                 f"recut_ok={repaired_by_recut}, "
                 f"merge_ok={repaired_by_merge}, "
                 f"fill_ok={repaired_by_fill}, "
+                f"borrow_ok={rebal_diag.get('borrow_success', 0)}, "
                 f"still_underfilled={still_under}, "
                 f"window_attempts={rebal_diag.get('rebalance_window_repairs_attempted', 0)}, "
                 f"window_success={rebal_diag.get('rebalance_window_repairs_success', 0)}, "
@@ -5754,6 +6366,22 @@ def cut_sequences_into_campaigns(
         "tail_repair_shift_success": rebal_diag.get("tail_repair_shift_success", 0),
         "tail_repair_fill_attempts": rebal_diag.get("tail_repair_fill_attempts", 0),
         "tail_repair_fill_success": rebal_diag.get("tail_repair_fill_success", 0),
+        "borrow_attempts": rebal_diag.get("borrow_attempts", 0),
+        "borrow_success": rebal_diag.get("borrow_success", 0),
+        "borrow_from_prev_success": rebal_diag.get("borrow_from_prev_success", 0),
+        "borrow_from_next_success": rebal_diag.get("borrow_from_next_success", 0),
+        "borrow_reject_reverse_budget": rebal_diag.get("borrow_reject_reverse_budget", 0),
+        "borrow_reject_hard_rule": rebal_diag.get("borrow_reject_hard_rule", 0),
+        "borrow_reject_multiplicity": rebal_diag.get("borrow_reject_multiplicity", 0),
+        "borrow_reject_ton_window": rebal_diag.get("borrow_reject_ton_window", 0),
+        "borrow_priority_for_small_gap_enabled": rebal_diag.get("borrow_priority_for_small_gap_enabled", False),
+        "donor_rank_score_avg": rebal_diag.get("donor_rank_score_avg", 0.0),
+        "donor_rank_reject_pair_invalid": rebal_diag.get("donor_rank_reject_pair_invalid", 0),
+        "donor_rank_reject_reverse_budget": rebal_diag.get("donor_rank_reject_reverse_budget", 0),
+        "donor_rank_reject_ton_window": rebal_diag.get("donor_rank_reject_ton_window", 0),
+        "near_viable_tail_count": rebal_diag.get("near_viable_tail_count", 0),
+        "near_viable_tail_attempted": rebal_diag.get("near_viable_tail_attempted", 0),
+        "near_viable_tail_repaired": rebal_diag.get("near_viable_tail_repaired", 0),
         "tail_fill_candidates_considered": rebal_diag.get("tail_fill_candidates_considered", 0),
         "candidate_source": "graph_unused_nodes",
         "graph_unused_candidates_total": rebal_diag.get("graph_unused_candidates_total", 0),
@@ -5797,6 +6425,7 @@ def cut_sequences_into_campaigns(
         "shift_seconds": rebal_diag.get("shift_seconds", 0.0),
         "fill_seconds": rebal_diag.get("fill_seconds", 0.0),
         "merge_seconds": rebal_diag.get("merge_seconds", 0.0),
+        "reverse_width_count_used_max": rebal_diag.get("reverse_width_count_used_max", 0),
     })
 
     # Compute diagnostics

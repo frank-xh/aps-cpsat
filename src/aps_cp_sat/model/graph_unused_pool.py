@@ -5,7 +5,11 @@ from typing import Any, Iterable
 
 import pandas as pd
 
-from aps_cp_sat.model.edge_hard_filter import edge_passes_final_hard_rules
+from aps_cp_sat.model.edge_hard_filter import (
+    accumulate_adj_hard_filter_rejection,
+    edge_passes_final_hard_rules,
+    log_adj_hard_filter,
+)
 
 
 @dataclass
@@ -55,6 +59,7 @@ def collect_graph_unused_candidates(
     virtual: list[str] = []
     candidate_edges: list[dict[str, Any]] = []
     rejected_by_hard: dict[str, int] = {}
+    adj_rejections: dict[str, int] = {}
     scanned = 0
     line_filtered = 0
     used_filtered = 0
@@ -90,6 +95,7 @@ def collect_graph_unused_candidates(
         )
         if not ok:
             rejected_by_hard[reason] = rejected_by_hard.get(reason, 0) + 1
+            adj_rejections = accumulate_adj_hard_filter_rejection(adj_rejections, reason)
             continue
         rec = records.get(to_oid, {})
         if _is_virtual(rec):
@@ -107,6 +113,7 @@ def collect_graph_unused_candidates(
         )
 
     total = len(real) + len(virtual)
+    log_adj_hard_filter("graph_unused_pool", adj_rejections)
     return GraphUnusedCandidates(
         real_candidates=real,
         virtual_candidates=virtual,

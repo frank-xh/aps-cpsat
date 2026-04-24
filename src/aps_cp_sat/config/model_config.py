@@ -87,6 +87,8 @@ class ModelConfig:
     constructive_destroy_ratio_min: float = 0.18  # 约束下限：constructive_destroy_ratio_min。
     constructive_destroy_ratio_max: float = 0.30  # 约束上限：constructive_destroy_ratio_max。
     constructive_subproblem_max_orders: int = 48  # 约束上限：constructive_subproblem_max_orders。
+    local_cpsat_max_orders: int = 48  # LNS 局部 CP-SAT 子问题最大订单数，和 constructive_subproblem_max_orders 保持同口径。
+    constructive_local_cpsat_time_limit_seconds: float = 8.0  # LNS 局部 CP-SAT 单轮时间上限，避免在碎片尾段上过度耗时。
     constructive_enable_cp_sat_repair: bool = True  # 参数：constructive_enable_cp_sat_repair，用于控制相关算法行为。
     # ---- LNS Early Stop Configuration ----
     lns_early_stop_no_improve_rounds: int = 4  # 数量参数：lns_early_stop_no_improve_rounds。
@@ -161,33 +163,102 @@ class ModelConfig:
     small_roll_dual_reserve_penalty: int = 15  # 惩罚权重：small_roll_dual_reserve_penalty。
     # ---- Small roll dual-order reserve bucket: hard-prevent big_roll from taking top dual candidates ----
     small_roll_dual_reserve_bucket_enabled: bool = True  # 算法开关：small_roll_dual_reserve_bucket_enabled，用于控制相关算法行为。
-    small_roll_dual_reserve_bucket_ratio: float = 0.40  # 比例参数：small_roll_dual_reserve_bucket_ratio。
+    small_roll_dual_reserve_bucket_ratio: float = 0.38  # 比例参数：small_roll_dual_reserve_bucket_ratio。
     small_roll_dual_reserve_bucket_max_orders: int = 100  # 约束上限：small_roll_dual_reserve_bucket_max_orders。
     # ---- Small roll seed-first: prioritize small_roll chain building before big_roll consumes reserve ----
     small_roll_seed_first_enabled: bool = True  # 算法开关：small_roll_seed_first_enabled，用于控制相关算法行为。
-    small_roll_seed_min_orders: int = 24  # 约束下限：small_roll_seed_min_orders。
-    small_roll_seed_min_tons10: int = 6000  # 约束下限：small_roll_seed_min_tons10。
+    small_roll_seed_min_orders: int = 16  # 约束下限：small_roll_seed_min_orders。
+    small_roll_seed_min_tons10: int = 4500  # 约束下限：small_roll_seed_min_tons10。
     # ---- Small roll dual-order reserve QUOTA: balanced allocation instead of "lock all" ----
     # Quota enables a floor (min) AND a ceiling (max) for small_roll's priority on dual orders.
     # Once small_roll reaches max quota, remaining reserve bucket is released to big_roll.
     small_roll_dual_reserve_quota_enabled: bool = True  # 算法开关：small_roll_dual_reserve_quota_enabled，用于控制相关算法行为。
     small_roll_dual_reserve_quota_min_orders: int = 25  # 约束下限：small_roll_dual_reserve_quota_min_orders。
     small_roll_dual_reserve_quota_min_tons10: int = 6000  # 约束下限：small_roll_dual_reserve_quota_min_tons10。
-    small_roll_dual_reserve_quota_max_orders: int = 60  # 约束上限：small_roll_dual_reserve_quota_max_orders。
-    small_roll_dual_reserve_quota_max_tons10: int = 14000  # 约束上限：small_roll_dual_reserve_quota_max_tons10。
+    small_roll_dual_reserve_quota_max_orders: int = 50  # 约束上限：small_roll_dual_reserve_quota_max_orders。
+    small_roll_dual_reserve_quota_max_tons10: int = 12000  # 约束上限：small_roll_dual_reserve_quota_max_tons10。
     # ---- Big roll release: after small_roll seed phase, release remaining quota to big_roll ----
     big_roll_dual_release_after_small_seed: bool = True  # 参数：big_roll_dual_release_after_small_seed，用于控制相关算法行为。
     # ---- Tail Repair Budget: limit search scope to reduce runtime ----
-    max_tail_repair_windows_per_line: int = 12  # 约束上限：max_tail_repair_windows_per_line。
-    max_tail_repair_windows_total: int = 24  # 约束上限：max_tail_repair_windows_total。
-    max_recut_cutpoints_per_window: int = 12  # 约束上限：max_recut_cutpoints_per_window。
+    max_tail_repair_windows_per_line: int = 6  # 约束上限：max_tail_repair_windows_per_line。
+    max_tail_repair_windows_total: int = 12  # 约束上限：max_tail_repair_windows_total。
+    max_recut_cutpoints_per_window: int = 6  # 约束上限：max_recut_cutpoints_per_window。
     max_fill_candidates_per_tail: int = 8  # 约束上限：max_fill_candidates_per_tail。
     tail_repair_gap_to_min_limit: float = 180.0  # 约束下限：tail_repair_gap_to_min_limit。
+    constructive_reverse_width_max_count: int = 3  # 同一轧期允许的逆宽事件预算上限（状态预算，默认 3）。
+    continuation_bias_gain_weight: float = 0.55  # constructive 连续成形偏置：缩小到 ton_min 缺口的增益权重。
+    continuation_bias_cross_min_bonus: float = 65.0  # constructive 首次跨越 ton_min 的额外奖励。
+    continuation_bias_near_max_penalty: float = 45.0  # constructive 接近 ton_max 时的惩罚，避免无效拉长。
+    continuation_bias_near_max_ratio: float = 0.92  # 触发 near-max 惩罚的比例阈值（相对 ton_max）。
+    continuation_bias_short_chain_hold_bonus: float = 18.0  # 短链（<200t）继续扩展的保守鼓励项。
+    tail_borrow_from_adjacent_enabled: bool = True  # 尾段修复开关：允许从相邻 segment 借单补吨。
+    tail_borrow_max_orders_per_attempt: int = 2  # 相邻借单每次最多借几单（默认 1~2 单）。
     tail_fill_from_dropped_enabled: bool = True  # 算法开关：tail_fill_from_dropped_enabled，用于控制相关算法行为。
     tail_fill_gap_to_min_limit: float = 220.0  # 约束下限：tail_fill_gap_to_min_limit。
     tail_fill_accept_partial_progress: bool = True  # 参数：tail_fill_accept_partial_progress，用于控制相关算法行为。
     tail_fill_max_inserts_per_tail: int = 2  # 约束上限：tail_fill_max_inserts_per_tail。
     tail_fill_second_pass_gap_limit: float = 30.0  # 参数：tail_fill_second_pass_gap_limit，用于控制相关算法行为。
+    tail_repair_gap_limit_tons: float = 220.0  # tail repair 新阈值：gap_to_min 小于该值时允许进入修复窗口。
+    tail_repair_min_fill_ratio: float = 0.55  # tail repair 新阈值：尾段吨位达到 ton_min 的该比例即视为 near-viable。
+    tail_repair_enable_near_viable_only: bool = True  # 是否只对 near-viable 尾段启动 cutter repair。
+    tail_repair_max_windows_per_line: int = 6  # 每条产线最多尝试多少个 tail repair 窗口。
+    successor_weight_width_desc: float = 0.30  # successor 业务评分：宽到窄方向奖励权重。
+    successor_weight_continuation: float = 0.48  # successor 业务评分：接近 700 吨的成形奖励权重。
+    successor_weight_extendability: float = 0.24  # successor 业务评分：后继可延展性权重。
+    successor_weight_group_continuity: float = 0.12  # successor 业务评分：同组连续性奖励权重。
+    successor_weight_reverse_budget_cost: float = 0.18  # successor 业务评分：reverse budget 成本权重。
+    successor_weight_dead_end_penalty: float = 0.20  # successor 业务评分：死胡同风险惩罚权重。
+    seed_formability_lookahead_orders: int = 28  # seed 可成形性估算使用的后继订单数，避免用 4 步低估到 700 吨的能力。
+    constructive_typical_order_tons: float = 25.0  # constructive 阶段典型单卷吨位估算，用于链容量/seed 可成形性统计。
+    seed_weight_width_headroom: float = 0.38  # seed 评分：宽度头部优先权重。
+    seed_weight_extendability: float = 0.16  # seed 评分：后继可延展性权重。
+    seed_weight_tonnage_formability: float = 0.28  # seed 评分：吨位可成形性权重。
+    seed_weight_group_continuity: float = 0.08  # seed 评分：同钢种组连续性权重。
+    seed_weight_smoothness: float = 0.06  # seed 评分：宽厚温平滑性权重。
+    seed_weight_reverse_friendliness: float = 0.04  # seed 评分：逆宽友好性权重。
+    seed_formability_min_projected_tons: float = 350.0
+    seed_formability_soft_gate_enabled: bool = True
+    seed_formability_hard_gate_enabled: bool = False
+    seed_penalty_low_formability: float = 80.0
+    seed_bonus_width_head: float = 35.0
+    seed_bonus_high_extendability: float = 25.0
+    constructive_virtual_rescue_enabled: bool = True
+    constructive_virtual_rescue_under_min_only: bool = True
+    constructive_virtual_rescue_real_successor_threshold: int = 2
+    constructive_virtual_rescue_bonus: float = 45.0
+    constructive_virtual_rescue_cross_min_bonus: float = 85.0
+    constructive_virtual_rescue_dead_end_bonus: float = 40.0
+    constructive_virtual_rescue_near_min_ratio: float = 0.75
+    constructive_virtual_rescue_max_virtual_chain: int = 5
+    constructive_virtual_rescue_penalty_floor: float = 0.0
+    constructive_virtual_rescue_big_roll_enabled: bool = True
+    constructive_virtual_rescue_big_roll_real_successor_threshold: int = 8
+    constructive_virtual_rescue_ignore_rich_real_when_under_min_deadend: bool = True
+    constructive_virtual_rescue_big_roll_bonus: float = 70.0
+    constructive_virtual_rescue_big_roll_cross_min_bonus: float = 110.0
+    constructive_virtual_rescue_big_roll_near_min_ratio: float = 0.65
+    constructive_virtual_rescue_score_scale: float = 1.0
+    constructive_virtual_rescue_min_current_tons: float = 80.0
+    constructive_virtual_rescue_try_even_when_real_successor_exists: bool = True
+    successor_cross_min_bonus: float = 95.0
+    successor_near_min_bonus: float = 35.0
+    successor_under_min_gain_weight: float = 0.70
+    successor_near_max_penalty: float = 60.0
+    successor_near_max_ratio: float = 0.92
+    successor_short_chain_deadend_penalty: float = 55.0
+    alns_include_underfilled_fragments: bool = True
+    alns_underfilled_fragment_max_count: int = 80
+    alns_underfilled_fragment_min_tons: float = 80.0
+    alns_underfilled_fragment_priority_near_min: bool = True
+    alns_underfilled_fragment_allow_virtual_rescue: bool = True
+    alns_underfilled_stitch_enabled: bool = True
+    alns_underfilled_stitch_max_pairs_per_round: int = 200
+    alns_underfilled_stitch_max_bridge_trials: int = 3
+    alns_underfilled_stitch_allow_virtual: bool = True
+    alns_underfilled_stitch_allow_real_bridge: bool = True
+    alns_underfilled_stitch_min_combined_tons: float = 650.0
+    alns_underfilled_stitch_max_combined_tons: float = 2000.0
+    alns_underfilled_stitch_prefer_same_line: bool = True
     # ---- Block Generator Configuration (block_first_guarded_search) ----
     # 这里的 block 语义按“子块/sub-block”理解，而不是完整轧期。
     block_generator_target_blocks: int = 2000  # block-first 块级求解参数：block_generator_target_blocks。

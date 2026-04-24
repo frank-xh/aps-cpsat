@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 from dataclasses import replace
@@ -12,6 +12,7 @@ from aps_cp_sat.domain.models import ColdRollingRequest, ColdRollingResult
 from aps_cp_sat.io import export_schedule_results
 from aps_cp_sat.model.candidate_graph import build_candidate_graph
 from aps_cp_sat.model import solve_master_model
+from aps_cp_sat.model.virtual_order_utils import count_effective_virtual_rows, normalize_effective_virtual_flags
 from aps_cp_sat.preprocess import prepare_orders_for_model
 from aps_cp_sat.rules import RULE_REGISTRY
 from aps_cp_sat.routes import PreparedWorld, create_route_runner
@@ -66,7 +67,7 @@ class ColdRollingPipeline:
     def _print_template_diagnostics(transition_pack: dict) -> None:
         tpl = transition_pack.get("templates") if isinstance(transition_pack, dict) else None
         if tpl is None or tpl.empty:
-            print("[APS][TEMPLATE_DIAG] no_templates")
+            print("[APS][TRANSITION_EDGE_DIAG] no_transition_edges")
             return
         for line in sorted(tpl["line"].dropna().unique().tolist()):
             t = tpl[tpl["line"] == line]
@@ -76,14 +77,14 @@ class ColdRollingPipeline:
             avg_out = float(out_deg.mean()) if len(out_deg) else 0.0
             avg_in = float(in_deg.mean()) if len(in_deg) else 0.0
             print(
-                f"[APS][妯℃澘璇婃柇] line={line}, templates={len(t)}, nodes={len(nodes)}, "
+                f"[APS][transition edge diagnostics] line={line}, edges={len(t)}, nodes={len(nodes)}, "
                 f"avg_out={avg_out:.2f}, avg_in={avg_in:.2f}, "
                 f"max_bridge={int(t['bridge_count'].max()) if not t.empty else 0}"
             )
         ps = transition_pack.get("prune_summaries", []) if isinstance(transition_pack, dict) else []
         for s in ps:
             print(
-                f"[APS][妯℃澘鍓灊] line={s.line}, unbridgeable={s.pruned_unbridgeable}, "
+                f"[APS][transition edge pruning] line={s.line}, unbridgeable={s.pruned_unbridgeable}, "
                 f"topk={s.pruned_topk}, degree={s.pruned_degree}, kept={s.kept_templates}"
             )
         bd = transition_pack.get("build_debug", []) if isinstance(transition_pack, dict) else []
@@ -93,8 +94,8 @@ class ColdRollingPipeline:
                 line = str(item.get("line", ""))
                 if line in {"big_roll", "small_roll"}:
                     print(
-                        f"[APS][妯℃澘鏋勫缓鎽樿] line={line}, candidatePairs={int(item.get('candidate_pairs', 0) or 0)}, "
-                        f"templatesBuilt={int(item.get('kept_templates', 0) or 0)}, "
+                        f"[APS][transition edge summary] line={line}, candidatePairs={int(item.get('candidate_pairs', 0) or 0)}, "
+                        f"edgesBuilt={int(item.get('kept_templates', 0) or 0)}, "
                         f"avgVirtualCount={float(item.get('avg_virtual_count', 0.0) or 0.0):.2f}, "
                         f"maxVirtualCount={int(item.get('max_virtual_count', 0) or 0)}, "
                         f"directEdgeCount={int(item.get('direct_edge_count', 0) or 0)}, "
@@ -104,14 +105,14 @@ class ColdRollingPipeline:
                     )
             if isinstance(total, dict):
                 print(
-                    f"[APS][妯℃澘鑰楁椂] preprocess_seconds={float(total.get('preprocess_seconds', 0.0)):.3f}, "
+                    f"[APS][transition edge timing] preprocess_seconds={float(total.get('preprocess_seconds', 0.0)):.3f}, "
                     f"line_partition_seconds={float(total.get('line_partition_seconds', 0.0)):.3f}, "
-                    f"template_pair_scan_seconds={float(total.get('template_pair_scan_seconds', 0.0)):.3f}, "
+                    f"transition_edge_pair_scan_seconds={float(total.get('template_pair_scan_seconds', 0.0)):.3f}, "
                     f"bridge_check_seconds={float(total.get('bridge_check_seconds', 0.0)):.3f}, "
-                    f"template_prune_seconds={float(total.get('template_prune_seconds', 0.0)):.3f}, "
+                    f"transition_edge_prune_seconds={float(total.get('template_prune_seconds', 0.0)):.3f}, "
                     f"transition_pack_build_seconds={float(total.get('transition_pack_build_seconds', 0.0)):.3f}, "
                     f"diagnostics_build_seconds={float(total.get('diagnostics_build_seconds', 0.0)):.3f}, "
-                    f"template_build_seconds={float(total.get('template_build_seconds', 0.0)):.3f}"
+                    f"transition_edge_build_seconds={float(total.get('template_build_seconds', 0.0)):.3f}"
                 )
                 print(
                         f"[APS][CandidateGraph] edges={int(total.get('candidate_graph_edge_count', 0) or 0)}, "
@@ -125,7 +126,6 @@ class ColdRollingPipeline:
                         f"real_bridge_capable_orders={int(total.get('candidate_graph_real_bridge_capable_order_count', 0) or 0)}, "
                         f"direct={int(total.get('candidate_graph_direct_edge_count', 0) or 0)}, "
                     f"real_bridge={int(total.get('candidate_graph_real_bridge_edge_count', 0) or 0)}, "
-                    f"virtual_family={int(total.get('candidate_graph_virtual_bridge_family_edge_count', 0) or 0)}, "
                     f"filtered_width={int(total.get('candidate_graph_filtered_by_width_count', 0) or 0)}, "
                     f"filtered_thickness={int(total.get('candidate_graph_filtered_by_thickness_count', 0) or 0)}, "
                     f"filtered_temp={int(total.get('candidate_graph_filtered_by_temp_count', 0) or 0)}, "
@@ -387,6 +387,15 @@ class ColdRollingPipeline:
         "virtual_inventory_small_roll_count",
         "virtual_inventory_remaining_count",
         "virtual_inventory_consumed_count",
+        "final_virtual_rows_snapshot",
+        "final_virtual_rows_audited",
+        "final_virtual_rows_exported",
+        "virtual_accounting_consistency_ok",
+        "decode_validation_columns_backfilled",
+        "decode_validation_missing_cols",
+        "final_schedule_required_cols_ok",
+        "final_schedule_missing_required_cols",
+        "final_schedule_backfilled_cols",
         "prebuilt_virtual_line_capability_breakdown",
         # ---- Single Candidate Graph 杩借釜 ----
         "candidate_graph_source",
@@ -414,6 +423,19 @@ class ColdRollingPipeline:
         "campaign_count",
         "low_slots",
         "tail_underfilled_count",
+        "seed_scoring_enabled",
+        "width_desc_seed_bias_enabled",
+        "selected_seed_score_avg",
+        "selected_seed_width_percentile_avg",
+        "top_seed_width_avg",
+        "top_seed_extendability_avg",
+        "top_seed_formability_avg",
+        "successor_business_scoring_enabled",
+        "width_desc_successor_bias_enabled",
+        "successor_extendability_bias_enabled",
+        "successor_group_continuity_bias_enabled",
+        "successor_reverse_budget_cost_total",
+        "dead_end_successor_count",
         # ---- Edge type statistics ----
         "selected_real_bridge_edge_count",
         "selected_virtual_bridge_edge_count",
@@ -856,8 +878,9 @@ class ColdRollingPipeline:
             rounds_df = pd.DataFrame()
         final_schedule_summary = recompute_final_schedule_summary(schedule_df, cfg.rule if hasattr(cfg, "rule") else RuleConfig())
 
-        if not schedule_df.empty and "is_virtual" in schedule_df.columns:
-            scheduled_virtual = int(schedule_df["is_virtual"].fillna(False).astype(bool).sum())
+        if isinstance(schedule_df, pd.DataFrame) and not schedule_df.empty:
+            schedule_df = normalize_effective_virtual_flags(schedule_df)
+            scheduled_virtual = int(count_effective_virtual_rows(schedule_df))
             scheduled_real = int(len(schedule_df) - scheduled_virtual)
         else:
             scheduled_real = int(len(schedule_df)) if schedule_df is not None else 0
@@ -942,8 +965,62 @@ class ColdRollingPipeline:
                     em.get("greedy_virtual_family_budget_blocked_count",
                            build_diags.get("greedy_virtual_family_budget_blocked_count", 0)) or 0
                 ),
+                "seed_scoring_enabled": bool(em.get("seed_scoring_enabled", build_diags.get("seed_scoring_enabled", True))),
+                "width_desc_seed_bias_enabled": bool(
+                    em.get("width_desc_seed_bias_enabled", build_diags.get("width_desc_seed_bias_enabled", True))
+                ),
+                "selected_seed_score_avg": float(
+                    em.get("selected_seed_score_avg", build_diags.get("selected_seed_score_avg", 0.0)) or 0.0
+                ),
+                "selected_seed_width_percentile_avg": float(
+                    em.get(
+                        "selected_seed_width_percentile_avg",
+                        build_diags.get("selected_seed_width_percentile_avg", 0.0),
+                    ) or 0.0
+                ),
+                "top_seed_width_avg": float(em.get("top_seed_width_avg", build_diags.get("top_seed_width_avg", 0.0)) or 0.0),
+                "top_seed_extendability_avg": float(
+                    em.get("top_seed_extendability_avg", build_diags.get("top_seed_extendability_avg", 0.0)) or 0.0
+                ),
+                "top_seed_formability_avg": float(
+                    em.get("top_seed_formability_avg", build_diags.get("top_seed_formability_avg", 0.0)) or 0.0
+                ),
+                "successor_business_scoring_enabled": bool(
+                    em.get(
+                        "successor_business_scoring_enabled",
+                        build_diags.get("successor_business_scoring_enabled", True),
+                    )
+                ),
+                "width_desc_successor_bias_enabled": bool(
+                    em.get(
+                        "width_desc_successor_bias_enabled",
+                        build_diags.get("width_desc_successor_bias_enabled", True),
+                    )
+                ),
+                "successor_extendability_bias_enabled": bool(
+                    em.get(
+                        "successor_extendability_bias_enabled",
+                        build_diags.get("successor_extendability_bias_enabled", True),
+                    )
+                ),
+                "successor_group_continuity_bias_enabled": bool(
+                    em.get(
+                        "successor_group_continuity_bias_enabled",
+                        build_diags.get("successor_group_continuity_bias_enabled", True),
+                    )
+                ),
+                "successor_reverse_budget_cost_total": float(
+                    em.get(
+                        "successor_reverse_budget_cost_total",
+                        build_diags.get("successor_reverse_budget_cost_total", 0.0),
+                    ) or 0.0
+                ),
+                "dead_end_successor_count": int(
+                    em.get("dead_end_successor_count", build_diags.get("dead_end_successor_count", 0)) or 0
+                ),
                 "scheduled_real_orders": scheduled_real,
                 "scheduled_virtual_orders": scheduled_virtual,
+                "final_virtual_rows_snapshot": scheduled_virtual,
                 "dropped_count": dropped_count,
                 "campaign_count": int(final_schedule_summary.get("campaign_cnt", cls._count_campaigns(schedule_df)) or 0),
                 "campaign_cnt": int(final_schedule_summary.get("campaign_cnt", cls._count_campaigns(schedule_df)) or 0),
@@ -1070,6 +1147,27 @@ class ColdRollingPipeline:
                 "final_hard_violation_count_total": int(em.get("final_hard_violation_count_total", 0) or 0),
             }
         )
+        final_audit_summary = final_schedule_summary.get("final_schedule_audit_summary", {}) if isinstance(final_schedule_summary, dict) else {}
+        audited_virtual = int(
+            final_audit_summary.get("virtual_orders", em.get("final_virtual_rows_audited", scheduled_virtual)) or 0
+        ) if isinstance(final_audit_summary, dict) else int(em.get("final_virtual_rows_audited", scheduled_virtual) or 0)
+        em["final_virtual_rows_audited"] = audited_virtual
+        em["virtual_inventory_consumed_count"] = max(
+            int(em.get("virtual_inventory_consumed_count", 0) or 0),
+            scheduled_virtual,
+        )
+        remaining_total = int(em.get("virtual_inventory_count_total", em.get("prebuilt_virtual_inventory_count", 0)) or 0)
+        em["virtual_inventory_remaining_count"] = max(0, remaining_total - int(em["virtual_inventory_consumed_count"]))
+        exported_virtual = int(em.get("final_virtual_rows_exported", scheduled_virtual) or 0)
+        em["final_virtual_rows_snapshot"] = scheduled_virtual
+        em["virtual_accounting_consistency_ok"] = bool(
+            scheduled_virtual == audited_virtual == exported_virtual
+        )
+        if not em["virtual_accounting_consistency_ok"]:
+            print(
+                f"[APS][VIRTUAL_ACCOUNTING_MISMATCH] snapshot={scheduled_virtual}, "
+                f"audited={audited_virtual}, exported={exported_virtual}"
+            )
         for key in cls._UNIFIED_ENGINE_META_FIELDS:
             em.setdefault(key, 0 if key.endswith("_count") or key.endswith("_orders") else "unknown")
         return em
@@ -1079,16 +1177,50 @@ class ColdRollingPipeline:
         model_cfg = getattr(cfg, "model", cfg)
         allow_virtual = bool(getattr(model_cfg, "allow_virtual_bridge_edge_in_constructive", False))
         allow_real = bool(getattr(model_cfg, "allow_real_bridge_edge_in_constructive", False))
+        snapshot_fields = {
+            "profile_name": getattr(model_cfg, "profile_name", "unknown"),
+            "solver_path": getattr(model_cfg, "main_solver_strategy", "unknown"),
+            "constructive_edge_policy": cls._constructive_edge_policy_from_flags(allow_virtual, allow_real),
+            "allow_virtual_bridge_edge_in_constructive": allow_virtual,
+            "allow_real_bridge_edge_in_constructive": allow_real,
+            "bridge_expansion_mode": getattr(model_cfg, "bridge_expansion_mode", "disabled"),
+            "virtual_family_frontload_enabled": bool(getattr(model_cfg, "virtual_family_frontload_enabled", False)),
+            "virtual_family_frontload_global_penalty": float(getattr(model_cfg, "virtual_family_frontload_global_penalty", 0.0) or 0.0),
+            "virtual_family_frontload_local_penalty": float(getattr(model_cfg, "virtual_family_frontload_local_penalty", 0.0) or 0.0),
+            "seed_formability_lookahead_orders": int(getattr(model_cfg, "seed_formability_lookahead_orders", 0) or 0),
+            "seed_formability_min_projected_tons": float(getattr(model_cfg, "seed_formability_min_projected_tons", 0.0) or 0.0),
+            "seed_formability_soft_gate_enabled": bool(getattr(model_cfg, "seed_formability_soft_gate_enabled", False)),
+            "seed_penalty_low_formability": float(getattr(model_cfg, "seed_penalty_low_formability", 0.0) or 0.0),
+            "successor_cross_min_bonus": float(getattr(model_cfg, "successor_cross_min_bonus", 0.0) or 0.0),
+            "successor_under_min_gain_weight": float(getattr(model_cfg, "successor_under_min_gain_weight", 0.0) or 0.0),
+            "successor_near_min_bonus": float(getattr(model_cfg, "successor_near_min_bonus", 0.0) or 0.0),
+            "successor_near_max_penalty": float(getattr(model_cfg, "successor_near_max_penalty", 0.0) or 0.0),
+            "constructive_virtual_rescue_enabled": bool(getattr(model_cfg, "constructive_virtual_rescue_enabled", False)),
+            "constructive_virtual_rescue_bonus": float(getattr(model_cfg, "constructive_virtual_rescue_bonus", 0.0) or 0.0),
+            "constructive_virtual_rescue_cross_min_bonus": float(getattr(model_cfg, "constructive_virtual_rescue_cross_min_bonus", 0.0) or 0.0),
+            "constructive_virtual_rescue_dead_end_bonus": float(getattr(model_cfg, "constructive_virtual_rescue_dead_end_bonus", 0.0) or 0.0),
+            "constructive_virtual_rescue_big_roll_enabled": bool(getattr(model_cfg, "constructive_virtual_rescue_big_roll_enabled", False)),
+            "constructive_virtual_rescue_big_roll_real_successor_threshold": int(getattr(model_cfg, "constructive_virtual_rescue_big_roll_real_successor_threshold", 0) or 0),
+            "constructive_virtual_rescue_big_roll_bonus": float(getattr(model_cfg, "constructive_virtual_rescue_big_roll_bonus", 0.0) or 0.0),
+            "constructive_virtual_rescue_score_scale": float(getattr(model_cfg, "constructive_virtual_rescue_score_scale", 0.0) or 0.0),
+            "small_roll_dual_reserve_bucket_ratio": float(getattr(model_cfg, "small_roll_dual_reserve_bucket_ratio", 0.0) or 0.0),
+            "small_roll_dual_reserve_quota_max_orders": int(getattr(model_cfg, "small_roll_dual_reserve_quota_max_orders", 0) or 0),
+            "small_roll_dual_reserve_quota_max_tons10": int(getattr(model_cfg, "small_roll_dual_reserve_quota_max_tons10", 0) or 0),
+            "local_cpsat_max_orders": int(getattr(model_cfg, "local_cpsat_max_orders", 0) or 0),
+            "local_cpsat_time_limit_seconds": float(getattr(model_cfg, "constructive_local_cpsat_time_limit_seconds", getattr(model_cfg, "local_cpsat_time_limit_seconds", 0.0)) or 0.0),
+            "alns_include_underfilled_fragments": bool(getattr(model_cfg, "alns_include_underfilled_fragments", False)),
+            "alns_underfilled_fragment_max_count": int(getattr(model_cfg, "alns_underfilled_fragment_max_count", 0) or 0),
+            "alns_underfilled_fragment_min_tons": float(getattr(model_cfg, "alns_underfilled_fragment_min_tons", 0.0) or 0.0),
+            "alns_underfilled_fragment_priority_near_min": bool(getattr(model_cfg, "alns_underfilled_fragment_priority_near_min", False)),
+            "alns_underfilled_fragment_allow_virtual_rescue": bool(getattr(model_cfg, "alns_underfilled_fragment_allow_virtual_rescue", False)),
+            "alns_underfilled_stitch_enabled": bool(getattr(model_cfg, "alns_underfilled_stitch_enabled", False)),
+            "alns_underfilled_stitch_max_pairs_per_round": int(getattr(model_cfg, "alns_underfilled_stitch_max_pairs_per_round", 0) or 0),
+            "alns_underfilled_stitch_allow_virtual": bool(getattr(model_cfg, "alns_underfilled_stitch_allow_virtual", False)),
+            "candidate_graph_source": "from_pipeline",
+        }
         print(
             "[APS][CONFIG_SNAPSHOT] "
-            f"profile_name={getattr(model_cfg, 'profile_name', 'unknown')}, "
-            f"solver_path={getattr(model_cfg, 'main_solver_strategy', 'unknown')}, "
-            f"constructive_edge_policy={cls._constructive_edge_policy_from_flags(allow_virtual, allow_real)}, "
-            f"allow_virtual_bridge_edge_in_constructive={allow_virtual}, "
-            f"allow_real_bridge_edge_in_constructive={allow_real}, "
-            f"bridge_expansion_mode={getattr(model_cfg, 'bridge_expansion_mode', 'disabled')}, "
-            f"virtual_family_frontload_enabled={bool(getattr(model_cfg, 'virtual_family_frontload_enabled', False))}, "
-            f"candidate_graph_source=from_pipeline"
+            + ", ".join(f"{key}={value}" for key, value in snapshot_fields.items())
         )
 
     @classmethod
@@ -1786,7 +1918,7 @@ class ColdRollingPipeline:
             )
 
         # Single route: constructive_lns only.
-        print(f"[APS][constructive_lns] preparing transition templates for constructive graph search")
+        print(f"[APS][constructive_lns] preparing transition edge cache for constructive graph search")
         print(f"[APS][Profile] name={req.config.model.profile_name}")
         # Route B: Log bridge expansion mode to prevent future misdiagnosis
         bridge_expansion_mode = str(getattr(req.config.model, "bridge_expansion_mode", "disabled"))
@@ -2580,6 +2712,8 @@ class ColdRollingPipeline:
         updated_engine_meta["final_segment_demoted_fragment_count"] = _int(
             lns_diag.get("final_segment_demoted_fragment_count"))
         updated_engine_meta["final_segment_full_drop_count"] = _int(lns_diag.get("final_segment_full_drop_count"))
+        if isinstance(summary, dict):
+            updated_engine_meta["final_virtual_rows_audited"] = int(summary.get("virtual_orders", 0) or 0)
 
         updated_engine_meta = self._ensure_unified_engine_meta(
             updated_engine_meta,

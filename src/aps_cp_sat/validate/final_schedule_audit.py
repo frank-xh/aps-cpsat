@@ -12,6 +12,25 @@ from typing import Any, Dict
 import pandas as pd
 
 from aps_cp_sat.config.rule_config import RuleConfig
+from aps_cp_sat.model.virtual_order_utils import normalize_effective_virtual_flags
+
+REQUIRED_AUDIT_COLUMNS = [
+    "temp_min",
+    "temp_max",
+    "line_capability",
+    "virtual_origin",
+    "virtual_spec_key",
+    "virtual_usage_type",
+    "is_virtual",
+    "width",
+    "thickness",
+    "steel_group",
+    "tons",
+    "order_id",
+    "line",
+    "campaign_id",
+    "sequence",
+]
 
 
 def _first_col(df: pd.DataFrame, names: list[str]) -> str | None:
@@ -35,14 +54,36 @@ def _append_limited(rows: list[dict[str, Any]], item: dict[str, Any], limit: int
         rows.append(item)
 
 
+def _has_non_null_col(df: pd.DataFrame, col: str) -> bool:
+    return col in df.columns and bool(df[col].notna().all())
+
+
+def _audit_contract(schedule_df: pd.DataFrame, engine_meta: dict[str, Any]) -> tuple[bool, list[str], bool]:
+    missing: list[str] = []
+    for col in REQUIRED_AUDIT_COLUMNS:
+        if col not in schedule_df.columns:
+            missing.append(col)
+    for col in ["temp_min", "temp_max"]:
+        if col in schedule_df.columns and bool(schedule_df[col].isna().any()):
+            missing.append(col)
+    missing = sorted(set(missing))
+    fail_fast = bool(missing) or bool(engine_meta.get("decode_required_column_recovery_failed", False))
+    required_cols_ok = not fail_fast
+    print(
+        f"[APS][FINAL_AUDIT_CONTRACT] required_cols_ok={required_cols_ok}, "
+        f"missing={missing}, fail_fast={fail_fast}"
+    )
+    return required_cols_ok, missing, fail_fast
+
+
 def _prepare(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+    out = normalize_effective_virtual_flags(df)
     if out.empty:
         return out
 
     line_col = _first_col(out, ["line", "assigned_line"])
     campaign_col = _first_col(out, ["campaign_id", "master_slot", "assigned_slot", "slot_no"])
-    seq_col = _first_col(out, ["campaign_seq", "sequence_in_slot", "global_sequence_on_line"])
+    seq_col = _first_col(out, ["sequence", "seq", "campaign_seq", "sequence_in_slot", "global_sequence_on_line"])
     slot_col = _first_col(out, ["master_slot", "assigned_slot", "slot_no"])
     order_col = _first_col(out, ["order_id", "source_order_id"])
 
@@ -109,6 +150,7 @@ def run_final_schedule_audit(
     work = _prepare(schedule_df if isinstance(schedule_df, pd.DataFrame) else pd.DataFrame())
     summary: Dict[str, Any] = {}
     details: Dict[str, list[dict[str, Any]]] = {
+        "contract": [],
         "width": [],
         "thickness": [],
         "temperature": [],
@@ -116,6 +158,43 @@ def run_final_schedule_audit(
         "campaign_ton": [],
         "sequence": [],
     }
+    engine_meta = dict(engine_meta or {})
+    required_cols_ok, missing_contract_cols, fail_fast = _audit_contract(work, engine_meta)
+    if fail_fast:
+        _append_limited(
+            details["contract"],
+            {
+                "missing_required_cols": list(missing_contract_cols or engine_meta.get("decode_missing_required_cols", [])),
+                "audit_result": "DATA_CONTRACT_VIOLATION",
+                "decode_required_column_recovery_failed": bool(engine_meta.get("decode_required_column_recovery_failed", False)),
+            },
+        )
+        summary.update(
+            {
+                "required_cols_ok": bool(required_cols_ok),
+                "missing_required_cols": list(missing_contract_cols),
+                "data_contract_violation_count": 1,
+                "width_audit_pair_count": 0,
+                "width_increase_violation_count": 0,
+                "width_overdrop_violation_count": 0,
+                "width_total_violation_count": 0,
+                "thickness_audit_pair_count": 0,
+                "thickness_violation_count": 0,
+                "temperature_audit_pair_count": 0,
+                "temperature_violation_count": 0,
+                "group_transition_pair_count": 0,
+                "group_transition_violation_count": 0,
+                "group_transition_unknown_count": 0,
+                "campaign_ton_audit_count": 0,
+                "campaign_ton_min_violation_count": 0,
+                "campaign_ton_max_violation_count": 0,
+                "campaign_grouping_violation_count": 0,
+                "campaign_sequence_violation_count": 0,
+                "duplicate_order_violation_count": 0,
+                "final_hard_violation_count_total": 0,
+            }
+        )
+        return {"summary": summary, "details": details}
 
     width_pairs = width_increase = width_overdrop = 0
     thk_pairs = thk_viol = 0
@@ -169,7 +248,7 @@ def run_final_schedule_audit(
                     },
                 )
 
-        if {"temp_min", "temp_max"}.issubset(work.columns):
+        if _has_non_null_col(work, "temp_min") and _has_non_null_col(work, "temp_max"):
             temp_pairs += 1
             amin = _to_float(prev.get("temp_min"))
             amax = _to_float(prev.get("temp_max"))
@@ -277,6 +356,9 @@ def run_final_schedule_audit(
     )
     summary.update(
         {
+            "required_cols_ok": bool(required_cols_ok),
+            "missing_required_cols": list(missing_contract_cols),
+            "data_contract_violation_count": 0,
             "width_audit_pair_count": int(width_pairs),
             "width_increase_violation_count": int(width_increase),
             "width_overdrop_violation_count": int(width_overdrop),
